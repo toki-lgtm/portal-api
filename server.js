@@ -73,9 +73,13 @@ app.post('/api/auth/google', async (req, res) => {
 app.get('/api/apps', async (req, res) => {
   try {
     const isDev = process.env.NODE_ENV !== 'production';
-    const safetyPatrolUrl = isDev
+    const baseUrl = isDev
       ? 'http://localhost:5174'
       : 'https://safety-patrol-nine.vercel.app';
+
+    // ユーザー情報をURL パラメータで渡す（必須）
+    const userParam = req.query.user ? `?user=${encodeURIComponent(req.query.user)}` : '?user={}';
+    const safetyPatrolUrl = `${baseUrl}${userParam}`;
 
     const apps = [
       { id: 1, name: '安全パトロール', url: safetyPatrolUrl, icon: '✅' },
