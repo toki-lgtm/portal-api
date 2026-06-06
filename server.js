@@ -72,8 +72,13 @@ app.post('/api/auth/google', async (req, res) => {
 // ✅ ダッシュボード用：アプリ一覧
 app.get('/api/apps', async (req, res) => {
   try {
+    const isDev = process.env.NODE_ENV !== 'production';
+    const safetyPatrolUrl = isDev
+      ? 'http://localhost:5174'
+      : 'https://safety-patrol-nine.vercel.app';
+
     const apps = [
-      { id: 1, name: '安全パトロール', url: 'https://safety-patrol-nine.vercel.app', icon: '✅' },
+      { id: 1, name: '安全パトロール', url: safetyPatrolUrl, icon: '✅' },
       { id: 2, name: '社員管理', url: '#', icon: '👤', status: 'coming_soon' },
       { id: 3, name: 'メーラー', url: '#', icon: '📧', status: 'coming_soon' },
       { id: 4, name: 'ファイル管理', url: '#', icon: '📁', status: 'coming_soon' },
