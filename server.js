@@ -183,6 +183,174 @@ app.delete('/api/inspections/:id', async (req, res) => {
   }
 });
 
+// ✅ マスター管理 - 現場一覧
+app.get('/api/masters/projects', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('projects')
+      .select('*')
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+    res.json(data || []);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ マスター管理 - 現場作成
+app.post('/api/masters/projects', async (req, res) => {
+  try {
+    const { id, name, location, start_date, end_date, manager_id } = req.body;
+    const { data, error } = await supabase
+      .from('projects')
+      .insert([{ id: id || uuidv4(), name, location, start_date, end_date, manager_id }])
+      .select();
+    if (error) throw error;
+    res.json(data[0]);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ マスター管理 - 現場更新
+app.put('/api/masters/projects/:id', async (req, res) => {
+  try {
+    const { name, location, start_date, end_date, manager_id } = req.body;
+    const { data, error } = await supabase
+      .from('projects')
+      .update({ name, location, start_date, end_date, manager_id })
+      .eq('id', req.params.id)
+      .select();
+    if (error) throw error;
+    res.json(data[0]);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ マスター管理 - 現場削除
+app.delete('/api/masters/projects/:id', async (req, res) => {
+  try {
+    const { error } = await supabase.from('projects').delete().eq('id', req.params.id);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ マスター管理 - スタッフ一覧
+app.get('/api/masters/staff', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('staff_master')
+      .select('*')
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+    res.json(data || []);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ マスター管理 - スタッフ作成
+app.post('/api/masters/staff', async (req, res) => {
+  try {
+    const { id, name, email, role } = req.body;
+    const { data, error } = await supabase
+      .from('staff_master')
+      .insert([{ id: id || uuidv4(), name, email, role }])
+      .select();
+    if (error) throw error;
+    res.json(data[0]);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ マスター管理 - スタッフ更新
+app.put('/api/masters/staff/:id', async (req, res) => {
+  try {
+    const { name, email, role } = req.body;
+    const { data, error } = await supabase
+      .from('staff_master')
+      .update({ name, email, role })
+      .eq('id', req.params.id)
+      .select();
+    if (error) throw error;
+    res.json(data[0]);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ マスター管理 - スタッフ削除
+app.delete('/api/masters/staff/:id', async (req, res) => {
+  try {
+    const { error } = await supabase.from('staff_master').delete().eq('id', req.params.id);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ マスター管理 - 対象区分一覧
+app.get('/api/masters/inspection-items', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('inspection_master')
+      .select('*')
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+    res.json(data || []);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ マスター管理 - 対象区分作成
+app.post('/api/masters/inspection-items', async (req, res) => {
+  try {
+    const { id, category, description } = req.body;
+    const { data, error } = await supabase
+      .from('inspection_master')
+      .insert([{ id: id || uuidv4(), category, description }])
+      .select();
+    if (error) throw error;
+    res.json(data[0]);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ マスター管理 - 対象区分更新
+app.put('/api/masters/inspection-items/:id', async (req, res) => {
+  try {
+    const { category, description } = req.body;
+    const { data, error } = await supabase
+      .from('inspection_master')
+      .update({ category, description })
+      .eq('id', req.params.id)
+      .select();
+    if (error) throw error;
+    res.json(data[0]);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ マスター管理 - 対象区分削除
+app.delete('/api/masters/inspection-items/:id', async (req, res) => {
+  try {
+    const { error } = await supabase.from('inspection_master').delete().eq('id', req.params.id);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`✅ Portal API running on http://localhost:${PORT}`);
 });
