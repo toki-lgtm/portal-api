@@ -3,6 +3,7 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import { createClient } from '@supabase/supabase-js';
 import ws from 'ws';
+import { v4 as uuidv4 } from 'uuid';
 
 dotenv.config();
 
@@ -55,10 +56,19 @@ app.post('/api/auth/google', async (req, res) => {
 
     const userInfo = await googleRes.json();
 
-    // Supabase にユーザーを登録/更新
+    // 既存ユーザーを確認
+    const { data: existingUser } = await supabase
+      .from('users')
+      .select('id')
+      .eq('email', userInfo.email)
+      .single();
+
+    // ユーザーを登録/更新
+    const userId = existingUser?.id || uuidv4();
     const { data, error } = await supabase
       .from('users')
       .upsert([{
+        id: userId,
         email: userInfo.email,
         full_name: userInfo.name,
         avatar_url: userInfo.picture
