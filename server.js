@@ -58,11 +58,11 @@ app.post('/api/auth/google', async (req, res) => {
     // Supabase にユーザーを登録/更新
     const { data, error } = await supabase
       .from('users')
-      .upsert({
+      .upsert([{
         email: userInfo.email,
         full_name: userInfo.name,
         avatar_url: userInfo.picture
-      }, { onConflict: 'email' })
+      }])
       .select()
       .single();
 
