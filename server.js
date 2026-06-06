@@ -41,8 +41,42 @@ app.post('/api/auth/google', async (req, res) => {
     return res.status(400).json({ error: 'Token required' });
   }
 
-  // Google トークンを Supabase で検証（後で実装）
-  res.json({ message: 'Auth endpoint' });
+  try {
+    // Google トークンからユーザー情報を取得
+    const googleRes = await fetch('https://www.googleapis.com/oauth2/v1/userinfo', {
+      headers: { Authorization: `Bearer ${token}` }
+    });
+
+    if (!googleRes.ok) {
+      return res.status(401).json({ error: 'Invalid token' });
+    }
+
+    const userInfo = await googleRes.json();
+
+    // Supabase にユーザーを登録/更新
+    const { data, error } = await supabase
+      .from('users')
+      .upsert({
+        email: userInfo.email,
+        name: userInfo.name,
+        google_id: userInfo.id,
+        avatar: userInfo.picture
+      }, { onConflict: 'email' })
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    res.json({
+      id: data.id,
+      email: data.email,
+      name: data.name,
+      avatar: data.avatar
+    });
+  } catch (error) {
+    console.error('Auth error:', error);
+    res.status(401).json({ error: error.message });
+  }
 });
 
 // ✅ ダッシュボード用：アプリ一覧
