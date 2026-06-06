@@ -72,7 +72,7 @@ app.post('/api/auth/google', async (req, res) => {
 app.get('/api/apps', async (req, res) => {
   try {
     const apps = [
-      { id: 1, name: '安全パトロール', url: process.env.SAFETY_PATROL_URL || '#', icon: '✅' },
+      { id: 1, name: '安全パトロール', url: 'https://safety-patrol-app-gzyw.vercel.app', icon: '✅' },
       { id: 2, name: '社員管理', url: '#', icon: '👤', status: 'coming_soon' },
       { id: 3, name: 'メーラー', url: '#', icon: '📧', status: 'coming_soon' },
       { id: 4, name: 'ファイル管理', url: '#', icon: '📁', status: 'coming_soon' },
