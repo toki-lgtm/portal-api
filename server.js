@@ -76,8 +76,8 @@ app.post('/api/auth/google', async (req, res) => {
       avatar: data.avatar
     });
   } catch (error) {
-    console.error('Auth error:', error);
-    res.status(401).json({ error: error.message });
+    console.error('Auth error:', error.message, error);
+    res.status(500).json({ error: error.message });
   }
 });
 
