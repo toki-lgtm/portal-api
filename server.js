@@ -3,6 +3,7 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import { createClient } from '@supabase/supabase-js';
 import ws from 'ws';
+import { v4 as uuidv4 } from 'uuid';
 
 dotenv.config();
 
@@ -81,6 +82,94 @@ app.get('/api/apps', async (req, res) => {
     ];
     res.json(apps);
   } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 安全パトロール - 点検一覧
+app.get('/api/inspections', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('inspections')
+      .select('*')
+      .order('inspection_date', { ascending: false });
+
+    if (error) throw error;
+    res.json(data || []);
+  } catch (error) {
+    console.error('Error:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 安全パトロール - 点検作成
+app.post('/api/inspections', async (req, res) => {
+  try {
+    const { inspection_id, project_id, inspector_id, inspection_date, categories, status, comments, report_url } = req.body;
+
+    const { data, error } = await supabase
+      .from('inspections')
+      .insert([{
+        id: uuidv4(),
+        inspection_id,
+        project_id,
+        inspector_id,
+        inspection_date,
+        categories: categories || [],
+        status: status || 'pending',
+        comments,
+        report_url
+      }])
+      .select();
+
+    if (error) throw error;
+    res.json(data[0]);
+  } catch (error) {
+    console.error('Error:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 安全パトロール - 点検更新
+app.put('/api/inspections/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status, comments, report_url, categories } = req.body;
+
+    const { data, error } = await supabase
+      .from('inspections')
+      .update({
+        status,
+        comments,
+        report_url,
+        categories,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', id)
+      .select();
+
+    if (error) throw error;
+    res.json(data[0]);
+  } catch (error) {
+    console.error('Error:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 安全パトロール - 点検削除
+app.delete('/api/inspections/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const { error } = await supabase
+      .from('inspections')
+      .delete()
+      .eq('id', id);
+
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Error:', error.message);
     res.status(500).json({ error: error.message });
   }
 });
