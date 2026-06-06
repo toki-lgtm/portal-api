@@ -60,8 +60,8 @@ app.post('/api/auth/google', async (req, res) => {
       .from('users')
       .upsert({
         email: userInfo.email,
-        name: userInfo.name,
-        google_id: userInfo.id
+        full_name: userInfo.name,
+        avatar_url: userInfo.picture
       }, { onConflict: 'email' })
       .select()
       .single();
@@ -71,7 +71,8 @@ app.post('/api/auth/google', async (req, res) => {
     res.json({
       id: data.id,
       email: data.email,
-      name: data.name
+      name: data.full_name,
+      avatar: data.avatar_url
     });
   } catch (error) {
     console.error('Auth error:', error.message, error);
