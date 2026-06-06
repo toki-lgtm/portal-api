@@ -2,6 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import { createClient } from '@supabase/supabase-js';
+import ws from 'ws';
 
 dotenv.config();
 
@@ -15,7 +16,8 @@ app.use(express.json());
 // Supabase クライアント
 const supabase = createClient(
   process.env.SUPABASE_URL,
-  process.env.SUPABASE_ANON_KEY
+  process.env.SUPABASE_ANON_KEY,
+  { global: { headers: { 'x-client-info': 'portal-api' } }, realtime: { transport: ws } }
 );
 
 // ✅ ヘルスチェック
