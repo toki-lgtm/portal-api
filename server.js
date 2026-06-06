@@ -13,10 +13,10 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// Supabase クライアント
+// Supabase クライアント（サービスロールキーを使用）
 const supabase = createClient(
   process.env.SUPABASE_URL,
-  process.env.SUPABASE_ANON_KEY,
+  process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY,
   { global: { headers: { 'x-client-info': 'portal-api' } }, realtime: { transport: ws } }
 );
 
