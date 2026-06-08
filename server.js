@@ -455,6 +455,10 @@ app.post('/api/inspections/:id/report', upload.single('report'), async (req, res
     if (insp && isStoredPdf(insp.report_url)) {
       return res.status(409).json({ error: 'この点検は既にPDF生成済みです' });
     }
+    // アーカイブ済み（ドライブへ移動済み）は再生成不可
+    if (insp && typeof insp.report_url === 'string' && insp.report_url.startsWith('archived:')) {
+      return res.status(409).json({ error: 'この点検はアーカイブ済みのため操作できません' });
+    }
 
     await ensureReportsBucket();
 
