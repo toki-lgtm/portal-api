@@ -206,6 +206,7 @@ app.post('/api/inspections', async (req, res) => {
       status,
       comments,
       report_url,
+      site_photo_urls,
       details
     } = req.body;
 
@@ -229,7 +230,8 @@ app.post('/api/inspections', async (req, res) => {
         categories: categories || [],
         status: status || 'pending',
         comments,
-        report_url
+        report_url,
+        site_photo_urls: site_photo_urls || []
       }])
       .select();
 
@@ -248,6 +250,7 @@ app.post('/api/inspections', async (req, res) => {
         result: d.result,
         issue_content: d.issue_content || null,
         issue_image_url: d.issue_image_url || null,
+        issue_image_urls: d.issue_image_urls || [],
         due_date: d.due_date || null
       }));
 
@@ -330,7 +333,7 @@ app.get('/api/inspections/:id', async (req, res) => {
 app.put('/api/inspections/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    const { status, comments, report_url, categories, details } = req.body;
+    const { status, comments, report_url, categories, site_photo_urls, details } = req.body;
 
     const { data: inspectionData, error: inspectionError } = await supabase
       .from('inspections')
@@ -339,6 +342,7 @@ app.put('/api/inspections/:id', async (req, res) => {
         comments,
         report_url,
         categories,
+        site_photo_urls,
         updated_at: new Date().toISOString()
       })
       .eq('id', id)
@@ -366,6 +370,7 @@ app.put('/api/inspections/:id', async (req, res) => {
         result: d.result,
         issue_content: d.issue_content || null,
         issue_image_url: d.issue_image_url || null,
+        issue_image_urls: d.issue_image_urls || [],
         due_date: d.due_date || null
       }));
 
