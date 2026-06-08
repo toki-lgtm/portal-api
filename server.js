@@ -350,6 +350,17 @@ app.put('/api/inspections/:id', async (req, res) => {
     const { id } = req.params;
     const { status, comments, report_url, categories, site_photo_urls, details } = req.body;
 
+    // ✅ PDF生成済みの点検は編集不可（ロック）。report_url が立っていれば生成済みとみなす。
+    const { data: existing, error: existingError } = await supabase
+      .from('inspections')
+      .select('report_url')
+      .eq('id', id)
+      .single();
+    if (existingError) throw existingError;
+    if (existing && existing.report_url) {
+      return res.status(409).json({ error: 'この点検はPDF生成済みのため編集できません' });
+    }
+
     const { data: inspectionData, error: inspectionError } = await supabase
       .from('inspections')
       .update({
@@ -400,6 +411,29 @@ app.put('/api/inspections/:id', async (req, res) => {
     }
 
     res.json(inspection);
+  } catch (error) {
+    console.error('Error:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 安全パトロール - PDF生成済みにする（report_url に生成日時を記録し、以後は編集ロック）
+app.patch('/api/inspections/:id/pdf-generated', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const now = new Date().toISOString();
+
+    const { data, error } = await supabase
+      .from('inspections')
+      .update({
+        report_url: `generated:${now}`,
+        updated_at: now
+      })
+      .eq('id', id)
+      .select();
+
+    if (error) throw error;
+    res.json(data[0]);
   } catch (error) {
     console.error('Error:', error.message);
     res.status(500).json({ error: error.message });
