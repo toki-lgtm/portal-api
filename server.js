@@ -20,6 +20,12 @@ const JWT_SECRET = process.env.JWT_SECRET;
 const ALLOWED_EMAIL_DOMAIN = process.env.ALLOWED_EMAIL_DOMAIN || 'nakahara131.co.jp';
 const JWT_EXPIRES_IN = '12h';
 
+// ✅ 安全パトロール権限: 環境変数で常に管理者扱いにするメール（カンマ区切り）。DB未登録でも管理者化できる安全網。
+const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || 'toki@nakahara131.co.jp')
+  .split(',')
+  .map((e) => e.trim().toLowerCase())
+  .filter(Boolean);
+
 if (!JWT_SECRET) {
   console.warn('⚠️  JWT_SECRET が未設定です。ログイン（JWT発行/検証）は失敗します。Render の環境変数に JWT_SECRET を設定してください。');
 }
@@ -94,6 +100,45 @@ async function nextMasterId(table, prefix) {
   return prefix + String(max + 1).padStart(3, '0');
 }
 
+// ✅ ログインユーザーの権限と検査官IDを解決
+//    - role: 'admin'（管理者：全機能） / 'member'（メンバー：閲覧・新規点検）
+//    - staffId: staff_master を email で突合した本人のスタッフID（未登録なら null）
+//    判定: 環境変数 ADMIN_EMAILS に含まれる、または staff_master.app_role='admin' なら管理者。
+async function resolvePermissions(email) {
+  const lower = String(email || '').toLowerCase();
+  let staffId = null;
+  let dbRole = null;
+  try {
+    const { data } = await supabase
+      .from('staff_master')
+      .select('id, app_role')
+      .ilike('email', lower)
+      .maybeSingle();
+    if (data) {
+      staffId = data.id;
+      dbRole = data.app_role;
+    }
+  } catch (e) {
+    console.error('resolvePermissions 失敗:', e.message);
+  }
+  const role = ADMIN_EMAILS.includes(lower) || dbRole === 'admin' ? 'admin' : 'member';
+  return { role, staffId };
+}
+
+// ✅ 管理者のみ許可するミドルウェア（要 requireAuth 後段）
+async function requireAdmin(req, res, next) {
+  try {
+    const perms = await resolvePermissions(req.user?.email);
+    if (perms.role !== 'admin') {
+      return res.status(403).json({ error: 'この操作は管理者のみ可能です' });
+    }
+    req.perms = perms;
+    next();
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+}
+
 // ✅ 指摘内容テンプレートの蓄積
 //    点検保存時に「指摘あり」かつ指摘内容ありの明細を項目単位でストックする。
 //    既存（同一 item_id × 同一 content）があれば use_count を加算、無ければ新規登録。
@@ -146,6 +191,21 @@ app.get('/api/user', requireAuth, (req, res) => {
     name: req.user.name,
     avatar: req.user.avatar
   });
+});
+
+// ✅ 安全パトロール - ログインユーザーの権限（フロントのボタン表示制御に使用）
+app.get('/api/my-permissions', requireAuth, async (req, res) => {
+  try {
+    const perms = await resolvePermissions(req.user.email);
+    res.json({
+      role: perms.role,        // 'admin' | 'member'
+      staff_id: perms.staffId, // 本人のスタッフID（未登録なら null）
+      email: req.user.email,
+      name: req.user.name
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
 // ✅ Google OAuth コールバック
@@ -231,6 +291,12 @@ app.get('/api/apps', requireAuth, async (req, res) => {
 app.use('/api/inspections', requireAuth);
 app.use('/api/masters', requireAuth);
 
+// ✅ マスター管理は閲覧(GET)は全員可、登録/編集/削除は管理者のみ
+app.use('/api/masters', async (req, res, next) => {
+  if (req.method === 'GET') return next();
+  return requireAdmin(req, res, next);
+});
+
 // ✅ 安全パトロール - 点検一覧
 app.get('/api/inspections', async (req, res) => {
   try {
@@ -272,13 +338,19 @@ app.post('/api/inspections', async (req, res) => {
 
     const newId = uuidv4();
 
+    // ✅ メンバーは検査官を自分に固定（自分が検査した案件のみ後で編集/PDF発行できるようにするため）。
+    //    管理者は指定どおり。staff未登録のメンバーは送信値を尊重（管理者がstaff整備する想定）。
+    const perms = await resolvePermissions(req.user.email);
+    const resolvedInspectorId =
+      perms.role !== 'admin' && perms.staffId ? perms.staffId : inspector_id;
+
     const { data: inspectionData, error: inspectionError } = await supabase
       .from('inspections')
       .insert([{
         id: newId,
         inspection_id: resolvedInspectionId,
         project_id,
-        inspector_id,
+        inspector_id: resolvedInspectorId,
         manager_id,
         inspection_date,
         categories: categories || [],
@@ -395,10 +467,17 @@ app.put('/api/inspections/:id', async (req, res) => {
     // ✅ PDF生成済みの点検は編集不可（ロック）。report_url が立っていれば生成済みとみなす。
     const { data: existing, error: existingError } = await supabase
       .from('inspections')
-      .select('report_url')
+      .select('report_url, inspector_id')
       .eq('id', id)
       .single();
     if (existingError) throw existingError;
+
+    // ✅ 編集権限: 管理者は全件、メンバーは自分が検査官の案件のみ
+    const perms = await resolvePermissions(req.user.email);
+    if (perms.role !== 'admin' && existing.inspector_id !== perms.staffId) {
+      return res.status(403).json({ error: '自分が検査した案件のみ編集できます' });
+    }
+
     if (existing && existing.report_url) {
       return res.status(409).json({ error: 'この点検はPDF生成済みのため編集できません' });
     }
@@ -491,10 +570,16 @@ app.post('/api/inspections/:id/report', upload.single('report'), async (req, res
 
     const { data: insp, error: inspError } = await supabase
       .from('inspections')
-      .select('inspection_id, project_id, report_url')
+      .select('inspection_id, project_id, report_url, inspector_id')
       .eq('id', id)
       .single();
     if (inspError) throw inspError;
+
+    // ✅ PDF発行権限: 管理者は全件、メンバーは自分が検査官の案件のみ
+    const perms = await resolvePermissions(req.user.email);
+    if (perms.role !== 'admin' && insp.inspector_id !== perms.staffId) {
+      return res.status(403).json({ error: 'PDFの発行は担当検査官または管理者のみ可能です' });
+    }
 
     // 既に実ファイルが保存済みなら再生成は不可（生成は一度きり）
     if (insp && isStoredPdf(insp.report_url)) {
@@ -560,8 +645,8 @@ app.get('/api/inspections/:id/report-url', async (req, res) => {
   }
 });
 
-// ✅ 安全パトロール - 点検削除
-app.delete('/api/inspections/:id', async (req, res) => {
+// ✅ 安全パトロール - 点検削除（管理者のみ）
+app.delete('/api/inspections/:id', requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
 
@@ -652,11 +737,11 @@ app.get('/api/masters/staff', async (req, res) => {
 // ✅ マスター管理 - スタッフ作成
 app.post('/api/masters/staff', async (req, res) => {
   try {
-    const { id, name, email, role } = req.body;
+    const { id, name, email, role, app_role } = req.body;
     const newId = id || await nextMasterId('staff_master', 'S');
     const { data, error } = await supabase
       .from('staff_master')
-      .insert([{ id: newId, name, email, role }])
+      .insert([{ id: newId, name, email, role, app_role: app_role || 'member' }])
       .select();
     if (error) throw error;
     res.json(data[0]);
@@ -668,10 +753,10 @@ app.post('/api/masters/staff', async (req, res) => {
 // ✅ マスター管理 - スタッフ更新
 app.put('/api/masters/staff/:id', async (req, res) => {
   try {
-    const { name, email, role } = req.body;
+    const { name, email, role, app_role } = req.body;
     const { data, error } = await supabase
       .from('staff_master')
-      .update({ name, email, role })
+      .update({ name, email, role, app_role })
       .eq('id', req.params.id)
       .select();
     if (error) throw error;
