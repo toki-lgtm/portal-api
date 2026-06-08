@@ -8,14 +8,17 @@
 import dotenv from 'dotenv';
 import { createClient } from '@supabase/supabase-js';
 import nodemailer from 'nodemailer';
+import ws from 'ws';
 
 dotenv.config();
 
-// ── Supabase クライアント（env 変数名は server.js と完全一致）──
+// ── Supabase クライアント（env 変数名・オプションは server.js と完全一致）──
+//    realtime.transport に ws を渡すのは、Node 18 にネイティブ WebSocket が無く
+//    createClient が起動時に throw するのを防ぐため（server.js と同じ対処）。
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY,
-  { global: { headers: { 'x-client-info': 'portal-api-cron' } } }
+  { global: { headers: { 'x-client-info': 'portal-api-cron' } }, realtime: { transport: ws } }
 );
 
 // ── nodemailer transporter（env 変数名は server.js と完全一致）──
