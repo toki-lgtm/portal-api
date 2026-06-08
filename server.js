@@ -223,11 +223,13 @@ app.get('/api/user', requireAuth, (req, res) => {
 app.get('/api/my-permissions', requireAuth, async (req, res) => {
   try {
     const perms = await resolvePermissions(req.user.email);
+    const appPerms = await resolveAppPermissions(perms.staffId);
     res.json({
-      role: perms.role,        // 'admin' | 'member'
+      role: perms.role,        // 'admin' | 'member'（安全パトロール互換のグローバルロール）
       staff_id: perms.staffId, // 本人のスタッフID（未登録なら null）
       email: req.user.email,
-      name: req.user.name
+      name: req.user.name,
+      apps: appPerms,          // { app_key: 'member'|'admin' } アプリ別権限マップ
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -299,14 +301,26 @@ app.get('/api/apps', requireAuth, async (req, res) => {
     }));
     const safetyPatrolUrl = `${baseUrl}?user=${userJson}&token=${encodeURIComponent(appToken)}`;
 
-    const apps = [
-      { id: 1, name: '安全パトロール', url: safetyPatrolUrl, icon: '✅' },
-      { id: 2, name: '社員管理', url: '#', icon: '👤', status: 'coming_soon' },
-      { id: 3, name: 'メーラー', url: '#', icon: '📧', status: 'coming_soon' },
-      { id: 4, name: 'ファイル管理', url: '#', icon: '📁', status: 'coming_soon' },
-      { id: 5, name: '社員評価', url: '#', icon: '⭐', status: 'coming_soon' },
-      { id: 6, name: '宿舎予約', url: '#', icon: '🛏️', status: 'coming_soon' }
+    // アプリ定義（key を持つものは app_permissions による権限フィルタ対象）
+    // internal:true は外部URLではなくポータル内ビュー（フロントが view 切替で表示）
+    const allApps = [
+      { id: 1, key: 'safety-patrol', name: '安全パトロール', url: safetyPatrolUrl, icon: '✅' },
+      { id: 2, key: 'employee-list', name: '社員一覧', icon: '👤', internal: true, view: 'employees' },
+      { id: 3, key: 'mailer', name: 'メーラー', url: '#', icon: '📧', status: 'coming_soon' },
+      { id: 4, key: 'file-manager', name: 'ファイル管理', url: '#', icon: '📁', status: 'coming_soon' },
+      { id: 5, key: 'evaluation', name: '社員評価', url: '#', icon: '⭐', status: 'coming_soon' },
+      { id: 6, key: 'dormitory', name: '宿舎予約', url: '#', icon: '🛏️', status: 'coming_soon' }
     ];
+
+    // 権限フィルタ: グローバル管理者は全件。それ以外は app_permissions に行があるアプリのみ。
+    // coming_soon（プレースホルダ）は誰にでも表示する。
+    const perms = await resolvePermissions(req.user.email);
+    const appPerms = await resolveAppPermissions(perms.staffId);
+    const apps = allApps.filter((a) => {
+      if (a.status === 'coming_soon') return true;
+      if (perms.role === 'admin') return true;
+      return !!appPerms[a.key];
+    });
     res.json(apps);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -1483,6 +1497,440 @@ app.put('/api/user/settings', requireAuth, async (req, res) => {
     res.json(merged);
   } catch (error) {
     console.error('Error (user settings PUT):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================================
+// ✅ 社員一覧（社員台帳 / アプリ別権限 / 資格管理）API
+//    - 台帳本体は staff_master（安全パトロールと共用）。
+//    - アプリ別権限は app_permissions（社員 × アプリ × member/admin）。
+//    - 資格は qualification_master（マスタ）と staff_qualifications（社員ひも付け）。
+//    既存の /api/masters/staff（安全パトロールのマスタ管理）はそのまま温存し、
+//    社員一覧画面はこちらの /api/employees・/api/qualifications を使う。
+// ============================================================
+
+// 既知のアプリキー（/api/apps と権限UIで共有）
+const APP_KEYS = ['safety-patrol', 'employee-list', 'mailer', 'file-manager', 'evaluation', 'dormitory'];
+
+// staffId のアプリ別権限を { app_key: 'member'|'admin' } のマップで返す
+async function resolveAppPermissions(staffId) {
+  if (!staffId) return {};
+  const { data, error } = await supabase
+    .from('staff_app_permissions')
+    .select('app_key, access_level')
+    .eq('staff_id', staffId);
+  if (error) {
+    console.error('resolveAppPermissions 失敗:', error.message);
+    return {};
+  }
+  const map = {};
+  for (const r of data || []) map[r.app_key] = r.access_level;
+  return map;
+}
+
+// 社員一覧アプリにおける本人のロールを解決
+//  - グローバル管理者（ADMIN_EMAILS / staff_master.app_role='admin'）は常に 'admin'
+//  - それ以外は app_permissions の 'employee-list' を見る（admin / member / none）
+async function resolveEmployeeRole(email) {
+  const perms = await resolvePermissions(email); // { role, staffId }
+  if (perms.role === 'admin') return { role: 'admin', staffId: perms.staffId, globalAdmin: true };
+  let level = null;
+  if (perms.staffId) {
+    const { data } = await supabase
+      .from('staff_app_permissions')
+      .select('access_level')
+      .eq('staff_id', perms.staffId)
+      .eq('app_key', 'employee-list')
+      .maybeSingle();
+    level = data?.access_level || null;
+  }
+  const role = level === 'admin' ? 'admin' : level ? 'member' : 'none';
+  return { role, staffId: perms.staffId, globalAdmin: false };
+}
+
+// 社員一覧の閲覧権限（member 以上）
+async function requireEmployeeAccess(req, res, next) {
+  try {
+    const r = await resolveEmployeeRole(req.user.email);
+    if (r.role === 'none') return res.status(403).json({ error: '社員一覧へのアクセス権がありません' });
+    req.empRole = r;
+    next();
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+}
+
+// 社員一覧の管理権限（admin のみ）
+async function requireEmployeeAdmin(req, res, next) {
+  try {
+    const r = await resolveEmployeeRole(req.user.email);
+    if (r.role !== 'admin') return res.status(403).json({ error: 'この操作は社員一覧の管理者のみ可能です' });
+    req.empRole = r;
+    next();
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+}
+
+// 期限切れ間近の判定日数（既定90日）
+const EXPIRY_SOON_DAYS = 90;
+
+// ✅ 社員一覧 - 一覧取得（権限サマリ・資格件数・期限アラートを付与）
+app.get('/api/employees', requireAuth, requireEmployeeAccess, async (req, res) => {
+  try {
+    const [{ data: staff, error: sErr }, { data: perms }, { data: quals }] = await Promise.all([
+      supabase.from('staff_master').select('*').order('id', { ascending: true }),
+      supabase.from('staff_app_permissions').select('staff_id, app_key, access_level'),
+      supabase.from('staff_qualifications').select('staff_id, expiry_date'),
+    ]);
+    if (sErr) throw sErr;
+
+    // 権限を staff_id ごとにまとめる
+    const permByStaff = {};
+    for (const p of perms || []) {
+      (permByStaff[p.staff_id] ||= {})[p.app_key] = p.access_level;
+    }
+
+    // 資格件数・期限アラート件数を staff_id ごとに集計
+    const today = new Date();
+    const soon = new Date(today.getTime() + EXPIRY_SOON_DAYS * 86400000);
+    const qStat = {};
+    for (const q of quals || []) {
+      const s = (qStat[q.staff_id] ||= { count: 0, expiring: 0, expired: 0 });
+      s.count++;
+      if (q.expiry_date) {
+        const d = new Date(q.expiry_date);
+        if (d < today) s.expired++;
+        else if (d <= soon) s.expiring++;
+      }
+    }
+
+    const rows = (staff || []).map((s) => ({
+      ...s,
+      permissions: permByStaff[s.id] || {},
+      qualification_count: qStat[s.id]?.count || 0,
+      qualification_expiring: qStat[s.id]?.expiring || 0,
+      qualification_expired: qStat[s.id]?.expired || 0,
+    }));
+    res.json(rows);
+  } catch (error) {
+    console.error('Error (employees list):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 社員一覧 - 社員作成（管理者のみ）
+app.post('/api/employees', requireAuth, requireEmployeeAdmin, async (req, res) => {
+  try {
+    const b = req.body || {};
+    const newId = b.id || (await nextMasterId('staff_master', 'S'));
+    const row = {
+      id: newId,
+      name: b.name,
+      furigana: b.furigana || null,
+      email: b.email || null,
+      skill_id: b.skill_id || null,
+      job_type: b.job_type || null,
+      department: b.department || null,
+      birth_date: b.birth_date || null,
+      gender: b.gender || null,
+      phone: b.phone || null,
+      hire_date: b.hire_date || null,
+      role: b.role || null,
+      app_role: b.app_role || 'member',
+      report_cc: !!b.report_cc,
+      is_active: b.is_active === undefined ? true : !!b.is_active,
+    };
+    const { data, error } = await supabase.from('staff_master').insert([row]).select();
+    if (error) throw error;
+    res.json(data[0]);
+  } catch (error) {
+    console.error('Error (employee create):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 社員一覧 - 社員更新（管理者のみ）
+app.put('/api/employees/:id', requireAuth, requireEmployeeAdmin, async (req, res) => {
+  try {
+    const b = req.body || {};
+    // 送られてきたフィールドのみ更新（部分更新）
+    const allowed = ['name', 'furigana', 'email', 'skill_id', 'job_type', 'department',
+      'birth_date', 'gender', 'phone', 'hire_date', 'role', 'app_role', 'report_cc', 'is_active'];
+    const patch = { updated_at: new Date().toISOString() };
+    for (const k of allowed) {
+      if (b[k] !== undefined) {
+        patch[k] = (k === 'report_cc' || k === 'is_active') ? !!b[k] : (b[k] === '' ? null : b[k]);
+      }
+    }
+    const { data, error } = await supabase
+      .from('staff_master').update(patch).eq('id', req.params.id).select();
+    if (error) throw error;
+    if (!data || data.length === 0) return res.status(404).json({ error: '社員が見つかりません' });
+    res.json(data[0]);
+  } catch (error) {
+    console.error('Error (employee update):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 社員一覧 - 社員削除（管理者のみ）。app_permissions / staff_qualifications は FK の ON DELETE CASCADE で消える。
+app.delete('/api/employees/:id', requireAuth, requireEmployeeAdmin, async (req, res) => {
+  try {
+    const { error } = await supabase.from('staff_master').delete().eq('id', req.params.id);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Error (employee delete):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 社員一覧 - アプリ別権限の更新（管理者のみ）
+//    body: { permissions: { 'safety-patrol': 'admin'|'member'|'none'|null, ... } }
+//    'none' / null / 空文字 はアクセス権の削除。member/admin は upsert。
+app.put('/api/employees/:id/permissions', requireAuth, requireEmployeeAdmin, async (req, res) => {
+  try {
+    const staffId = req.params.id;
+    const incoming = (req.body && req.body.permissions) || {};
+
+    // 対象社員の存在チェック
+    const { data: staff } = await supabase.from('staff_master').select('id').eq('id', staffId).maybeSingle();
+    if (!staff) return res.status(404).json({ error: '社員が見つかりません' });
+
+    for (const [appKey, levelRaw] of Object.entries(incoming)) {
+      if (!APP_KEYS.includes(appKey)) continue; // 未知アプリキーは無視
+      const level = levelRaw === 'admin' ? 'admin' : levelRaw === 'member' ? 'member' : null;
+      if (level === null) {
+        await supabase.from('staff_app_permissions').delete().eq('staff_id', staffId).eq('app_key', appKey);
+      } else {
+        await supabase.from('staff_app_permissions').upsert(
+          { staff_id: staffId, app_key: appKey, access_level: level, updated_at: new Date().toISOString() },
+          { onConflict: 'staff_id,app_key' }
+        );
+      }
+    }
+
+    const map = await resolveAppPermissions(staffId);
+    res.json({ staff_id: staffId, permissions: map });
+  } catch (error) {
+    console.error('Error (permissions update):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 社員一覧 - 一括インポート（管理者のみ）
+//    body: { rows: [ { name, furigana, email, job_type, department, skill_id, gender, birth_date, hire_date, phone } ] }
+//    email があれば突合して更新、無ければ新規採番。返り値はサマリ。
+app.post('/api/employees/import', requireAuth, requireEmployeeAdmin, async (req, res) => {
+  try {
+    const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
+    if (rows.length === 0) return res.status(400).json({ error: 'インポート対象の行がありません' });
+
+    let inserted = 0, updated = 0;
+    const errors = [];
+
+    // 既存 email → id の対応表
+    const { data: existing } = await supabase.from('staff_master').select('id, email');
+    const byEmail = {};
+    for (const e of existing || []) {
+      if (e.email) byEmail[String(e.email).toLowerCase()] = e.id;
+    }
+
+    const fields = ['name', 'furigana', 'email', 'skill_id', 'job_type', 'department', 'birth_date', 'gender', 'phone', 'hire_date'];
+    for (let i = 0; i < rows.length; i++) {
+      const r = rows[i] || {};
+      if (!r.name && !r.email) { errors.push({ row: i + 1, error: '氏名・メールが両方空です' }); continue; }
+      const payload = {};
+      for (const f of fields) {
+        if (r[f] !== undefined && r[f] !== '') payload[f] = r[f];
+      }
+      try {
+        const key = r.email ? String(r.email).toLowerCase() : null;
+        if (key && byEmail[key]) {
+          await supabase.from('staff_master')
+            .update({ ...payload, updated_at: new Date().toISOString() })
+            .eq('id', byEmail[key]);
+          updated++;
+        } else {
+          const newId = await nextMasterId('staff_master', 'S');
+          await supabase.from('staff_master')
+            .insert([{ id: newId, app_role: 'member', is_active: true, ...payload }]);
+          if (key) byEmail[key] = newId;
+          inserted++;
+        }
+      } catch (e) {
+        errors.push({ row: i + 1, error: e.message });
+      }
+    }
+
+    res.json({ inserted, updated, errors, total: rows.length });
+  } catch (error) {
+    console.error('Error (employee import):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ===== 資格マスタ =====
+
+// ✅ 資格マスタ一覧（認証必須・閲覧は社員一覧アクセス権で十分）
+app.get('/api/qualifications', requireAuth, requireEmployeeAccess, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('qualification_master')
+      .select('*')
+      .order('sort_order', { ascending: true })
+      .order('id', { ascending: true });
+    if (error) throw error;
+    res.json(data || []);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 資格マスタ - 期限切れ間近/期限切れの社員資格一覧（:id ルートより前に定義）
+app.get('/api/qualifications/expiring', requireAuth, requireEmployeeAccess, async (req, res) => {
+  try {
+    const days = Number(req.query.days) > 0 ? Number(req.query.days) : EXPIRY_SOON_DAYS;
+    const limit = new Date(Date.now() + days * 86400000).toISOString().slice(0, 10);
+    const { data, error } = await supabase
+      .from('staff_qualifications')
+      .select('*, qualification_master(name, category), staff_master(name)')
+      .not('expiry_date', 'is', null)
+      .lte('expiry_date', limit)
+      .order('expiry_date', { ascending: true });
+    if (error) throw error;
+    res.json(data || []);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 資格マスタ - 作成（管理者のみ）
+app.post('/api/qualifications', requireAuth, requireEmployeeAdmin, async (req, res) => {
+  try {
+    const { id, name, category, has_expiry, sort_order } = req.body || {};
+    if (!name) return res.status(400).json({ error: '資格名は必須です' });
+    const newId = id || (await nextMasterId('qualification_master', 'Q'));
+    const { data, error } = await supabase
+      .from('qualification_master')
+      .insert([{ id: newId, name, category: category || 'その他', has_expiry: !!has_expiry, sort_order: sort_order || 0 }])
+      .select();
+    if (error) throw error;
+    res.json(data[0]);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 資格マスタ - 更新（管理者のみ）
+app.put('/api/qualifications/:id', requireAuth, requireEmployeeAdmin, async (req, res) => {
+  try {
+    const { name, category, has_expiry, sort_order } = req.body || {};
+    const patch = { updated_at: new Date().toISOString() };
+    if (name !== undefined) patch.name = name;
+    if (category !== undefined) patch.category = category;
+    if (has_expiry !== undefined) patch.has_expiry = !!has_expiry;
+    if (sort_order !== undefined) patch.sort_order = sort_order;
+    const { data, error } = await supabase
+      .from('qualification_master').update(patch).eq('id', req.params.id).select();
+    if (error) throw error;
+    if (!data || data.length === 0) return res.status(404).json({ error: '資格が見つかりません' });
+    res.json(data[0]);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 資格マスタ - 削除（管理者のみ）。ひも付く staff_qualifications は CASCADE で消える。
+app.delete('/api/qualifications/:id', requireAuth, requireEmployeeAdmin, async (req, res) => {
+  try {
+    const { error } = await supabase.from('qualification_master').delete().eq('id', req.params.id);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ===== 社員ごとの資格 =====
+
+// ✅ 社員の保有資格一覧（資格マスタ名を結合）
+app.get('/api/employees/:id/qualifications', requireAuth, requireEmployeeAccess, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('staff_qualifications')
+      .select('*, qualification_master(name, category, has_expiry)')
+      .eq('staff_id', req.params.id)
+      .order('acquired_date', { ascending: false });
+    if (error) throw error;
+    res.json(data || []);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 社員へ資格を追加（管理者のみ）
+app.post('/api/employees/:id/qualifications', requireAuth, requireEmployeeAdmin, async (req, res) => {
+  try {
+    const { qualification_id, acquired_date, expiry_date, cert_number, note } = req.body || {};
+    if (!qualification_id) return res.status(400).json({ error: '資格を選択してください' });
+    const { data, error } = await supabase
+      .from('staff_qualifications')
+      .insert([{
+        staff_id: req.params.id,
+        qualification_id,
+        acquired_date: acquired_date || null,
+        expiry_date: expiry_date || null,
+        cert_number: cert_number || null,
+        note: note || null,
+      }])
+      .select('*, qualification_master(name, category, has_expiry)');
+    if (error) {
+      if (error.code === '23505') return res.status(409).json({ error: 'この社員には既に同じ資格が登録されています' });
+      throw error;
+    }
+    res.json(data[0]);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 社員の資格を更新（管理者のみ）
+app.put('/api/employees/:id/qualifications/:qid', requireAuth, requireEmployeeAdmin, async (req, res) => {
+  try {
+    const { acquired_date, expiry_date, cert_number, note } = req.body || {};
+    const patch = { updated_at: new Date().toISOString() };
+    if (acquired_date !== undefined) patch.acquired_date = acquired_date || null;
+    if (expiry_date !== undefined) patch.expiry_date = expiry_date || null;
+    if (cert_number !== undefined) patch.cert_number = cert_number || null;
+    if (note !== undefined) patch.note = note || null;
+    const { data, error } = await supabase
+      .from('staff_qualifications')
+      .update(patch)
+      .eq('id', req.params.qid)
+      .eq('staff_id', req.params.id)
+      .select('*, qualification_master(name, category, has_expiry)');
+    if (error) throw error;
+    if (!data || data.length === 0) return res.status(404).json({ error: '資格が見つかりません' });
+    res.json(data[0]);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 社員の資格を削除（管理者のみ）
+app.delete('/api/employees/:id/qualifications/:qid', requireAuth, requireEmployeeAdmin, async (req, res) => {
+  try {
+    const { error } = await supabase
+      .from('staff_qualifications')
+      .delete()
+      .eq('id', req.params.qid)
+      .eq('staff_id', req.params.id);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
