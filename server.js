@@ -6,6 +6,7 @@ import ws from 'ws';
 import { randomUUID as uuidv4 } from 'crypto';
 import jwt from 'jsonwebtoken';
 import multer from 'multer';
+import nodemailer from 'nodemailer';
 
 dotenv.config();
 
@@ -84,6 +85,31 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY,
   { global: { headers: { 'x-client-info': 'portal-api' } }, realtime: { transport: ws } }
 );
+
+// ✅ メール送信（SMTP）設定。環境変数から遅延初期化し、未設定ならサーバー起動は妨げず送信時にエラーを返す。
+//    自社メール（bizmw / nakahara131.co.jp, port587, 暗号化なし, SMTP認証あり）を想定。
+const MAIL_FROM = process.env.MAIL_FROM || 'system_noreply@nakahara131.co.jp';
+const MAIL_FROM_NAME = process.env.MAIL_FROM_NAME || '中原建設社内システム';
+let mailTransporter = null;
+function getMailTransporter() {
+  if (mailTransporter) return mailTransporter;
+  const host = process.env.SMTP_HOST;
+  const port = Number(process.env.SMTP_PORT || 587);
+  const user = process.env.SMTP_USER;
+  const pass = process.env.SMTP_PASS;
+  if (!host || !user || !pass) {
+    throw new Error('メール送信が未設定です（環境変数 SMTP_HOST / SMTP_USER / SMTP_PASS を設定してください）');
+  }
+  mailTransporter = nodemailer.createTransport({
+    host,
+    port,
+    secure: port === 465, // 465は暗黙SSL。587はSTARTTLS（対応時のみ日和見的に使用）
+    auth: { user, pass },
+    requireTLS: false,                 // サーバー設定が「暗号化なし」のためTLSを必須にしない
+    tls: { rejectUnauthorized: false } // 暗号化なし／自己署名環境でも送信を通す
+  });
+  return mailTransporter;
+}
 
 // ✅ マスタIDを既存の連番に従って自動採番（例: P001 → P010, S008, M049）
 async function nextMasterId(table, prefix) {
@@ -645,6 +671,121 @@ app.get('/api/inspections/:id/report-url', async (req, res) => {
   }
 });
 
+// ✅ 安全パトロール - 生成済みPDFを作業所長へメール送信（CCは report_cc=true の社員）
+//    宛先(To)＝点検の作業所長(manager_id)のメール、CC＝レポートCC対象の社員。
+//    送信権限はPDF発行と同条件（管理者 or 担当検査官）。
+app.post('/api/inspections/:id/send-report', async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // 点検＋明細（指摘件数算出用）を取得
+    const { data: insp, error: inspErr } = await supabase
+      .from('inspections')
+      .select('*, inspection_details(result)')
+      .eq('id', id)
+      .single();
+    if (inspErr) {
+      if (inspErr.code === 'PGRST116') return res.status(404).json({ error: '点検が見つかりません' });
+      throw inspErr;
+    }
+
+    // 権限: 管理者 or 担当検査官
+    const perms = await resolvePermissions(req.user.email);
+    if (perms.role !== 'admin' && insp.inspector_id !== perms.staffId) {
+      return res.status(403).json({ error: 'メール送信は担当検査官または管理者のみ可能です' });
+    }
+
+    // 保存済みPDFが前提
+    if (!isStoredPdf(insp.report_url)) {
+      return res.status(409).json({ error: '先にPDFを生成・保存してください' });
+    }
+
+    // 宛先(To): 作業所長
+    if (!insp.manager_id) {
+      return res.status(400).json({ error: 'この点検に作業所長が設定されていません' });
+    }
+    const { data: mgrRows } = await supabase
+      .from('staff_master')
+      .select('name, email')
+      .eq('id', insp.manager_id);
+    const manager = mgrRows && mgrRows[0];
+    const toEmail = (manager?.email || '').trim();
+    if (!toEmail) {
+      return res.status(400).json({ error: '作業所長のメールアドレスが未登録です。社員管理で登録してください。' });
+    }
+
+    // CC: report_cc=true の社員（Toと重複・空は除外）
+    const { data: ccRows } = await supabase
+      .from('staff_master')
+      .select('email')
+      .eq('report_cc', true);
+    const ccEmails = [...new Set(
+      (ccRows || [])
+        .map((r) => (r.email || '').trim())
+        .filter(Boolean)
+        .filter((e) => e.toLowerCase() !== toEmail.toLowerCase())
+    )];
+
+    // 現場名
+    const { data: projRows } = await supabase
+      .from('projects')
+      .select('name')
+      .eq('id', insp.project_id);
+    const projectName = projRows?.[0]?.name || insp.project_id || '現場';
+
+    // 指摘件数
+    const details = insp.inspection_details || [];
+    const issueCount = details.filter((d) => d.result === '指摘あり').length;
+
+    // Storage から PDF を取得して添付
+    const { data: fileBlob, error: dlErr } = await supabase.storage
+      .from(REPORTS_BUCKET)
+      .download(insp.report_url);
+    if (dlErr) throw dlErr;
+    const pdfBuffer = Buffer.from(await fileBlob.arrayBuffer());
+
+    const dateStr = insp.inspection_date
+      ? new Date(insp.inspection_date).toLocaleDateString('ja-JP')
+      : '';
+    const subject = `【安全パトロール点検報告】${projectName} ${dateStr}`.trim();
+    const attachName = `点検報告_${String(projectName).replace(/[\\/:*?"<>|]/g, '')}_${dateStr.replace(/\//g, '')}.pdf`;
+    const body = [
+      `${manager?.name || ''} 様`.trim(),
+      '',
+      'お疲れ様です。中原建設社内システムです。',
+      `${projectName} の安全パトロール点検報告書をお送りします。`,
+      '',
+      `　点検日　： ${dateStr}`,
+      `　現場　　： ${projectName}`,
+      `　指摘件数： ${issueCount} 件`,
+      '',
+      '詳細は添付のPDFをご確認ください。',
+      '',
+      '────────────────────',
+      '※本メールは送信専用アドレスから自動送信されています。',
+      '※ご返信いただいてもご対応できない場合があります。',
+    ].join('\n');
+
+    const transporter = getMailTransporter();
+    await transporter.sendMail({
+      from: { name: MAIL_FROM_NAME, address: MAIL_FROM },
+      to: toEmail,
+      cc: ccEmails.length ? ccEmails : undefined,
+      subject,
+      text: body,
+      attachments: [{ filename: attachName, content: pdfBuffer, contentType: 'application/pdf' }]
+    });
+
+    const sentAt = new Date().toISOString();
+    await supabase.from('inspections').update({ report_sent_at: sentAt }).eq('id', id);
+
+    res.json({ success: true, to: toEmail, cc: ccEmails, sent_at: sentAt });
+  } catch (error) {
+    console.error('Error (send-report):', error.message);
+    res.status(500).json({ error: `メール送信に失敗しました: ${error.message}` });
+  }
+});
+
 // ✅ 安全パトロール - 点検削除（管理者のみ）
 app.delete('/api/inspections/:id', requireAdmin, async (req, res) => {
   try {
@@ -737,11 +878,11 @@ app.get('/api/masters/staff', async (req, res) => {
 // ✅ マスター管理 - スタッフ作成
 app.post('/api/masters/staff', async (req, res) => {
   try {
-    const { id, name, email, role, app_role } = req.body;
+    const { id, name, email, role, app_role, report_cc } = req.body;
     const newId = id || await nextMasterId('staff_master', 'S');
     const { data, error } = await supabase
       .from('staff_master')
-      .insert([{ id: newId, name, email, role, app_role: app_role || 'member' }])
+      .insert([{ id: newId, name, email, role, app_role: app_role || 'member', report_cc: !!report_cc }])
       .select();
     if (error) throw error;
     res.json(data[0]);
@@ -753,10 +894,10 @@ app.post('/api/masters/staff', async (req, res) => {
 // ✅ マスター管理 - スタッフ更新
 app.put('/api/masters/staff/:id', async (req, res) => {
   try {
-    const { name, email, role, app_role } = req.body;
+    const { name, email, role, app_role, report_cc } = req.body;
     const { data, error } = await supabase
       .from('staff_master')
-      .update({ name, email, role, app_role })
+      .update({ name, email, role, app_role, report_cc: !!report_cc })
       .eq('id', req.params.id)
       .select();
     if (error) throw error;
