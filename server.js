@@ -1723,57 +1723,8 @@ app.put('/api/employees/:id/permissions', requireAuth, requireEmployeeAdmin, asy
   }
 });
 
-// ✅ 社員一覧 - 一括インポート（管理者のみ）
-//    body: { rows: [ { name, furigana, email, job_type, department, skill_id, gender, birth_date, hire_date, phone } ] }
-//    email があれば突合して更新、無ければ新規採番。返り値はサマリ。
-app.post('/api/employees/import', requireAuth, requireEmployeeAdmin, async (req, res) => {
-  try {
-    const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
-    if (rows.length === 0) return res.status(400).json({ error: 'インポート対象の行がありません' });
-
-    let inserted = 0, updated = 0;
-    const errors = [];
-
-    // 既存 email → id の対応表
-    const { data: existing } = await supabase.from('staff_master').select('id, email');
-    const byEmail = {};
-    for (const e of existing || []) {
-      if (e.email) byEmail[String(e.email).toLowerCase()] = e.id;
-    }
-
-    const fields = ['name', 'furigana', 'email', 'skill_id', 'job_type', 'department', 'company', 'birth_date', 'gender', 'phone', 'postal_code', 'address', 'hire_date'];
-    for (let i = 0; i < rows.length; i++) {
-      const r = rows[i] || {};
-      if (!r.name && !r.email) { errors.push({ row: i + 1, error: '氏名・メールが両方空です' }); continue; }
-      const payload = {};
-      for (const f of fields) {
-        if (r[f] !== undefined && r[f] !== '') payload[f] = r[f];
-      }
-      try {
-        const key = r.email ? String(r.email).toLowerCase() : null;
-        if (key && byEmail[key]) {
-          await supabase.from('staff_master')
-            .update({ ...payload, updated_at: new Date().toISOString() })
-            .eq('id', byEmail[key]);
-          updated++;
-        } else {
-          const newId = await nextMasterId('staff_master', 'S');
-          await supabase.from('staff_master')
-            .insert([{ id: newId, app_role: 'member', is_active: true, ...payload }]);
-          if (key) byEmail[key] = newId;
-          inserted++;
-        }
-      } catch (e) {
-        errors.push({ row: i + 1, error: e.message });
-      }
-    }
-
-    res.json({ inserted, updated, errors, total: rows.length });
-  } catch (error) {
-    console.error('Error (employee import):', error.message);
-    res.status(500).json({ error: error.message });
-  }
-});
+// 注: 社員の一括インポート機能（旧 POST /api/employees/import）は廃止しました。
+//     社員登録は画面からの個別追加、台帳の持ち出しは CSV エクスポートで行います。
 
 // ===== 資格マスタ =====
 
@@ -1857,9 +1808,132 @@ app.delete('/api/qualifications/:id', requireAuth, requireEmployeeAdmin, async (
   }
 });
 
+// ===== 資格者証の AI 読み取り（Gemini）+ 原本画像保存 =====
+
+// 資格者証の原本画像を入れる Supabase Storage バケット（非公開）。
+// 個人情報（氏名・生年月日等）を含むため公開せず、閲覧時に署名付きURLを都度発行する。
+const CERT_BUCKET = 'qualification-certs';
+let certBucketEnsured = false;
+async function ensureCertBucket() {
+  if (certBucketEnsured) return;
+  const { data: buckets, error } = await supabase.storage.listBuckets();
+  if (error) throw error;
+  if (!buckets?.some((b) => b.name === CERT_BUCKET)) {
+    const { error: createError } = await supabase.storage.createBucket(CERT_BUCKET, { public: false });
+    if (createError && !/exist/i.test(createError.message)) throw createError;
+  }
+  certBucketEnsured = true;
+}
+
+// 非公開バケットの画像を一時表示するための署名付きURL（既定1時間）
+async function certSignedUrl(path, expiresIn = 3600) {
+  if (!path) return null;
+  const { data } = await supabase.storage.from(CERT_BUCKET).createSignedUrl(path, expiresIn);
+  return data?.signedUrl || null;
+}
+
+// 資格名の正規化（空白・括弧書きを除去して突合精度を上げる）
+function normalizeQualName(s) {
+  return String(s || '')
+    .replace(/[\s　]/g, '')
+    .replace(/[（(].*?[)）]/g, '')
+    .toLowerCase();
+}
+
+// 抽出した資格名を qualification_master に突合。完全一致→部分一致の順。見つからなければ null。
+function matchQualificationId(name, masters) {
+  const n = normalizeQualName(name);
+  if (!n) return null;
+  const exact = masters.find((m) => normalizeQualName(m.name) === n);
+  if (exact) return exact.id;
+  const part = masters.find((m) => {
+    const mn = normalizeQualName(m.name);
+    return mn && (mn.includes(n) || n.includes(mn));
+  });
+  return part ? part.id : null;
+}
+
+// YYYY-MM-DD 形式のみ許可。それ以外（和暦の取りこぼし等）は null にして手入力に委ねる。
+function cleanIsoDate(s) {
+  return /^\d{4}-\d{2}-\d{2}$/.test(String(s || '')) ? s : null;
+}
+
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+
+// 資格者証の画像/PDF を Gemini で解析し、資格名・区分・番号・取得日・有効期限を構造化して返す。
+async function extractCertificate(buffer, mimeType) {
+  if (!GEMINI_API_KEY) {
+    const e = new Error('GEMINI_API_KEY が未設定です。Render の環境変数に設定してください。');
+    e.status = 503;
+    throw e;
+  }
+  const prompt = [
+    'これは日本の労働安全衛生に関する「資格者証」（修了証・技能講習修了証・免許証・運転免許証など）の画像です。',
+    '記載内容を読み取り、次の項目をJSONで返してください。',
+    '- name: 資格・講習の正式名称（例: 玉掛け技能講習、フォークリフト運転技能講習、職長・安全衛生責任者教育）',
+    '- category: 次のいずれか1つ「特別教育」「技能講習」「免許」「その他」',
+    '- cert_number: 証明書番号・免許番号（無ければ空文字）',
+    '- acquired_date: 取得日・修了日（YYYY-MM-DD。和暦は西暦へ変換。読めなければ空文字）',
+    '- expiry_date: 有効期限（YYYY-MM-DD。期限の記載が無ければ空文字）',
+    '読み取れない項目は空文字にし、推測で埋めないでください。',
+  ].join('\n');
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+  const body = {
+    contents: [{
+      parts: [
+        { text: prompt },
+        { inlineData: { mimeType: mimeType || 'image/jpeg', data: buffer.toString('base64') } },
+      ],
+    }],
+    generationConfig: {
+      temperature: 0,
+      responseMimeType: 'application/json',
+      responseSchema: {
+        type: 'OBJECT',
+        properties: {
+          name: { type: 'STRING' },
+          category: { type: 'STRING', enum: ['特別教育', '技能講習', '免許', 'その他'] },
+          cert_number: { type: 'STRING' },
+          acquired_date: { type: 'STRING' },
+          expiry_date: { type: 'STRING' },
+        },
+        required: ['name', 'category'],
+      },
+    },
+  };
+
+  const resp = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!resp.ok) {
+    const t = await resp.text();
+    const e = new Error(`Gemini API エラー (${resp.status}): ${t.slice(0, 300)}`);
+    e.status = 502;
+    throw e;
+  }
+  const json = await resp.json();
+  const text = json?.candidates?.[0]?.content?.parts?.[0]?.text;
+  if (!text) throw new Error('Gemini から有効な応答が得られませんでした');
+  let parsed;
+  try { parsed = JSON.parse(text); } catch { throw new Error('Gemini 応答の解析に失敗しました'); }
+
+  const CATS = ['特別教育', '技能講習', '免許', 'その他'];
+  return {
+    name: (parsed.name || '').trim(),
+    category: CATS.includes(parsed.category) ? parsed.category : 'その他',
+    cert_number: (parsed.cert_number || '').trim(),
+    acquired_date: cleanIsoDate(parsed.acquired_date),
+    expiry_date: cleanIsoDate(parsed.expiry_date),
+  };
+}
+
 // ===== 社員ごとの資格 =====
 
-// ✅ 社員の保有資格一覧（資格マスタ名を結合）
+// ✅ 社員の保有資格一覧（資格マスタ名を結合。原本画像があれば署名付きURLを付与）
 app.get('/api/employees/:id/qualifications', requireAuth, requireEmployeeAccess, async (req, res) => {
   try {
     const { data, error } = await supabase
@@ -1868,16 +1942,21 @@ app.get('/api/employees/:id/qualifications', requireAuth, requireEmployeeAccess,
       .eq('staff_id', req.params.id)
       .order('acquired_date', { ascending: false });
     if (error) throw error;
-    res.json(data || []);
+    // 原本画像があれば表示用の署名付きURLを付与
+    const rows = await Promise.all((data || []).map(async (r) => ({
+      ...r,
+      cert_image_url: r.cert_image_path ? await certSignedUrl(r.cert_image_path) : null,
+    })));
+    res.json(rows);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
-// ✅ 社員へ資格を追加（管理者のみ）
+// ✅ 社員へ資格を追加（管理者のみ）。cert_image_path があれば原本画像も紐付ける。
 app.post('/api/employees/:id/qualifications', requireAuth, requireEmployeeAdmin, async (req, res) => {
   try {
-    const { qualification_id, acquired_date, expiry_date, cert_number, note } = req.body || {};
+    const { qualification_id, acquired_date, expiry_date, cert_number, note, cert_image_path } = req.body || {};
     if (!qualification_id) return res.status(400).json({ error: '資格を選択してください' });
     const { data, error } = await supabase
       .from('staff_qualifications')
@@ -1888,15 +1967,53 @@ app.post('/api/employees/:id/qualifications', requireAuth, requireEmployeeAdmin,
         expiry_date: expiry_date || null,
         cert_number: cert_number || null,
         note: note || null,
+        cert_image_path: cert_image_path || null,
       }])
       .select('*, qualification_master(name, category, has_expiry)');
     if (error) {
       if (error.code === '23505') return res.status(409).json({ error: 'この社員には既に同じ資格が登録されています' });
       throw error;
     }
-    res.json(data[0]);
+    const row = data[0];
+    row.cert_image_url = row.cert_image_path ? await certSignedUrl(row.cert_image_path) : null;
+    res.json(row);
   } catch (error) {
     res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 資格者証をアップロード→Geminiで読取→原本画像を保存し、抽出結果を返す（管理者のみ）
+//    この時点ではDBに資格は登録しない。フロントで内容を確認・修正してから保存する。
+//    返り値: { extracted, matched_qualification_id, cert_image_path, cert_image_url }
+app.post('/api/employees/:id/qualifications/scan', requireAuth, requireEmployeeAdmin, upload.single('cert'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'cert（資格者証の画像/PDF）が必要です' });
+
+    // 1) Gemini で内容を抽出
+    const extracted = await extractCertificate(req.file.buffer, req.file.mimetype);
+
+    // 2) 原本画像を非公開バケットへ保存
+    await ensureCertBucket();
+    const ext = (req.file.originalname.split('.').pop() || 'jpg').toLowerCase();
+    const path = `${req.params.id}/${Date.now()}-${uuidv4()}.${ext}`;
+    const { error: upErr } = await supabase.storage
+      .from(CERT_BUCKET)
+      .upload(path, req.file.buffer, { contentType: req.file.mimetype });
+    if (upErr) throw upErr;
+
+    // 3) 抽出した資格名を既存マスタへ突合
+    const { data: masters } = await supabase.from('qualification_master').select('id, name');
+    const matched_qualification_id = matchQualificationId(extracted.name, masters || []);
+
+    res.json({
+      extracted,
+      matched_qualification_id,
+      cert_image_path: path,
+      cert_image_url: await certSignedUrl(path),
+    });
+  } catch (error) {
+    console.error('Error (qualification scan):', error.message);
+    res.status(error.status || 500).json({ error: error.message });
   }
 });
 
