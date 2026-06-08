@@ -1637,6 +1637,8 @@ app.post('/api/employees', requireAuth, requireEmployeeAdmin, async (req, res) =
       birth_date: b.birth_date || null,
       gender: b.gender || null,
       phone: b.phone || null,
+      postal_code: b.postal_code || null,
+      address: b.address || null,
       hire_date: b.hire_date || null,
       role: b.role || null,
       app_role: b.app_role || 'member',
@@ -1658,7 +1660,7 @@ app.put('/api/employees/:id', requireAuth, requireEmployeeAdmin, async (req, res
     const b = req.body || {};
     // 送られてきたフィールドのみ更新（部分更新）
     const allowed = ['name', 'furigana', 'email', 'skill_id', 'job_type', 'department', 'company',
-      'birth_date', 'gender', 'phone', 'hire_date', 'role', 'app_role', 'report_cc', 'is_active'];
+      'birth_date', 'gender', 'phone', 'postal_code', 'address', 'hire_date', 'role', 'app_role', 'report_cc', 'is_active'];
     const patch = { updated_at: new Date().toISOString() };
     for (const k of allowed) {
       if (b[k] !== undefined) {
@@ -1739,7 +1741,7 @@ app.post('/api/employees/import', requireAuth, requireEmployeeAdmin, async (req,
       if (e.email) byEmail[String(e.email).toLowerCase()] = e.id;
     }
 
-    const fields = ['name', 'furigana', 'email', 'skill_id', 'job_type', 'department', 'company', 'birth_date', 'gender', 'phone', 'hire_date'];
+    const fields = ['name', 'furigana', 'email', 'skill_id', 'job_type', 'department', 'company', 'birth_date', 'gender', 'phone', 'postal_code', 'address', 'hire_date'];
     for (let i = 0; i < rows.length; i++) {
       const r = rows[i] || {};
       if (!r.name && !r.email) { errors.push({ row: i + 1, error: '氏名・メールが両方空です' }); continue; }
