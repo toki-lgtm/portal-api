@@ -943,6 +943,88 @@ async function loadDetailWithInspection(inspectionId, detailId) {
   return { detail, insp };
 }
 
+// 是正写真が提出されたら担当検査官へメール通知する（CC: report_cc=true の社員）。
+// ベストエフォート: ここでの失敗は呼び出し側で握りつぶし、是正提出自体は成功扱いにする。
+async function notifyCorrectionSubmitted({ inspectionId, detail, submitterStaffId }) {
+  // 検査官・現場・点検日を取得（loadDetailWithInspection は project/date を持たないため再取得）
+  const { data: insp, error: inspErr } = await supabase
+    .from('inspections')
+    .select('inspector_id, project_id, inspection_date')
+    .eq('id', inspectionId)
+    .single();
+  if (inspErr || !insp) throw new Error('点検情報の取得に失敗しました');
+  if (!insp.inspector_id) throw new Error('担当検査官が未設定のため通知できません');
+
+  // To: 担当検査官
+  const { data: inspectorRows } = await supabase
+    .from('staff_master')
+    .select('name, email')
+    .eq('id', insp.inspector_id);
+  const inspector = inspectorRows && inspectorRows[0];
+  const toEmail = (inspector?.email || '').trim();
+  if (!toEmail) throw new Error('担当検査官のメールアドレスが未登録です');
+
+  // CC: report_cc=true の社員（既存のPDF報告メールと同じ登録者リスト。To と重複・空は除外）
+  const { data: ccRows } = await supabase
+    .from('staff_master')
+    .select('email')
+    .eq('report_cc', true);
+  const ccEmails = [...new Set(
+    (ccRows || [])
+      .map((r) => (r.email || '').trim())
+      .filter(Boolean)
+      .filter((e) => e.toLowerCase() !== toEmail.toLowerCase())
+  )];
+
+  // 現場名・提出者名
+  const { data: projRows } = await supabase.from('projects').select('name').eq('id', insp.project_id);
+  const projectName = projRows?.[0]?.name || insp.project_id || '現場';
+  let submitterName = '';
+  if (submitterStaffId) {
+    const { data: subRows } = await supabase.from('staff_master').select('name').eq('id', submitterStaffId);
+    submitterName = subRows?.[0]?.name || '';
+  }
+
+  const dateStr = insp.inspection_date
+    ? new Date(insp.inspection_date).toLocaleDateString('ja-JP')
+    : '';
+  const photoCount = Array.isArray(detail.correction_image_urls) ? detail.correction_image_urls.length : 0;
+  const appUrl = (process.env.SAFETY_PATROL_URL || '').trim();
+
+  const subject = `【安全パトロール】是正写真が提出されました（${projectName} ${dateStr}）`.trim();
+  const lines = [
+    `${inspector?.name || ''} 様`.trim(),
+    '',
+    'お疲れ様です。中原建設社内システムです。',
+    '下記の指摘について是正写真が提出されました。内容をご確認のうえ、承認または差し戻しをお願いします。',
+    '',
+    `　現場　　： ${projectName}`,
+    `　点検日　： ${dateStr}`,
+    `　区分　　： ${detail.category || ''}`,
+    `　指摘内容： ${detail.issue_content || detail.description || ''}`,
+    `　是正写真： ${photoCount} 枚`,
+    submitterName ? `　提出者　： ${submitterName}` : null,
+    detail.correction_comment ? `　是正コメント： ${detail.correction_comment}` : null,
+    '',
+    'アプリの「是正対応」画面から確認・承認できます。',
+    appUrl ? `　${appUrl}` : null,
+    '',
+    '────────────────────',
+    '※本メールは送信専用アドレスから自動送信されています。',
+    '※ご返信いただいてもご対応できない場合があります。',
+  ].filter((line) => line !== null);
+
+  const transporter = getMailTransporter();
+  await transporter.sendMail({
+    from: { name: MAIL_FROM_NAME, address: MAIL_FROM },
+    to: toEmail,
+    cc: ccEmails.length ? ccEmails : undefined,
+    subject,
+    text: lines.join('\n'),
+  });
+  return { to: toEmail, cc: ccEmails };
+}
+
 // ✅ 是正写真の提出（作業所長 or 管理者）。pending/rejected → submitted。
 app.post('/api/inspections/:id/details/:detailId/correction', async (req, res) => {
   try {
@@ -974,7 +1056,14 @@ app.post('/api/inspections/:id/details/:detailId/correction', async (req, res) =
       .eq('id', detailId)
       .select();
     if (upErr) throw upErr;
-    res.json(data[0]);
+
+    const updated = data[0];
+    // 担当検査官へ是正提出を通知（CC: 登録者）。メール失敗は提出成否に影響させない。
+    notifyCorrectionSubmitted({ inspectionId: id, detail: updated, submitterStaffId: perms.staffId })
+      .then((info) => console.log(`是正提出メール送信: to=${info.to} cc=${info.cc.join(',') || 'なし'}`))
+      .catch((mailErr) => console.warn('是正提出メール通知に失敗（提出は成功）:', mailErr.message));
+
+    res.json(updated);
   } catch (error) {
     console.error('Error (correction submit):', error.message);
     res.status(500).json({ error: error.message });
