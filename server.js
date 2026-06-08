@@ -79,6 +79,21 @@ const supabase = createClient(
   { global: { headers: { 'x-client-info': 'portal-api' } }, realtime: { transport: ws } }
 );
 
+// ✅ マスタIDを既存の連番に従って自動採番（例: P001 → P010, S008, M049）
+async function nextMasterId(table, prefix) {
+  const { data, error } = await supabase.from(table).select('id');
+  if (error) throw error;
+  let max = 0;
+  for (const row of (data || [])) {
+    const m = String(row.id || '').match(new RegExp('^' + prefix + '(\\d+)$'));
+    if (m) {
+      const n = parseInt(m[1], 10);
+      if (n > max) max = n;
+    }
+  }
+  return prefix + String(max + 1).padStart(3, '0');
+}
+
 // ✅ ヘルスチェック
 app.get('/health', (req, res) => {
   res.json({ status: 'OK', timestamp: new Date().toISOString() });
@@ -427,9 +442,10 @@ app.get('/api/masters/projects', async (req, res) => {
 app.post('/api/masters/projects', async (req, res) => {
   try {
     const { id, name, location, start_date, end_date, manager_id } = req.body;
+    const newId = id || await nextMasterId('projects', 'P');
     const { data, error } = await supabase
       .from('projects')
-      .insert([{ id: id || uuidv4(), name, location, start_date, end_date, manager_id }])
+      .insert([{ id: newId, name, location, start_date, end_date, manager_id }])
       .select();
     if (error) throw error;
     res.json(data[0]);
@@ -483,9 +499,10 @@ app.get('/api/masters/staff', async (req, res) => {
 app.post('/api/masters/staff', async (req, res) => {
   try {
     const { id, name, email, role } = req.body;
+    const newId = id || await nextMasterId('staff_master', 'S');
     const { data, error } = await supabase
       .from('staff_master')
-      .insert([{ id: id || uuidv4(), name, email, role }])
+      .insert([{ id: newId, name, email, role }])
       .select();
     if (error) throw error;
     res.json(data[0]);
@@ -539,9 +556,10 @@ app.get('/api/masters/inspection-items', async (req, res) => {
 app.post('/api/masters/inspection-items', async (req, res) => {
   try {
     const { id, category, description } = req.body;
+    const newId = id || await nextMasterId('inspection_master', 'M');
     const { data, error } = await supabase
       .from('inspection_master')
-      .insert([{ id: id || uuidv4(), category, description }])
+      .insert([{ id: newId, category, description }])
       .select();
     if (error) throw error;
     res.json(data[0]);
