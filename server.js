@@ -5,8 +5,12 @@ import { createClient } from '@supabase/supabase-js';
 import ws from 'ws';
 import { v4 as uuidv4 } from 'uuid';
 import jwt from 'jsonwebtoken';
+import multer from 'multer';
 
 dotenv.config();
+
+// ✅ multer: 写真アップロード用（メモリストレージ）
+const upload = multer({ storage: multer.memoryStorage() });
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -189,18 +193,38 @@ app.get('/api/inspections', async (req, res) => {
   }
 });
 
-// ✅ 安全パトロール - 点検作成
+// ✅ 安全パトロール - 点検作成（details 一括 insert 対応）
 app.post('/api/inspections', async (req, res) => {
   try {
-    const { inspection_id, project_id, inspector_id, inspection_date, categories, status, comments, report_url } = req.body;
+    const {
+      inspection_id,
+      project_id,
+      inspector_id,
+      manager_id,
+      inspection_date,
+      categories,
+      status,
+      comments,
+      report_url,
+      details
+    } = req.body;
 
-    const { data, error } = await supabase
+    // inspection_id 省略時は 'INS-YYYYMMDD-XXXX' 形式で自動生成
+    const now = new Date();
+    const dateStr = now.toISOString().slice(0, 10).replace(/-/g, '');
+    const suffix = Math.random().toString(36).toUpperCase().slice(2, 6);
+    const resolvedInspectionId = inspection_id || `INS-${dateStr}-${suffix}`;
+
+    const newId = uuidv4();
+
+    const { data: inspectionData, error: inspectionError } = await supabase
       .from('inspections')
       .insert([{
-        id: uuidv4(),
-        inspection_id,
+        id: newId,
+        inspection_id: resolvedInspectionId,
         project_id,
         inspector_id,
+        manager_id,
         inspection_date,
         categories: categories || [],
         status: status || 'pending',
@@ -209,21 +233,106 @@ app.post('/api/inspections', async (req, res) => {
       }])
       .select();
 
-    if (error) throw error;
-    res.json(data[0]);
+    if (inspectionError) throw inspectionError;
+
+    const inspection = inspectionData[0];
+
+    // ✅ details がある場合は inspection_details に一括 insert
+    if (details && details.length > 0) {
+      const detailRows = details.map((d) => ({
+        id: uuidv4(),
+        inspection_id: newId,
+        item_id: d.item_id,
+        category: d.category,
+        description: d.description,
+        result: d.result,
+        issue_content: d.issue_content || null,
+        issue_image_url: d.issue_image_url || null,
+        due_date: d.due_date || null
+      }));
+
+      const { data: detailData, error: detailError } = await supabase
+        .from('inspection_details')
+        .insert(detailRows)
+        .select();
+
+      if (detailError) {
+        // ✅ details insert 失敗時はロールバック相当：作成した inspection を削除して 500 を返す
+        console.error('details insert error（rollback）:', detailError.message);
+        await supabase.from('inspections').delete().eq('id', newId);
+        return res.status(500).json({ error: `inspection_details の保存に失敗しました: ${detailError.message}` });
+      }
+
+      return res.json({ ...inspection, inspection_details: detailData || [] });
+    }
+
+    res.json({ ...inspection, inspection_details: [] });
   } catch (error) {
     console.error('Error:', error.message);
     res.status(500).json({ error: error.message });
   }
 });
 
-// ✅ 安全パトロール - 点検更新
+// ✅ 安全パトロール - 写真アップロード（Supabase Storage: inspection-photos バケット）
+// ※ このルートは固定パスのため :id より前に定義する
+app.post('/api/inspections/upload-photo', upload.single('photo'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'photo フィールドが必要です' });
+    }
+
+    const ext = (req.file.originalname.split('.').pop() || 'jpg').toLowerCase();
+    const path = `${Date.now()}-${uuidv4()}.${ext}`;
+
+    const { error: uploadError } = await supabase.storage
+      .from('inspection-photos')
+      .upload(path, req.file.buffer, { contentType: req.file.mimetype });
+
+    if (uploadError) throw uploadError;
+
+    const { data: urlData } = supabase.storage
+      .from('inspection-photos')
+      .getPublicUrl(path);
+
+    res.json({ url: urlData.publicUrl });
+  } catch (error) {
+    console.error('Error:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 安全パトロール - 点検詳細取得（inspection_details を結合）
+app.get('/api/inspections/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const { data, error } = await supabase
+      .from('inspections')
+      .select('*, inspection_details(*)')
+      .eq('id', id)
+      .single();
+
+    if (error) {
+      if (error.code === 'PGRST116') {
+        return res.status(404).json({ error: '点検が見つかりません' });
+      }
+      throw error;
+    }
+
+    res.json(data);
+  } catch (error) {
+    console.error('Error:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 安全パトロール - 点検更新（details がある場合は全削除→再 insert で置き換え）
 app.put('/api/inspections/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    const { status, comments, report_url, categories } = req.body;
+    const { status, comments, report_url, categories, details } = req.body;
 
-    const { data, error } = await supabase
+    const { data: inspectionData, error: inspectionError } = await supabase
       .from('inspections')
       .update({
         status,
@@ -235,8 +344,42 @@ app.put('/api/inspections/:id', async (req, res) => {
       .eq('id', id)
       .select();
 
-    if (error) throw error;
-    res.json(data[0]);
+    if (inspectionError) throw inspectionError;
+
+    const inspection = inspectionData[0];
+
+    // ✅ details がある場合は既存の inspection_details を全削除→再 insert
+    if (details && details.length > 0) {
+      const { error: deleteError } = await supabase
+        .from('inspection_details')
+        .delete()
+        .eq('inspection_id', id);
+
+      if (deleteError) throw deleteError;
+
+      const detailRows = details.map((d) => ({
+        id: uuidv4(),
+        inspection_id: id,
+        item_id: d.item_id,
+        category: d.category,
+        description: d.description,
+        result: d.result,
+        issue_content: d.issue_content || null,
+        issue_image_url: d.issue_image_url || null,
+        due_date: d.due_date || null
+      }));
+
+      const { data: detailData, error: detailError } = await supabase
+        .from('inspection_details')
+        .insert(detailRows)
+        .select();
+
+      if (detailError) throw detailError;
+
+      return res.json({ ...inspection, inspection_details: detailData || [] });
+    }
+
+    res.json(inspection);
   } catch (error) {
     console.error('Error:', error.message);
     res.status(500).json({ error: error.message });
