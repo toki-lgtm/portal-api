@@ -94,6 +94,45 @@ async function nextMasterId(table, prefix) {
   return prefix + String(max + 1).padStart(3, '0');
 }
 
+// ✅ 指摘内容テンプレートの蓄積
+//    点検保存時に「指摘あり」かつ指摘内容ありの明細を項目単位でストックする。
+//    既存（同一 item_id × 同一 content）があれば use_count を加算、無ければ新規登録。
+//    テンプレ保存に失敗しても点検保存自体は妨げないよう、エラーは握りつぶす。
+async function recordIssueTemplates(details) {
+  if (!Array.isArray(details)) return;
+  // 同一保存内の重複を除外（item_id|content をキーに）
+  const seen = new Map();
+  for (const d of details) {
+    if (!d || d.result !== '指摘あり') continue;
+    const content = (d.issue_content || '').trim();
+    if (!content || !d.item_id) continue;
+    seen.set(`${d.item_id}|${content}`, { item_id: d.item_id, content });
+  }
+  for (const { item_id, content } of seen.values()) {
+    try {
+      const { data: existing } = await supabase
+        .from('issue_templates')
+        .select('id, use_count')
+        .eq('item_id', item_id)
+        .eq('content', content)
+        .maybeSingle();
+
+      if (existing) {
+        await supabase
+          .from('issue_templates')
+          .update({ use_count: (existing.use_count || 0) + 1, updated_at: new Date().toISOString() })
+          .eq('id', existing.id);
+      } else {
+        await supabase
+          .from('issue_templates')
+          .insert([{ id: uuidv4(), item_id, content }]);
+      }
+    } catch (e) {
+      console.error('issue_templates 記録に失敗（無視）:', e.message);
+    }
+  }
+}
+
 // ✅ ヘルスチェック
 app.get('/health', (req, res) => {
   res.json({ status: 'OK', timestamp: new Date().toISOString() });
@@ -281,6 +320,9 @@ app.post('/api/inspections', async (req, res) => {
         return res.status(500).json({ error: `inspection_details の保存に失敗しました: ${detailError.message}` });
       }
 
+      // ✅ 指摘内容をテンプレートとして蓄積（失敗しても点検保存は成功扱い）
+      await recordIssueTemplates(details);
+
       return res.json({ ...inspection, inspection_details: detailData || [] });
     }
 
@@ -406,6 +448,9 @@ app.put('/api/inspections/:id', async (req, res) => {
         .select();
 
       if (detailError) throw detailError;
+
+      // ✅ 指摘内容をテンプレートとして蓄積（失敗しても点検保存は成功扱い）
+      await recordIssueTemplates(details);
 
       return res.json({ ...inspection, inspection_details: detailData || [] });
     }
@@ -699,6 +744,29 @@ app.delete('/api/masters/inspection-items/:id', async (req, res) => {
     const { error } = await supabase.from('inspection_master').delete().eq('id', req.params.id);
     if (error) throw error;
     res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 安全パトロール - 指摘内容テンプレート一覧
+//    item_id クエリで項目を絞り込み可能。省略時は全件返す（フロントで item_id 別にグルーピング）。
+//    利用頻度（use_count）の高い順 → 新しい順で返す。
+app.get('/api/issue-templates', async (req, res) => {
+  try {
+    let query = supabase
+      .from('issue_templates')
+      .select('*')
+      .order('use_count', { ascending: false })
+      .order('updated_at', { ascending: false });
+
+    if (req.query.item_id) {
+      query = query.eq('item_id', req.query.item_id);
+    }
+
+    const { data, error } = await query;
+    if (error) throw error;
+    res.json(data || []);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
