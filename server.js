@@ -1871,6 +1871,7 @@ async function extractCertificate(buffer, mimeType) {
   const prompt = [
     'これは日本の労働安全衛生に関する「資格者証」（修了証・技能講習修了証・免許証・運転免許証など）の画像です。',
     '記載内容を読み取り、次の項目をJSONで返してください。',
+    '- person_name: 資格を保有する本人の氏名（証書に記載の受講者・免許保有者名。姓名の間の空白は除いて返す。読めなければ空文字）',
     '- name: 資格・講習の正式名称（例: 玉掛け技能講習、フォークリフト運転技能講習、職長・安全衛生責任者教育）',
     '- category: 次のいずれか1つ「特別教育」「技能講習」「免許」「その他」',
     '- cert_number: 証明書番号・免許番号（無ければ空文字）',
@@ -1893,6 +1894,7 @@ async function extractCertificate(buffer, mimeType) {
       responseSchema: {
         type: 'OBJECT',
         properties: {
+          person_name: { type: 'STRING' },
           name: { type: 'STRING' },
           category: { type: 'STRING', enum: ['特別教育', '技能講習', '免許', 'その他'] },
           cert_number: { type: 'STRING' },
@@ -1923,12 +1925,25 @@ async function extractCertificate(buffer, mimeType) {
 
   const CATS = ['特別教育', '技能講習', '免許', 'その他'];
   return {
+    person_name: (parsed.person_name || '').trim(),
     name: (parsed.name || '').trim(),
     category: CATS.includes(parsed.category) ? parsed.category : 'その他',
     cert_number: (parsed.cert_number || '').trim(),
     acquired_date: cleanIsoDate(parsed.acquired_date),
     expiry_date: cleanIsoDate(parsed.expiry_date),
   };
+}
+
+// 抽出した氏名を staff_master へ突合（空白除去の完全一致のみ。曖昧一致は誤割当を招くため避け、
+// 一致しなければ null を返してフロントで人に選ばせる）。
+function normalizePersonName(s) {
+  return String(s || '').replace(/[\s　]/g, '').toLowerCase();
+}
+function matchStaffId(name, staff) {
+  const n = normalizePersonName(name);
+  if (!n) return null;
+  const hit = (staff || []).find((s) => normalizePersonName(s.name) === n);
+  return hit ? hit.id : null;
 }
 
 // ===== 社員ごとの資格 =====
@@ -2013,6 +2028,48 @@ app.post('/api/employees/:id/qualifications/scan', requireAuth, requireEmployeeA
     });
   } catch (error) {
     console.error('Error (qualification scan):', error.message);
+    res.status(error.status || 500).json({ error: error.message });
+  }
+});
+
+// ✅ 資格者証をアップロード→Geminiで読取→「氏名から社員」「資格名からマスタ」を自動突合して返す（管理者のみ）
+//    社員を指定しない一括取込用。DBには登録せず、フロントで担当社員・資格を確認してから保存する。
+//    返り値: { extracted, matched_staff_id, matched_staff_name, matched_qualification_id, cert_image_path, cert_image_url }
+app.post('/api/qualifications/scan', requireAuth, requireEmployeeAdmin, upload.single('cert'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'cert（資格者証の画像/PDF）が必要です' });
+
+    // 1) Gemini で内容（氏名含む）を抽出
+    const extracted = await extractCertificate(req.file.buffer, req.file.mimetype);
+
+    // 2) 原本画像を保存（振り分け先が未確定なので inbox/ に置く。保存確定後もこのパスをそのまま使う）
+    await ensureCertBucket();
+    const ext = (req.file.originalname.split('.').pop() || 'jpg').toLowerCase();
+    const path = `inbox/${Date.now()}-${uuidv4()}.${ext}`;
+    const { error: upErr } = await supabase.storage
+      .from(CERT_BUCKET)
+      .upload(path, req.file.buffer, { contentType: req.file.mimetype });
+    if (upErr) throw upErr;
+
+    // 3) 氏名→社員、資格名→マスタ を突合
+    const [{ data: masters }, { data: staff }] = await Promise.all([
+      supabase.from('qualification_master').select('id, name'),
+      supabase.from('staff_master').select('id, name'),
+    ]);
+    const matched_qualification_id = matchQualificationId(extracted.name, masters || []);
+    const matched_staff_id = matchStaffId(extracted.person_name, staff || []);
+    const matchedStaff = (staff || []).find((s) => s.id === matched_staff_id);
+
+    res.json({
+      extracted,
+      matched_qualification_id,
+      matched_staff_id: matched_staff_id || null,
+      matched_staff_name: matchedStaff ? matchedStaff.name : null,
+      cert_image_path: path,
+      cert_image_url: await certSignedUrl(path),
+    });
+  } catch (error) {
+    console.error('Error (qualification global scan):', error.message);
     res.status(error.status || 500).json({ error: error.message });
   }
 });
