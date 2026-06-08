@@ -4,15 +4,69 @@ import dotenv from 'dotenv';
 import { createClient } from '@supabase/supabase-js';
 import ws from 'ws';
 import { v4 as uuidv4 } from 'uuid';
+import jwt from 'jsonwebtoken';
 
 dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Middleware
-app.use(cors());
+// 認証設定
+const JWT_SECRET = process.env.JWT_SECRET;
+const ALLOWED_EMAIL_DOMAIN = process.env.ALLOWED_EMAIL_DOMAIN || 'nakahara131.co.jp';
+const JWT_EXPIRES_IN = '12h';
+
+if (!JWT_SECRET) {
+  console.warn('⚠️  JWT_SECRET が未設定です。ログイン（JWT発行/検証）は失敗します。Render の環境変数に JWT_SECRET を設定してください。');
+}
+
+// CORS: ALLOWED_ORIGINS（カンマ区切り）が設定されていれば限定、未設定なら全許可（現状維持・後で締める）
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || '')
+  .split(',')
+  .map((o) => o.trim())
+  .filter(Boolean);
+
+if (allowedOrigins.length === 0) {
+  console.warn('⚠️  ALLOWED_ORIGINS が未設定のため全オリジンを許可しています。本番では Vercel のURL等を設定してください。');
+}
+
+app.use(
+  cors(
+    allowedOrigins.length === 0
+      ? {}
+      : {
+          origin: (origin, callback) => {
+            // サーバー間呼び出し等 origin 無しは許可
+            if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
+            callback(new Error(`CORS: origin not allowed (${origin})`));
+          },
+        }
+  )
+);
 app.use(express.json());
+
+// ✅ 認可ミドルウェア: Authorization: Bearer <JWT> を検証し req.user に格納
+function requireAuth(req, res, next) {
+  if (!JWT_SECRET) {
+    return res.status(500).json({ error: 'Server auth not configured (JWT_SECRET missing)' });
+  }
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  if (!token) {
+    return res.status(401).json({ error: 'Authorization required' });
+  }
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    // ドメイン再チェック（多層防御）
+    if (ALLOWED_EMAIL_DOMAIN && !String(payload.email || '').toLowerCase().endsWith(`@${ALLOWED_EMAIL_DOMAIN}`)) {
+      return res.status(403).json({ error: 'Forbidden domain' });
+    }
+    req.user = payload;
+    next();
+  } catch (e) {
+    return res.status(401).json({ error: 'Invalid or expired token' });
+  }
+}
 
 // Supabase クライアント（サービスロールキーを使用）
 const supabase = createClient(
@@ -26,15 +80,14 @@ app.get('/health', (req, res) => {
   res.json({ status: 'OK', timestamp: new Date().toISOString() });
 });
 
-// ✅ ユーザー情報取得
-app.get('/api/user', (req, res) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader) {
-    return res.status(401).json({ error: 'Authorization required' });
-  }
-
-  // JWT トークンから user_id を抽出（後で実装）
-  res.json({ message: 'User endpoint' });
+// ✅ ユーザー情報取得（要認証）
+app.get('/api/user', requireAuth, (req, res) => {
+  res.json({
+    id: req.user.id,
+    email: req.user.email,
+    name: req.user.name,
+    avatar: req.user.avatar
+  });
 });
 
 // ✅ Google OAuth コールバック
@@ -56,30 +109,51 @@ app.post('/api/auth/google', async (req, res) => {
 
     const userInfo = await googleRes.json();
 
-    // Google ユーザー情報をそのまま返す
-    res.json({
+    // ✅ 会社ドメイン制限: 許可ドメイン以外のアカウントは拒否
+    const email = String(userInfo.email || '').toLowerCase();
+    if (ALLOWED_EMAIL_DOMAIN && !email.endsWith(`@${ALLOWED_EMAIL_DOMAIN}`)) {
+      return res.status(403).json({ error: `このポータルは ${ALLOWED_EMAIL_DOMAIN} のアカウントのみ利用できます` });
+    }
+
+    if (!JWT_SECRET) {
+      return res.status(500).json({ error: 'Server auth not configured (JWT_SECRET missing)' });
+    }
+
+    const user = {
       id: userInfo.id,
       email: userInfo.email,
       name: userInfo.name,
       avatar: userInfo.picture
-    });
+    };
+
+    // ✅ サーバー側で自前のJWTを発行（以降のAPIはこれで認可）
+    const appToken = jwt.sign(user, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
+
+    res.json({ ...user, token: appToken });
   } catch (error) {
     console.error('Auth error:', error.message, error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// ✅ ダッシュボード用：アプリ一覧
-app.get('/api/apps', async (req, res) => {
+// ✅ ダッシュボード用：アプリ一覧（要認証）
+app.get('/api/apps', requireAuth, async (req, res) => {
   try {
     const isDev = process.env.NODE_ENV !== 'production';
     const baseUrl = isDev
       ? 'http://localhost:5174'
       : 'https://safety-patrol-nine.vercel.app';
 
-    // ユーザー情報をURL パラメータで渡す（必須）
-    const userParam = req.query.user ? `?user=${encodeURIComponent(req.query.user)}` : '?user={}';
-    const safetyPatrolUrl = `${baseUrl}${userParam}`;
+    // 認証済みユーザー情報を安全パトロールへ受け渡し
+    // user パラメータは表示用。認可は署名付きJWT(token)で行う（改ざん不可）
+    const appToken = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+    const userJson = encodeURIComponent(JSON.stringify({
+      id: req.user.id,
+      email: req.user.email,
+      name: req.user.name,
+      avatar: req.user.avatar
+    }));
+    const safetyPatrolUrl = `${baseUrl}?user=${userJson}&token=${encodeURIComponent(appToken)}`;
 
     const apps = [
       { id: 1, name: '安全パトロール', url: safetyPatrolUrl, icon: '✅' },
@@ -94,6 +168,10 @@ app.get('/api/apps', async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+
+// ✅ 以降の共有データAPIは全て認証必須（安全パトロールもBearerトークンを送る）
+app.use('/api/inspections', requireAuth);
+app.use('/api/masters', requireAuth);
 
 // ✅ 安全パトロール - 点検一覧
 app.get('/api/inspections', async (req, res) => {
