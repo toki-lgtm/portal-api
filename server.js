@@ -1351,6 +1351,142 @@ app.get('/api/issue-templates', async (req, res) => {
   }
 });
 
+// ============================================================
+// ✅ 個人設定 API（要認証）
+//    ユーザーは req.user.email（小文字化）で識別。
+//    設定は user_settings テーブルに JSONB で保存する。
+// ============================================================
+
+// デフォルト設定（後方互換のためキーが欠けていた場合はこれで補完する）
+const DEFAULT_USER_SETTINGS = {
+  apps: {
+    pinned: [],
+    favorites: [],
+    order: [],
+    show_kpi: true,
+  },
+  notifications: {
+    in_app_enabled: true,
+    email_enabled: false,
+    // 曜日は JS の getDay() と同じ規約: 0=日,1=月,…,6=土。デフォルト月〜金。
+    email_weekdays: [1, 2, 3, 4, 5],
+    email_hour: 8,
+  },
+};
+
+// ディープマージ: target に source を再帰的に上書きする。配列は source で置き換える。
+function deepMerge(target, source) {
+  const result = { ...target };
+  for (const key of Object.keys(source)) {
+    if (
+      source[key] !== null &&
+      typeof source[key] === 'object' &&
+      !Array.isArray(source[key]) &&
+      typeof target[key] === 'object' &&
+      target[key] !== null &&
+      !Array.isArray(target[key])
+    ) {
+      result[key] = deepMerge(target[key], source[key]);
+    } else {
+      result[key] = source[key];
+    }
+  }
+  return result;
+}
+
+// ✅ 個人設定取得（GET /api/user/settings）
+//    保存済みがあれば欠けたキーをデフォルトで補完して返す。未保存はデフォルトをそのまま返す。
+app.get('/api/user/settings', requireAuth, async (req, res) => {
+  try {
+    const email = String(req.user.email || '').toLowerCase();
+    const { data, error } = await supabase
+      .from('user_settings')
+      .select('settings')
+      .eq('user_email', email)
+      .maybeSingle();
+    if (error) throw error;
+
+    // デフォルトに保存済みをマージ（後方互換: 新しいキーがデフォルトから補完される）
+    const merged = data ? deepMerge(DEFAULT_USER_SETTINGS, data.settings) : DEFAULT_USER_SETTINGS;
+    res.json(merged);
+  } catch (error) {
+    console.error('Error (user settings GET):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 個人設定更新（PUT /api/user/settings）
+//    body は設定オブジェクトの部分更新可。サーバー側でバリデーション・サニタイズを行い、
+//    既存設定にディープマージした後 upsert する。返り値は最終的なマージ済み設定。
+app.put('/api/user/settings', requireAuth, async (req, res) => {
+  try {
+    const email = String(req.user.email || '').toLowerCase();
+    const body = req.body || {};
+
+    // ── 現在の保存済み設定を取得（デフォルト補完ベースで作業する）──
+    const { data: existing, error: fetchErr } = await supabase
+      .from('user_settings')
+      .select('settings')
+      .eq('user_email', email)
+      .maybeSingle();
+    if (fetchErr) throw fetchErr;
+
+    const base = existing ? deepMerge(DEFAULT_USER_SETTINGS, existing.settings) : { ...DEFAULT_USER_SETTINGS };
+
+    // ── body を base にマージ（部分更新対応）──
+    const merged = deepMerge(base, body);
+
+    // ── サニタイズ ──
+    // notifications.email_hour: 6〜20 の整数のみ許可。範囲外は無視してデフォルト/既存値を維持。
+    const rawHour = merged.notifications?.email_hour;
+    const parsedHour = Math.trunc(Number(rawHour));
+    if (!Number.isFinite(parsedHour) || parsedHour < 6 || parsedHour > 20) {
+      merged.notifications.email_hour = base.notifications.email_hour;
+    } else {
+      merged.notifications.email_hour = parsedHour;
+    }
+
+    // notifications.email_weekdays: 0〜6 の整数配列、重複除去
+    const rawWeekdays = merged.notifications?.email_weekdays;
+    if (Array.isArray(rawWeekdays)) {
+      merged.notifications.email_weekdays = [
+        ...new Set(
+          rawWeekdays
+            .map((d) => Math.trunc(Number(d)))
+            .filter((d) => Number.isFinite(d) && d >= 0 && d <= 6)
+        ),
+      ].sort((a, b) => a - b);
+    } else {
+      merged.notifications.email_weekdays = base.notifications.email_weekdays;
+    }
+
+    // boolean フィールドを !! で正規化
+    merged.notifications.in_app_enabled = !!merged.notifications.in_app_enabled;
+    merged.notifications.email_enabled = !!merged.notifications.email_enabled;
+    merged.apps.show_kpi = !!merged.apps.show_kpi;
+
+    // apps の配列フィールド: 文字列配列のみ許可（非文字列要素は除外）
+    for (const key of ['pinned', 'favorites', 'order']) {
+      const arr = merged.apps?.[key];
+      merged.apps[key] = Array.isArray(arr) ? arr.filter((v) => typeof v === 'string') : [];
+    }
+
+    // ── upsert ──
+    const { error: upsertErr } = await supabase
+      .from('user_settings')
+      .upsert(
+        { user_email: email, settings: merged, updated_at: new Date().toISOString() },
+        { onConflict: 'user_email' }
+      );
+    if (upsertErr) throw upsertErr;
+
+    res.json(merged);
+  } catch (error) {
+    console.error('Error (user settings PUT):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`✅ Portal API running on http://localhost:${PORT}`);
 });
