@@ -313,6 +313,90 @@ app.get('/api/apps', requireAuth, async (req, res) => {
   }
 });
 
+// ✅ ポータルTOP用：安全パトロールの状況サマリ（KPIカード＋最近の活動）
+//    既存の inspections / inspection_details / projects を集計して返す。読み取り専用・要認証。
+//    KPI: 今月の点検数 / 完了率(承認済の指摘÷全指摘) / 是正対応中(未承認の指摘) / 承認待ち(submitted)
+app.get('/api/dashboard/stats', requireAuth, async (req, res) => {
+  try {
+    // 現在の年月（JST基準。Render は UTC のため +9h して算出）
+    const jstNow = new Date(Date.now() + 9 * 3600 * 1000);
+    const ym = jstNow.toISOString().slice(0, 7); // 'YYYY-MM'
+
+    // 点検（最近の活動用に作成日時降順で取得）
+    const { data: inspRows, error: inspErr } = await supabase
+      .from('inspections')
+      .select('id, inspection_id, project_id, inspection_date, status, created_at')
+      .order('created_at', { ascending: false });
+    if (inspErr) throw inspErr;
+    const inspections = inspRows || [];
+
+    // 指摘明細（是正状態の集計用）
+    const { data: detRows, error: detErr } = await supabase
+      .from('inspection_details')
+      .select('inspection_id, correction_status')
+      .eq('result', '指摘あり');
+    if (detErr) throw detErr;
+    const details = detRows || [];
+
+    // 現場名マップ
+    const { data: projRows } = await supabase.from('projects').select('id, name');
+    const projectName = {};
+    for (const p of projRows || []) projectName[p.id] = p.name;
+
+    // 今月の点検数
+    const inspectionsThisMonth = inspections.filter(
+      (i) => String(i.inspection_date || '').slice(0, 7) === ym
+    ).length;
+
+    // 是正状態の集計
+    let issuesTotal = 0;
+    let approved = 0;
+    let submitted = 0; // 承認待ち
+    const openByInsp = {}; // 点検ごとの未承認指摘数（最近の活動用）
+    for (const d of details) {
+      issuesTotal++;
+      const cs = d.correction_status || 'pending';
+      if (cs === 'approved') approved++;
+      else {
+        if (cs === 'submitted') submitted++;
+        openByInsp[d.inspection_id] = (openByInsp[d.inspection_id] || 0) + 1;
+      }
+    }
+    const issuesByInsp = {};
+    for (const d of details) {
+      issuesByInsp[d.inspection_id] = (issuesByInsp[d.inspection_id] || 0) + 1;
+    }
+    const issuesOpen = issuesTotal - approved; // 是正対応中（未承認）
+    const completionRate = issuesTotal > 0 ? Math.round((approved / issuesTotal) * 1000) / 10 : null;
+
+    // 最近の活動（直近5件の点検）
+    const recent = inspections.slice(0, 5).map((i) => ({
+      id: i.id,
+      inspection_id: i.inspection_id,
+      project_name: projectName[i.project_id] || i.project_id || '現場',
+      inspection_date: i.inspection_date,
+      status: i.status || 'pending',
+      issues: issuesByInsp[i.id] || 0,
+      open_issues: openByInsp[i.id] || 0,
+      created_at: i.created_at,
+    }));
+
+    res.json({
+      month: ym,
+      inspections_this_month: inspectionsThisMonth,
+      inspections_total: inspections.length,
+      issues_total: issuesTotal,
+      issues_open: issuesOpen,
+      awaiting_approval: submitted,
+      completion_rate: completionRate, // 全指摘に対する承認済割合(%)。指摘0件なら null
+      recent,
+    });
+  } catch (error) {
+    console.error('Error (dashboard stats):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // ✅ 以降の共有データAPIは全て認証必須（安全パトロールもBearerトークンを送る）
 app.use('/api/inspections', requireAuth);
 app.use('/api/masters', requireAuth);
