@@ -323,7 +323,7 @@ app.use('/api/masters', async (req, res, next) => {
   return requireAdmin(req, res, next);
 });
 
-// ✅ 安全パトロール - 点検一覧
+// ✅ 安全パトロール - 点検一覧（各点検に指摘是正サマリ correction を付与）
 app.get('/api/inspections', async (req, res) => {
   try {
     const { data, error } = await supabase
@@ -332,9 +332,61 @@ app.get('/api/inspections', async (req, res) => {
       .order('inspection_date', { ascending: false });
 
     if (error) throw error;
-    res.json(data || []);
+    const inspections = data || [];
+
+    // 指摘あり項目の是正状態を点検ごとに集計（一覧のステータス表示に使用）
+    const summaryByInsp = {};
+    if (inspections.length) {
+      const ids = inspections.map((i) => i.id);
+      const { data: dets, error: detErr } = await supabase
+        .from('inspection_details')
+        .select('inspection_id, correction_status')
+        .in('inspection_id', ids)
+        .eq('result', '指摘あり');
+      if (detErr) throw detErr;
+      for (const d of dets || []) {
+        const s =
+          summaryByInsp[d.inspection_id] ||
+          (summaryByInsp[d.inspection_id] = { issues: 0, pending: 0, submitted: 0, approved: 0, rejected: 0 });
+        s.issues++;
+        const cs = d.correction_status || 'pending';
+        if (s[cs] === undefined) s[cs] = 0;
+        s[cs]++;
+      }
+    }
+
+    const withSummary = inspections.map((i) => ({
+      ...i,
+      correction: summaryByInsp[i.id] || { issues: 0, pending: 0, submitted: 0, approved: 0, rejected: 0 }
+    }));
+    res.json(withSummary);
   } catch (error) {
     console.error('Error:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 安全パトロール - 自分に関係する是正項目の横断一覧（固定パスのため :id ルートより前に定義）
+//    admin=全件 / それ以外=自分が作業所長 or 検査官の点検の指摘項目のみ。
+app.get('/api/inspections/corrections', async (req, res) => {
+  try {
+    const perms = await resolvePermissions(req.user.email);
+    const { data, error } = await supabase
+      .from('inspection_details')
+      .select('*, inspections!inner(id, inspection_id, inspection_date, project_id, inspector_id, manager_id, status)')
+      .eq('result', '指摘あり')
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+    let rows = data || [];
+    if (perms.role !== 'admin') {
+      const me = perms.staffId;
+      rows = rows.filter(
+        (r) => r.inspections && (r.inspections.manager_id === me || r.inspections.inspector_id === me)
+      );
+    }
+    res.json(rows);
+  } catch (error) {
+    console.error('Error (corrections):', error.message);
     res.status(500).json({ error: error.message });
   }
 });
@@ -403,7 +455,8 @@ app.post('/api/inspections', async (req, res) => {
         issue_content: d.issue_content || null,
         issue_image_url: d.issue_image_url || null,
         issue_image_urls: d.issue_image_urls || [],
-        due_date: d.due_date || null
+        due_date: d.due_date || null,
+        correction_status: d.result === '指摘あり' ? 'pending' : null
       }));
 
       const { data: detailData, error: detailError } = await supabase
@@ -544,7 +597,8 @@ app.put('/api/inspections/:id', async (req, res) => {
         issue_content: d.issue_content || null,
         issue_image_url: d.issue_image_url || null,
         issue_image_urls: d.issue_image_urls || [],
-        due_date: d.due_date || null
+        due_date: d.due_date || null,
+        correction_status: d.result === '指摘あり' ? 'pending' : null
       }));
 
       const { data: detailData, error: detailError } = await supabase
@@ -783,6 +837,132 @@ app.post('/api/inspections/:id/send-report', async (req, res) => {
   } catch (error) {
     console.error('Error (send-report):', error.message);
     res.status(500).json({ error: `メール送信に失敗しました: ${error.message}` });
+  }
+});
+
+// ===== 指摘是正フロー =====
+// detail と所属 inspection を取得し、所属チェックも行う共通ヘルパー
+async function loadDetailWithInspection(inspectionId, detailId) {
+  const { data: detail, error } = await supabase
+    .from('inspection_details')
+    .select('*')
+    .eq('id', detailId)
+    .single();
+  if (error) return { error };
+  if (!detail || detail.inspection_id !== inspectionId) return { notFound: true };
+  const { data: insp, error: inspErr } = await supabase
+    .from('inspections')
+    .select('id, inspector_id, manager_id')
+    .eq('id', inspectionId)
+    .single();
+  if (inspErr) return { error: inspErr };
+  return { detail, insp };
+}
+
+// ✅ 是正写真の提出（作業所長 or 管理者）。pending/rejected → submitted。
+app.post('/api/inspections/:id/details/:detailId/correction', async (req, res) => {
+  try {
+    const { id, detailId } = req.params;
+    const { image_urls, comment } = req.body;
+    const { detail, insp, error, notFound } = await loadDetailWithInspection(id, detailId);
+    if (error) throw error;
+    if (notFound) return res.status(404).json({ error: '指摘項目が見つかりません' });
+    if (detail.result !== '指摘あり') return res.status(400).json({ error: '指摘ありの項目のみ是正できます' });
+
+    const perms = await resolvePermissions(req.user.email);
+    const canSubmit = perms.role === 'admin' || insp.manager_id === perms.staffId;
+    if (!canSubmit) return res.status(403).json({ error: '是正写真の提出は作業所長または管理者のみ可能です' });
+
+    const urls = Array.isArray(image_urls) ? image_urls.filter(Boolean) : [];
+    if (urls.length === 0) return res.status(400).json({ error: '是正写真を1枚以上添付してください' });
+
+    const { data, error: upErr } = await supabase
+      .from('inspection_details')
+      .update({
+        correction_status: 'submitted',
+        correction_image_urls: urls,
+        correction_comment: comment || null,
+        corrected_at: new Date().toISOString(),
+        corrected_by: perms.staffId || null,
+        reject_reason: null,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', detailId)
+      .select();
+    if (upErr) throw upErr;
+    res.json(data[0]);
+  } catch (error) {
+    console.error('Error (correction submit):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 是正の承認（検査官 or 管理者）。submitted → approved。
+app.post('/api/inspections/:id/details/:detailId/approve', async (req, res) => {
+  try {
+    const { id, detailId } = req.params;
+    const { detail, insp, error, notFound } = await loadDetailWithInspection(id, detailId);
+    if (error) throw error;
+    if (notFound) return res.status(404).json({ error: '指摘項目が見つかりません' });
+
+    const perms = await resolvePermissions(req.user.email);
+    const canApprove = perms.role === 'admin' || insp.inspector_id === perms.staffId;
+    if (!canApprove) return res.status(403).json({ error: '承認は担当検査官または管理者のみ可能です' });
+    if (detail.correction_status !== 'submitted') {
+      return res.status(409).json({ error: '承認待ち（是正写真提出済み）の項目のみ承認できます' });
+    }
+
+    const { data, error: upErr } = await supabase
+      .from('inspection_details')
+      .update({
+        correction_status: 'approved',
+        approved_at: new Date().toISOString(),
+        approved_by: perms.staffId || null,
+        reject_reason: null,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', detailId)
+      .select();
+    if (upErr) throw upErr;
+    res.json(data[0]);
+  } catch (error) {
+    console.error('Error (correction approve):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 是正の差し戻し（検査官 or 管理者）。submitted → rejected（理由付き、再提出で submitted に戻る）。
+app.post('/api/inspections/:id/details/:detailId/reject', async (req, res) => {
+  try {
+    const { id, detailId } = req.params;
+    const { reason } = req.body;
+    const { detail, insp, error, notFound } = await loadDetailWithInspection(id, detailId);
+    if (error) throw error;
+    if (notFound) return res.status(404).json({ error: '指摘項目が見つかりません' });
+
+    const perms = await resolvePermissions(req.user.email);
+    const canApprove = perms.role === 'admin' || insp.inspector_id === perms.staffId;
+    if (!canApprove) return res.status(403).json({ error: '差し戻しは担当検査官または管理者のみ可能です' });
+    if (detail.correction_status !== 'submitted') {
+      return res.status(409).json({ error: '承認待ちの項目のみ差し戻しできます' });
+    }
+
+    const { data, error: upErr } = await supabase
+      .from('inspection_details')
+      .update({
+        correction_status: 'rejected',
+        reject_reason: reason || null,
+        approved_at: null,
+        approved_by: null,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', detailId)
+      .select();
+    if (upErr) throw upErr;
+    res.json(data[0]);
+  } catch (error) {
+    console.error('Error (correction reject):', error.message);
+    res.status(500).json({ error: error.message });
   }
 });
 
