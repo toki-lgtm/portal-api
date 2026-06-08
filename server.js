@@ -430,7 +430,7 @@ app.get('/api/masters/projects', async (req, res) => {
     const { data, error } = await supabase
       .from('projects')
       .select('*')
-      .order('created_at', { ascending: false });
+      .order('id', { ascending: true });
     if (error) throw error;
     res.json(data || []);
   } catch (error) {
@@ -487,7 +487,7 @@ app.get('/api/masters/staff', async (req, res) => {
     const { data, error } = await supabase
       .from('staff_master')
       .select('*')
-      .order('created_at', { ascending: false });
+      .order('id', { ascending: true });
     if (error) throw error;
     res.json(data || []);
   } catch (error) {
@@ -544,7 +544,7 @@ app.get('/api/masters/inspection-items', async (req, res) => {
     const { data, error } = await supabase
       .from('inspection_master')
       .select('*')
-      .order('created_at', { ascending: false });
+      .order('id', { ascending: true });
     if (error) throw error;
     res.json(data || []);
   } catch (error) {
