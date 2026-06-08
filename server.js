@@ -417,23 +417,94 @@ app.put('/api/inspections/:id', async (req, res) => {
   }
 });
 
-// ✅ 安全パトロール - PDF生成済みにする（report_url に生成日時を記録し、以後は編集ロック）
-app.patch('/api/inspections/:id/pdf-generated', async (req, res) => {
+// ✅ 非公開バケット inspection-reports を必要時に作成（アプリ越しのみ参照可能にする）
+const REPORTS_BUCKET = 'inspection-reports';
+let reportsBucketEnsured = false;
+async function ensureReportsBucket() {
+  if (reportsBucketEnsured) return;
+  const { data: buckets, error } = await supabase.storage.listBuckets();
+  if (error) throw error;
+  if (!buckets?.some((b) => b.name === REPORTS_BUCKET)) {
+    const { error: createError } = await supabase.storage.createBucket(REPORTS_BUCKET, { public: false });
+    // 競合（既に存在）以外は致命的
+    if (createError && !/already exists/i.test(createError.message || '')) throw createError;
+  }
+  reportsBucketEnsured = true;
+}
+
+// 安全なファイル名片を作る
+const safeSeg = (s) => String(s || '').replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 80) || 'unknown';
+
+// report_url が実ファイルパスを指しているか（旧マーカーや空と区別）
+const isStoredPdf = (url) => typeof url === 'string' && url.startsWith('reports/');
+
+// ✅ 安全パトロール - 生成済みPDFを非公開バケットに保存（report_url にパスを記録、以後は編集ロック）
+app.post('/api/inspections/:id/report', upload.single('report'), async (req, res) => {
   try {
     const { id } = req.params;
-    const now = new Date().toISOString();
+    if (!req.file) return res.status(400).json({ error: 'report フィールド（PDF）が必要です' });
 
+    const { data: insp, error: inspError } = await supabase
+      .from('inspections')
+      .select('inspection_id, project_id, report_url')
+      .eq('id', id)
+      .single();
+    if (inspError) throw inspError;
+
+    // 既に実ファイルが保存済みなら再生成は不可（生成は一度きり）
+    if (insp && isStoredPdf(insp.report_url)) {
+      return res.status(409).json({ error: 'この点検は既にPDF生成済みです' });
+    }
+
+    await ensureReportsBucket();
+
+    const dateSeg = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+    const path = `reports/${safeSeg(insp?.project_id)}/${dateSeg}_${safeSeg(insp?.inspection_id || id)}.pdf`;
+
+    const { error: uploadError } = await supabase.storage
+      .from(REPORTS_BUCKET)
+      .upload(path, req.file.buffer, { contentType: 'application/pdf', upsert: true });
+    if (uploadError) throw uploadError;
+
+    const now = new Date().toISOString();
     const { data, error } = await supabase
       .from('inspections')
-      .update({
-        report_url: `generated:${now}`,
-        updated_at: now
-      })
+      .update({ report_url: path, updated_at: now })
       .eq('id', id)
       .select();
-
     if (error) throw error;
+
     res.json(data[0]);
+  } catch (error) {
+    console.error('Error (report upload):', error.message);
+    const msg = /service_role|not authorized|permission|row-level|Unauthorized|Invalid API key/i.test(error.message || '')
+      ? 'PDFの保存に失敗しました（Renderの環境変数 SUPABASE_SERVICE_ROLE_KEY が必要な可能性があります）'
+      : `PDFの保存に失敗しました: ${error.message}`;
+    res.status(500).json({ error: msg });
+  }
+});
+
+// ✅ 安全パトロール - 保存済みPDFの署名付きURLを発行（要認証＝アプリ越しのみ閲覧可能）
+app.get('/api/inspections/:id/report-url', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { data: insp, error: inspError } = await supabase
+      .from('inspections')
+      .select('report_url')
+      .eq('id', id)
+      .single();
+    if (inspError) throw inspError;
+
+    if (!insp || !isStoredPdf(insp.report_url)) {
+      return res.status(404).json({ error: 'PDFがまだ生成・保存されていません' });
+    }
+
+    const { data, error } = await supabase.storage
+      .from(REPORTS_BUCKET)
+      .createSignedUrl(insp.report_url, 120); // 120秒間有効
+    if (error) throw error;
+
+    res.json({ url: data.signedUrl });
   } catch (error) {
     console.error('Error:', error.message);
     res.status(500).json({ error: error.message });
