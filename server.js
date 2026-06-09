@@ -1728,6 +1728,80 @@ app.put('/api/employees/:id/permissions', requireAuth, requireEmployeeAdmin, asy
   }
 });
 
+// ===== 共有メールアドレス（個人に紐付かない共用メール）=====
+
+// 一覧取得（閲覧は社員一覧アクセス権。email_password は admin のみに返す）
+app.get('/api/shared-mailboxes', requireAuth, requireEmployeeAccess, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('shared_mailboxes')
+      .select('*')
+      .order('sort_order', { ascending: true })
+      .order('id', { ascending: true });
+    if (error) throw error;
+    const rows = data || [];
+    if (req.empRole?.role !== 'admin') {
+      for (const r of rows) delete r.email_password;
+    }
+    res.json(rows);
+  } catch (error) {
+    console.error('Error (shared-mailboxes list):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 追加（管理者のみ）
+app.post('/api/shared-mailboxes', requireAuth, requireEmployeeAdmin, async (req, res) => {
+  try {
+    const b = req.body || {};
+    if (!b.email?.trim()) return res.status(400).json({ error: 'メールアドレスは必須です' });
+    const row = {
+      email: b.email.trim(),
+      label: b.label?.trim() || null,
+      email_password: b.email_password || null,
+      sort_order: Number.isFinite(b.sort_order) ? b.sort_order : 0,
+    };
+    const { data, error } = await supabase.from('shared_mailboxes').insert([row]).select();
+    if (error) throw error;
+    res.json(data[0]);
+  } catch (error) {
+    console.error('Error (shared-mailbox create):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 更新（管理者のみ・部分更新）
+app.put('/api/shared-mailboxes/:id', requireAuth, requireEmployeeAdmin, async (req, res) => {
+  try {
+    const b = req.body || {};
+    const allowed = ['email', 'label', 'email_password', 'sort_order'];
+    const patch = { updated_at: new Date().toISOString() };
+    for (const k of allowed) {
+      if (b[k] !== undefined) patch[k] = (b[k] === '' ? null : b[k]);
+    }
+    const { data, error } = await supabase
+      .from('shared_mailboxes').update(patch).eq('id', req.params.id).select();
+    if (error) throw error;
+    if (!data || data.length === 0) return res.status(404).json({ error: '共有メールが見つかりません' });
+    res.json(data[0]);
+  } catch (error) {
+    console.error('Error (shared-mailbox update):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 削除（管理者のみ）
+app.delete('/api/shared-mailboxes/:id', requireAuth, requireEmployeeAdmin, async (req, res) => {
+  try {
+    const { error } = await supabase.from('shared_mailboxes').delete().eq('id', req.params.id);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Error (shared-mailbox delete):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // 注: 社員の一括インポート機能（旧 POST /api/employees/import）は廃止しました。
 //     社員登録は画面からの個別追加、台帳の持ち出しは CSV エクスポートで行います。
 
