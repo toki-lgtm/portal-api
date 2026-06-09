@@ -7,6 +7,7 @@ import { randomUUID as uuidv4 } from 'crypto';
 import jwt from 'jsonwebtoken';
 import multer from 'multer';
 import nodemailer from 'nodemailer';
+import { PDFDocument } from 'pdf-lib';
 
 dotenv.config();
 
@@ -2163,9 +2164,10 @@ app.get('/api/employees/:id/qualifications', requireAuth, requireEmployeeAccess,
 });
 
 // ✅ 社員へ資格を追加（管理者のみ）。cert_image_path があれば原本画像も紐付ける。
+//    issuer（発行者）・honseki（本籍地）は一括取込時に証書から抽出した値を受け取って保存する。
 app.post('/api/employees/:id/qualifications', requireAuth, requireEmployeeAdmin, async (req, res) => {
   try {
-    const { qualification_id, acquired_date, expiry_date, cert_number, note, cert_image_path } = req.body || {};
+    const { qualification_id, acquired_date, expiry_date, cert_number, note, cert_image_path, issuer, honseki } = req.body || {};
     if (!qualification_id) return res.status(400).json({ error: '資格を選択してください' });
     const { data, error } = await supabase
       .from('staff_qualifications')
@@ -2177,6 +2179,8 @@ app.post('/api/employees/:id/qualifications', requireAuth, requireEmployeeAdmin,
         cert_number: cert_number || null,
         note: note || null,
         cert_image_path: cert_image_path || null,
+        issuer: issuer || null,
+        honseki: honseki || null,
       }])
       .select('*, qualification_master(name, category, has_expiry)');
     if (error) {
@@ -2226,44 +2230,378 @@ app.post('/api/employees/:id/qualifications/scan', requireAuth, requireEmployeeA
   }
 });
 
+// ===== 束ねPDF一括取込: Gemini によるページ配列解析 =====
+
+// 資格書類をまとめた PDF または画像を Gemini に1回渡し、全ページを配列で返す。
+// 各要素は { page, type, qualification_name?, holders?, person_name?, cert_number?,
+//             acquired_date?, expiry_date?, birth_date?, honseki?, issuer? }
+async function extractCertificatePages(buffer, mimeType) {
+  if (!GEMINI_API_KEY) {
+    const e = new Error('GEMINI_API_KEY が未設定です。Render の環境変数に設定してください。');
+    e.status = 503;
+    throw e;
+  }
+
+  const prompt = [
+    'これは日本の建設業における資格関連書類をまとめたPDF/画像です。',
+    'ページごとに種別を判定し、下記スキーマの配列をJSONで返してください。',
+    '',
+    '【ページ種別（type）】',
+    '- index: 資格一覧表・索引ページ（資格名の目次のみ）',
+    '- roster: 資格名が見出しとして記載され、その資格を保有する氏名一覧が書かれた名簿ページ',
+    '- certificate: 免許証・合格証明書・技能講習修了証・特別教育修了証等の証書ページ',
+    '- other: 上記以外',
+    '',
+    '【roster ページで返す追加フィールド】',
+    '- qualification_name: 見出しに記載の資格名（例: 玉掛け技能講習）',
+    '- holders: 氏名の配列（姓名間の空白は除く。例: ["山田太郎","鈴木花子"]）',
+    '',
+    '【certificate ページで返す追加フィールド】',
+    '- person_name: 本人氏名（姓名間の空白は除く。読めなければ空文字）',
+    '- qualification_name: 証書面に記載の資格名称',
+    '- cert_number: 証明書番号・免許番号（無ければ空文字）',
+    '- acquired_date: 取得日・修了日（YYYY-MM-DD形式。和暦は西暦へ変換。読めなければ空文字）',
+    '- expiry_date: 有効期限（YYYY-MM-DD形式。記載なければ空文字）',
+    '- birth_date: 本人の生年月日（YYYY-MM-DD形式。和暦は西暦へ変換。記載なければ空文字）',
+    '- honseki: 本籍地（例: 福岡県。記載なければ空文字）',
+    '- issuer: 発行者名（例: 建設大臣、長崎県知事、国土交通大臣。記載なければ空文字）',
+    '',
+    '【注意】',
+    '- 90度回転している証書も正しく読んでください。',
+    '- 読み取れない項目は空文字にしてください。推測で埋めないでください。',
+    '- 1ページに複数の証書が印刷されている場合は1要素として扱ってください。',
+  ].join('\n');
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+  const body = {
+    contents: [{
+      parts: [
+        { text: prompt },
+        { inlineData: { mimeType: mimeType || 'application/pdf', data: buffer.toString('base64') } },
+      ],
+    }],
+    generationConfig: {
+      temperature: 0,
+      responseMimeType: 'application/json',
+      maxOutputTokens: 8192,
+      responseSchema: {
+        type: 'ARRAY',
+        items: {
+          type: 'OBJECT',
+          properties: {
+            page:               { type: 'INTEGER' },
+            type:               { type: 'STRING', enum: ['index', 'roster', 'certificate', 'other'] },
+            qualification_name: { type: 'STRING' },
+            holders:            { type: 'ARRAY', items: { type: 'STRING' } },
+            person_name:        { type: 'STRING' },
+            cert_number:        { type: 'STRING' },
+            acquired_date:      { type: 'STRING' },
+            expiry_date:        { type: 'STRING' },
+            birth_date:         { type: 'STRING' },
+            honseki:            { type: 'STRING' },
+            issuer:             { type: 'STRING' },
+          },
+          required: ['page', 'type'],
+        },
+      },
+    },
+  };
+
+  const resp = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!resp.ok) {
+    const t = await resp.text();
+    const e = new Error(`Gemini API エラー (${resp.status}): ${t.slice(0, 300)}`);
+    e.status = 502;
+    throw e;
+  }
+  const json = await resp.json();
+  const text = json?.candidates?.[0]?.content?.parts?.[0]?.text;
+  if (!text) throw new Error('Gemini から有効な応答が得られませんでした');
+  let parsed;
+  try { parsed = JSON.parse(text); } catch { throw new Error('Gemini 応答の解析に失敗しました'); }
+  if (!Array.isArray(parsed)) throw new Error('Gemini 応答がページ配列形式ではありません');
+
+  // 日付フィールドを cleanIsoDate でサニタイズして返す
+  return parsed.map((pg) => ({
+    ...pg,
+    acquired_date: cleanIsoDate(pg.acquired_date) || '',
+    expiry_date:   cleanIsoDate(pg.expiry_date)   || '',
+    birth_date:    cleanIsoDate(pg.birth_date)    || '',
+  }));
+}
+
+// 同名が複数いる場合に生年月日で一意化するための氏名+生年月日突合ヘルパ。
+// 返り値: { id, name, birth_date } | null。
+// match_method: 'name_exact'（名前のみ一意）| 'name+birth'（同名複数を生年月日で絞込）| 'none'
+function matchStaffWithBirth(personName, certBirthDate, staff) {
+  const n = normalizePersonName(personName);
+  if (!n) return { staffRecord: null, match_method: 'none', birth_mismatch: false };
+
+  const hits = (staff || []).filter((s) => normalizePersonName(s.name) === n);
+  if (hits.length === 0) return { staffRecord: null, match_method: 'none', birth_mismatch: false };
+
+  if (hits.length === 1) {
+    // 一意に特定。生年月日の不一致チェック（証書側に birth_date がある場合のみ）
+    const s = hits[0];
+    const mismatch = certBirthDate && s.birth_date ? (certBirthDate !== s.birth_date) : false;
+    return { staffRecord: s, match_method: 'name_exact', birth_mismatch: mismatch };
+  }
+
+  // 同名が複数。certBirthDate があれば生年月日で絞り込む。
+  if (certBirthDate) {
+    const byBirth = hits.filter((s) => s.birth_date && s.birth_date === certBirthDate);
+    if (byBirth.length === 1) {
+      return { staffRecord: byBirth[0], match_method: 'name+birth', birth_mismatch: false };
+    }
+  }
+  // 曖昧（同名複数かつ生年月日で一意化不可）→ null
+  return { staffRecord: null, match_method: 'none', birth_mismatch: false };
+}
+
+// ページ配列を走査し、確認用レコード配列を組み立てる純関数。
+// roster で列挙された保有者全員を登録対象とし（証書なし可）、
+// certificate ページで得た詳細情報を氏名突合で埋め込む。
+async function reconcileCertPages(pages, staff, masters) {
+  // page 昇順でソート
+  const sorted = [...pages].sort((a, b) => (a.page || 0) - (b.page || 0));
+
+  // 現在処理中の資格区画（直近の roster の内容）
+  let currentQual = null; // { qualification_name, holders: Map<normalizedName, record> }
+
+  // 全レコードを収集
+  const records = [];
+
+  // 資格区画に含まれない証書向けの一時バッファ（currentQual 確立後にフラッシュ）
+  const orphanCerts = [];
+
+  for (const pg of sorted) {
+    if (pg.type === 'roster') {
+      // 前の区画を確定させる
+      if (currentQual) {
+        // 孤立証書を取り込む（roster の外に来た証書は qualification_name を証書面のものとして使用済み）
+        flushOrphans(orphanCerts, records, staff, masters);
+      }
+      orphanCerts.length = 0;
+
+      const qualName = (pg.qualification_name || '').trim();
+      const holdersMap = new Map();
+      for (const h of (pg.holders || [])) {
+        const norm = normalizePersonName(h);
+        if (!norm) continue;
+        const rec = {
+          source: 'roster',
+          person_name: h.trim(),
+          qualification_name: qualName,
+          matched_qualification_id: matchQualificationId(qualName, masters),
+          qualification_category: resolveQualCategory(qualName, masters),
+          cert_number: null,
+          acquired_date: null,
+          expiry_date: null,
+          birth_date: null,
+          honseki: null,
+          issuer: null,
+          birth_mismatch: false,
+          cert_image_path: null,
+          cert_image_url: null,
+          cert_is_pdf: false,
+          _page_index: null, // 証書ページ番号（0始まり）
+        };
+        // 氏名突合（birth_date は未確定なので name_exact のみ試みる）
+        const { staffRecord, match_method } = matchStaffWithBirth(h, null, staff);
+        rec.matched_staff_id = staffRecord ? staffRecord.id : null;
+        rec.matched_staff_name = staffRecord ? staffRecord.name : null;
+        rec.match_method = match_method;
+        holdersMap.set(norm, rec);
+        records.push(rec);
+      }
+      currentQual = { qualification_name: qualName, holdersMap };
+
+    } else if (pg.type === 'certificate') {
+      const certPersonName = (pg.person_name || '').trim();
+      const norm = normalizePersonName(certPersonName);
+      const certBirth = pg.birth_date || null;
+
+      if (currentQual && norm && currentQual.holdersMap.has(norm)) {
+        // 名簿内の対象者に証書情報を上書き
+        const rec = currentQual.holdersMap.get(norm);
+        fillCertInfo(rec, pg, pg.page - 1); // page は 1始まり → 0始まりインデックスへ
+        // 生年月日が取得できたので突合を再試行（同名複数の場合に一意化）
+        const { staffRecord, match_method, birth_mismatch } = matchStaffWithBirth(certPersonName, certBirth, staff);
+        if (staffRecord) {
+          rec.matched_staff_id = staffRecord.id;
+          rec.matched_staff_name = staffRecord.name;
+          rec.match_method = match_method;
+          rec.birth_mismatch = birth_mismatch;
+        }
+      } else {
+        // 名簿に無い証書（名簿外の人・currentQual 未確立）→ 独立レコードとして追加
+        const qualName = currentQual
+          ? currentQual.qualification_name
+          : (pg.qualification_name || '').trim();
+        const rec = {
+          source: 'certificate',
+          person_name: certPersonName,
+          qualification_name: qualName,
+          matched_qualification_id: matchQualificationId(qualName, masters),
+          qualification_category: resolveQualCategory(qualName, masters),
+          cert_number: null,
+          acquired_date: null,
+          expiry_date: null,
+          birth_date: null,
+          honseki: null,
+          issuer: null,
+          birth_mismatch: false,
+          cert_image_path: null,
+          cert_image_url: null,
+          cert_is_pdf: false,
+          _page_index: pg.page - 1,
+        };
+        fillCertInfo(rec, pg, pg.page - 1);
+        const { staffRecord, match_method, birth_mismatch } = matchStaffWithBirth(certPersonName, certBirth, staff);
+        rec.matched_staff_id = staffRecord ? staffRecord.id : null;
+        rec.matched_staff_name = staffRecord ? staffRecord.name : null;
+        rec.match_method = match_method;
+        rec.birth_mismatch = birth_mismatch;
+
+        if (currentQual) {
+          records.push(rec);
+        } else {
+          orphanCerts.push(rec);
+        }
+      }
+    }
+    // index / other はスキップ
+  }
+
+  // ループ終了後に孤立証書をフラッシュ
+  flushOrphans(orphanCerts, records, staff, masters);
+
+  return records;
+}
+
+// 証書情報をレコードに充填するヘルパ
+function fillCertInfo(rec, pg, pageIndex) {
+  rec.source = 'certificate';
+  rec._page_index = pageIndex;
+  if (pg.cert_number)    rec.cert_number    = pg.cert_number.trim();
+  if (pg.acquired_date)  rec.acquired_date  = pg.acquired_date;
+  if (pg.expiry_date)    rec.expiry_date    = pg.expiry_date;
+  if (pg.birth_date)     rec.birth_date     = pg.birth_date;
+  if (pg.honseki)        rec.honseki        = pg.honseki.trim();
+  if (pg.issuer)         rec.issuer         = pg.issuer.trim();
+  // qualification_name は証書面のものがあれば上書き（但し名簿見出し優先は roster 側で確定済み）
+  if (!rec.qualification_name && pg.qualification_name) {
+    rec.qualification_name = pg.qualification_name.trim();
+  }
+}
+
+// 資格名からカテゴリを解決する（マスタ既存優先→既定'免許'）
+function resolveQualCategory(qualName, masters) {
+  const matched = masters.find((m) => matchQualificationId(qualName, [m]) === m.id);
+  return matched ? matched.category : '免許';
+}
+
+// 孤立証書レコードを records に追加（currentQual 確立前に来た証書）
+function flushOrphans(orphans, records, _staff, _masters) {
+  for (const rec of orphans) {
+    records.push(rec);
+  }
+  orphans.length = 0;
+}
+
+// PDF の特定ページ（0始まりインデックス）を単一ページPDFとして抽出し Buffer で返す
+async function extractPdfPage(pdfBuffer, pageIndex) {
+  const src = await PDFDocument.load(pdfBuffer);
+  const out = await PDFDocument.create();
+  const [p] = await out.copyPages(src, [pageIndex]);
+  out.addPage(p);
+  const bytes = await out.save();
+  return Buffer.from(bytes);
+}
+
 // ✅ 資格者証をアップロード→Geminiで読取→「氏名から社員」「資格名からマスタ」を自動突合して返す（管理者のみ）
-//    社員を指定しない一括取込用。DBには登録せず、フロントで担当社員・資格を確認してから保存する。
-//    返り値: { extracted, matched_staff_id, matched_staff_name, matched_qualification_id, cert_image_path, cert_image_url }
+//    社員を指定しない一括取込用（単体画像・束ねPDF どちらも受け付ける）。
+//    DBには登録せず、フロントで担当社員・資格を確認してから保存する。
+//    返り値: { records: [ { source, person_name, matched_staff_id, matched_staff_name, match_method,
+//              qualification_name, matched_qualification_id, qualification_category,
+//              cert_number, acquired_date, expiry_date, birth_date, honseki, issuer,
+//              birth_mismatch, cert_image_path, cert_image_url, cert_is_pdf } ] }
 app.post('/api/qualifications/scan', requireAuth, requireEmployeeAdmin, upload.single('cert'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'cert（資格者証の画像/PDF）が必要です' });
 
-    // 1) Gemini で内容（氏名含む）を抽出
-    const extracted = await extractCertificate(req.file.buffer, req.file.mimetype);
+    // Gemini インライン上限対策: 概ね 20MB を超えるファイルは分割を求める
+    const MAX_INLINE_BYTES = 20 * 1024 * 1024;
+    if (req.file.size > MAX_INLINE_BYTES) {
+      return res.status(413).json({ error: 'PDFのサイズが大きすぎます。20MB以下に分割してアップロードしてください。' });
+    }
 
-    // 2) 原本画像を保存（振り分け先が未確定なので inbox/ に置く。保存確定後もこのパスをそのまま使う）
-    await ensureCertBucket();
-    const ext = (req.file.originalname.split('.').pop() || 'jpg').toLowerCase();
-    const path = `inbox/${Date.now()}-${uuidv4()}.${ext}`;
-    const { error: upErr } = await supabase.storage
-      .from(CERT_BUCKET)
-      .upload(path, req.file.buffer, { contentType: req.file.mimetype });
-    if (upErr) throw upErr;
+    const isPdf = req.file.mimetype === 'application/pdf';
 
-    // 3) 氏名→社員、資格名→マスタ を突合
+    // 1) Gemini でページ配列を抽出
+    const pages = await extractCertificatePages(req.file.buffer, req.file.mimetype);
+
+    // 2) 社員マスタ・資格マスタを取得
     const [{ data: masters }, { data: staff }] = await Promise.all([
-      supabase.from('qualification_master').select('id, name'),
-      supabase.from('staff_master').select('id, name'),
+      supabase.from('qualification_master').select('id, name, category'),
+      supabase.from('staff_master').select('id, name, birth_date'),
     ]);
-    const matched_qualification_id = matchQualificationId(extracted.name, masters || []);
-    const matched_staff_id = matchStaffId(extracted.person_name, staff || []);
-    const matchedStaff = (staff || []).find((s) => s.id === matched_staff_id);
 
-    res.json({
-      extracted,
-      matched_qualification_id,
-      matched_staff_id: matched_staff_id || null,
-      matched_staff_name: matchedStaff ? matchedStaff.name : null,
-      cert_image_path: path,
-      cert_image_url: await certSignedUrl(path),
-    });
+    // 3) ページ配列を再構成してレコード配列を得る
+    const records = await reconcileCertPages(pages, staff || [], masters || []);
+
+    // 4) 証書ページがある（_page_index が設定されている）レコードを Storage に保存
+    await ensureCertBucket();
+    const ts = Date.now();
+
+    await Promise.all(records.map(async (rec) => {
+      if (rec._page_index == null) {
+        // 名簿のみ（証書なし）→ アップロードしない
+        return;
+      }
+      try {
+        let uploadBuffer;
+        let uploadMimeType;
+        let certIsPdf;
+
+        if (isPdf) {
+          // PDF: 該当ページだけを単一ページPDFとして抽出
+          uploadBuffer = await extractPdfPage(req.file.buffer, rec._page_index);
+          uploadMimeType = 'application/pdf';
+          certIsPdf = true;
+        } else {
+          // 画像: 元バッファをそのまま保存（1ページ扱い）
+          uploadBuffer = req.file.buffer;
+          uploadMimeType = req.file.mimetype;
+          certIsPdf = false;
+        }
+
+        const ext = isPdf ? 'pdf' : (req.file.originalname.split('.').pop() || 'jpg').toLowerCase();
+        const storagePath = `inbox/${ts}-${uuidv4()}.${ext}`;
+        const { error: upErr } = await supabase.storage
+          .from(CERT_BUCKET)
+          .upload(storagePath, uploadBuffer, { contentType: uploadMimeType });
+        if (upErr) throw upErr;
+
+        rec.cert_image_path = storagePath;
+        rec.cert_image_url  = await certSignedUrl(storagePath);
+        rec.cert_is_pdf     = certIsPdf;
+      } catch (upErr) {
+        // アップロード失敗はレコード単位で無視（cert_image_path=null のまま続行）
+        console.warn(`Warning: cert page upload failed (page ${rec._page_index + 1}):`, upErr.message);
+      }
+    }));
+
+    // 内部管理用フィールド(_page_index)を除いて返す
+    const responseRecords = records.map(({ _page_index, ...rest }) => rest);
+
+    res.json({ records: responseRecords });
   } catch (error) {
-    console.error('Error (qualification global scan):', error.message);
+    console.error('Error (qualification bundle scan):', error.message);
     res.status(error.status || 500).json({ error: error.message });
   }
 });
