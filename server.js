@@ -2028,10 +2028,13 @@ async function certSignedUrl(path, expiresIn = 3600) {
 }
 
 // 資格名の正規化（空白・括弧書きを除去して突合精度を上げる）
+// 漢数字→算用数字（「二級建築士免許証」と「2級建築士」を突合できるようにする）
+const KANJI_NUM = { '一': '1', '二': '2', '三': '3', '四': '4', '五': '5', '六': '6', '七': '7', '八': '8', '九': '9' };
 function normalizeQualName(s) {
   return String(s || '')
-    .replace(/[\s　]/g, '')
     .replace(/[（(].*?[)）]/g, '')
+    .replace(/[一二三四五六七八九]/g, (m) => KANJI_NUM[m])
+    .replace(/[\s　]/g, '')
     .toLowerCase();
 }
 
@@ -2129,10 +2132,20 @@ async function extractCertificate(buffer, mimeType) {
   };
 }
 
-// 抽出した氏名を staff_master へ突合（空白除去の完全一致のみ。曖昧一致は誤割当を招くため避け、
-// 一致しなければ null を返してフロントで人に選ばせる）。
+// 異体字フォールド（台帳とのゆらぎ吸収。誤統合を避けるため保守的な範囲に限定）
+const NAME_VARIANTS = [
+  [/[斎齋齊]/g, '斉'], [/[邉邊]/g, '辺'], [/髙/g, '高'], [/[﨑嵜]/g, '崎'],
+  [/德/g, '徳'], [/佑/g, '祐'], [/濵/g, '浜'], [/曺/g, '曹'], [/廸/g, '迪'],
+];
+function foldVariants(s) {
+  let r = String(s || '');
+  for (const [re, to] of NAME_VARIANTS) r = r.replace(re, to);
+  return r;
+}
+// 抽出した氏名を staff_master へ突合（空白除去＋異体字フォールド後の完全一致）。
+// 一致しなければ null を返してフロントで人に選ばせる。
 function normalizePersonName(s) {
-  return String(s || '').replace(/[\s　]/g, '').toLowerCase();
+  return foldVariants(String(s || '').replace(/[\s　]/g, '')).toLowerCase();
 }
 function matchStaffId(name, staff) {
   const n = normalizePersonName(name);
@@ -2244,30 +2257,35 @@ async function extractCertificatePages(buffer, mimeType) {
 
   const prompt = [
     'これは日本の建設業における資格関連書類をまとめたPDF/画像です。',
-    'ページごとに種別を判定し、下記スキーマの配列をJSONで返してください。',
+    'ページを走査し、下記スキーマの配列をJSONで返してください。1つの要素は「1つの名簿」または「1つの証書」です。',
     '',
-    '【ページ種別（type）】',
-    '- index: 資格一覧表・索引ページ（資格名の目次のみ）',
-    '- roster: 資格名が見出しとして記載され、その資格を保有する氏名一覧が書かれた名簿ページ',
-    '- certificate: 免許証・合格証明書・技能講習修了証・特別教育修了証等の証書ページ',
+    '【最重要】1ページに複数の資格の名簿が並んでいる場合（例: 同じページに「1級建築士」と「2級建築士」の表が別々にある）は、',
+    '資格ごとに別々の roster 要素として返してください。複数の見出しを1つにまとめたり、資格名を連結しないでください。',
+    '',
+    '【要素種別（type）】',
+    '- index: 資格一覧表・索引（資格名の目次のみ）',
+    '- roster: 資格名が見出しで、その下に保有者の氏名一覧がある名簿',
+    '- certificate: 免許証・合格証明書・技能講習修了証・特別教育修了証等の証書',
     '- other: 上記以外',
     '',
-    '【roster ページで返す追加フィールド】',
-    '- qualification_name: 見出しに記載の資格名（例: 玉掛け技能講習）',
-    '- holders: 氏名の配列（姓名間の空白は除く。例: ["山田太郎","鈴木花子"]）',
+    '【roster 要素のフィールド】',
+    '- page: ページ番号(整数)',
+    '- qualification_name: その名簿の見出し資格名（1つだけ。例: 1級建築士）',
+    '- holders: 氏名の配列（姓名間の空白は除く。手書きでも読めるだけ読む）',
     '',
-    '【certificate ページで返す追加フィールド】',
+    '【certificate 要素のフィールド】',
+    '- page: ページ番号(整数)',
     '- person_name: 本人氏名（姓名間の空白は除く。読めなければ空文字）',
-    '- qualification_name: 証書面に記載の資格名称',
-    '- cert_number: 証明書番号・免許番号（無ければ空文字）',
-    '- acquired_date: 取得日・修了日（YYYY-MM-DD形式。和暦は西暦へ変換。読めなければ空文字）',
-    '- expiry_date: 有効期限（YYYY-MM-DD形式。記載なければ空文字）',
-    '- birth_date: 本人の生年月日（YYYY-MM-DD形式。和暦は西暦へ変換。記載なければ空文字）',
-    '- honseki: 本籍地（例: 福岡県。記載なければ空文字）',
-    '- issuer: 発行者名（例: 建設大臣、長崎県知事、国土交通大臣。記載なければ空文字）',
+    '- qualification_name: 証書面に書かれた資格・証明の名称（例: 二級建築士免許証）',
+    '- cert_number: 証明書番号・免許番号・登録番号（無ければ空文字）',
+    '- acquired_date: 取得日・登録年月日・合格日（YYYY-MM-DD。和暦は西暦へ。読めなければ空文字）',
+    '- expiry_date: 有効期限・有効期間満了日（YYYY-MM-DD。無ければ空文字）',
+    '- birth_date: 本人の生年月日（YYYY-MM-DD。和暦は西暦へ。無ければ空文字）',
+    '- honseki: 本籍地（例: 福岡県。無ければ空文字）',
+    '- issuer: 発行者名（例: 建設大臣、長崎県知事、国土交通大臣。無ければ空文字）',
     '',
     '【注意】',
-    '- 90度回転している証書も正しく読んでください。',
+    '- 90度回転している証書も向きを補正して正しく読んでください。',
     '- 読み取れない項目は空文字にしてください。推測で埋めないでください。',
     '- 1ページに複数の証書が印刷されている場合は1要素として扱ってください。',
   ].join('\n');
@@ -2283,7 +2301,7 @@ async function extractCertificatePages(buffer, mimeType) {
     generationConfig: {
       temperature: 0,
       responseMimeType: 'application/json',
-      maxOutputTokens: 8192,
+      maxOutputTokens: 32768,
       responseSchema: {
         type: 'ARRAY',
         items: {
@@ -2319,7 +2337,13 @@ async function extractCertificatePages(buffer, mimeType) {
     throw e;
   }
   const json = await resp.json();
-  const text = json?.candidates?.[0]?.content?.parts?.[0]?.text;
+  const cand = json?.candidates?.[0];
+  if (cand?.finishReason === 'MAX_TOKENS') {
+    const e = new Error('PDFの情報量が多く、AIが読み切れませんでした。資格ごと等にPDFを分割してアップロードしてください。');
+    e.status = 413;
+    throw e;
+  }
+  const text = cand?.content?.parts?.[0]?.text;
   if (!text) throw new Error('Gemini から有効な応答が得られませんでした');
   let parsed;
   try { parsed = JSON.parse(text); } catch { throw new Error('Gemini 応答の解析に失敗しました'); }
@@ -2363,123 +2387,98 @@ function matchStaffWithBirth(personName, certBirthDate, staff) {
 }
 
 // ページ配列を走査し、確認用レコード配列を組み立てる純関数。
-// roster で列挙された保有者全員を登録対象とし（証書なし可）、
-// certificate ページで得た詳細情報を氏名突合で埋め込む。
-async function reconcileCertPages(pages, staff, masters) {
-  // page 昇順でソート
+// ページ順に「名簿見出しグループ→続く証書群」へ分割し、各証書を同グループの見出しへ紐付ける。
+// 見出しが複数（例: 同一ページに1級建築士と2級建築士）なら証書面の名称で確定する。
+// 資格名は名簿見出しを正とする（手書き名簿の氏名が空でも見出しは読めるため綺麗な資格名になる）。
+// roster の氏名一覧(holders)が読めている場合は、証書なしの保有者も登録対象にする。
+function reconcileCertPages(pages, staff, masters) {
   const sorted = [...pages].sort((a, b) => (a.page || 0) - (b.page || 0));
+  const blank = () => ({
+    cert_number: null, acquired_date: null, expiry_date: null, birth_date: null,
+    honseki: null, issuer: null, birth_mismatch: false,
+    cert_image_path: null, cert_image_url: null, cert_is_pdf: false, _page_index: null,
+  });
+  const applyStaff = (rec, name, birth) => {
+    const m = matchStaffWithBirth(name, birth || null, staff);
+    rec.matched_staff_id = m.staffRecord ? m.staffRecord.id : null;
+    rec.matched_staff_name = m.staffRecord ? m.staffRecord.name : null;
+    rec.match_method = m.match_method;
+    rec.birth_mismatch = m.birth_mismatch;
+  };
+  const mkRec = (source, name, qualName) => ({
+    source, person_name: (name || '').trim(),
+    qualification_name: qualName,
+    matched_qualification_id: matchQualificationId(qualName, masters),
+    qualification_category: resolveQualCategory(qualName, masters),
+    matched_staff_id: null, matched_staff_name: null, match_method: 'none', ...blank(),
+  });
 
-  // 現在処理中の資格区画（直近の roster の内容）
-  let currentQual = null; // { qualification_name, holders: Map<normalizedName, record> }
-
-  // 全レコードを収集
-  const records = [];
-
-  // 資格区画に含まれない証書向けの一時バッファ（currentQual 確立後にフラッシュ）
-  const orphanCerts = [];
-
+  // 見出しグループへ分割（連続する roster をまとめ、続く certificate を同グループへ）
+  const groups = [];
+  let cur = null;
+  let lastWasCert = true;
   for (const pg of sorted) {
     if (pg.type === 'roster') {
-      // 前の区画を確定させる
-      if (currentQual) {
-        // 孤立証書を取り込む（roster の外に来た証書は qualification_name を証書面のものとして使用済み）
-        flushOrphans(orphanCerts, records, staff, masters);
-      }
-      orphanCerts.length = 0;
-
-      const qualName = (pg.qualification_name || '').trim();
-      const holdersMap = new Map();
-      for (const h of (pg.holders || [])) {
-        const norm = normalizePersonName(h);
-        if (!norm) continue;
-        const rec = {
-          source: 'roster',
-          person_name: h.trim(),
-          qualification_name: qualName,
-          matched_qualification_id: matchQualificationId(qualName, masters),
-          qualification_category: resolveQualCategory(qualName, masters),
-          cert_number: null,
-          acquired_date: null,
-          expiry_date: null,
-          birth_date: null,
-          honseki: null,
-          issuer: null,
-          birth_mismatch: false,
-          cert_image_path: null,
-          cert_image_url: null,
-          cert_is_pdf: false,
-          _page_index: null, // 証書ページ番号（0始まり）
-        };
-        // 氏名突合（birth_date は未確定なので name_exact のみ試みる）
-        const { staffRecord, match_method } = matchStaffWithBirth(h, null, staff);
-        rec.matched_staff_id = staffRecord ? staffRecord.id : null;
-        rec.matched_staff_name = staffRecord ? staffRecord.name : null;
-        rec.match_method = match_method;
-        holdersMap.set(norm, rec);
-        records.push(rec);
-      }
-      currentQual = { qualification_name: qualName, holdersMap };
-
+      if (lastWasCert || !cur) { cur = { rosters: [], certs: [] }; groups.push(cur); }
+      cur.rosters.push({ heading: (pg.qualification_name || '').trim(), holders: pg.holders || [] });
+      lastWasCert = false;
     } else if (pg.type === 'certificate') {
-      const certPersonName = (pg.person_name || '').trim();
-      const norm = normalizePersonName(certPersonName);
-      const certBirth = pg.birth_date || null;
-
-      if (currentQual && norm && currentQual.holdersMap.has(norm)) {
-        // 名簿内の対象者に証書情報を上書き
-        const rec = currentQual.holdersMap.get(norm);
-        fillCertInfo(rec, pg, pg.page - 1); // page は 1始まり → 0始まりインデックスへ
-        // 生年月日が取得できたので突合を再試行（同名複数の場合に一意化）
-        const { staffRecord, match_method, birth_mismatch } = matchStaffWithBirth(certPersonName, certBirth, staff);
-        if (staffRecord) {
-          rec.matched_staff_id = staffRecord.id;
-          rec.matched_staff_name = staffRecord.name;
-          rec.match_method = match_method;
-          rec.birth_mismatch = birth_mismatch;
-        }
-      } else {
-        // 名簿に無い証書（名簿外の人・currentQual 未確立）→ 独立レコードとして追加
-        const qualName = currentQual
-          ? currentQual.qualification_name
-          : (pg.qualification_name || '').trim();
-        const rec = {
-          source: 'certificate',
-          person_name: certPersonName,
-          qualification_name: qualName,
-          matched_qualification_id: matchQualificationId(qualName, masters),
-          qualification_category: resolveQualCategory(qualName, masters),
-          cert_number: null,
-          acquired_date: null,
-          expiry_date: null,
-          birth_date: null,
-          honseki: null,
-          issuer: null,
-          birth_mismatch: false,
-          cert_image_path: null,
-          cert_image_url: null,
-          cert_is_pdf: false,
-          _page_index: pg.page - 1,
-        };
-        fillCertInfo(rec, pg, pg.page - 1);
-        const { staffRecord, match_method, birth_mismatch } = matchStaffWithBirth(certPersonName, certBirth, staff);
-        rec.matched_staff_id = staffRecord ? staffRecord.id : null;
-        rec.matched_staff_name = staffRecord ? staffRecord.name : null;
-        rec.match_method = match_method;
-        rec.birth_mismatch = birth_mismatch;
-
-        if (currentQual) {
-          records.push(rec);
-        } else {
-          orphanCerts.push(rec);
-        }
-      }
+      if (!cur) { cur = { rosters: [], certs: [] }; groups.push(cur); }
+      cur.certs.push(pg);
+      lastWasCert = true;
     }
     // index / other はスキップ
   }
 
-  // ループ終了後に孤立証書をフラッシュ
-  flushOrphans(orphanCerts, records, staff, masters);
+  const records = [];
+  for (const g of groups) {
+    // 1) holders から証書なし保有者レコードを先に作る（holders が空なら何も作られない）
+    const holderRec = new Map(); // `${heading}::${norm}` -> rec
+    for (const r of g.rosters) {
+      for (const h of r.holders) {
+        const norm = normalizePersonName(h);
+        if (!norm) continue;
+        const rec = mkRec('roster', h, r.heading);
+        applyStaff(rec, h, null);
+        records.push(rec);
+        holderRec.set(`${r.heading}::${norm}`, rec);
+      }
+    }
 
+    // 2) 証書を見出しへ割当
+    for (const c of g.certs) {
+      const norm = normalizePersonName(c.person_name);
+      let heading = null;
+      if (g.rosters.length === 1) {
+        heading = g.rosters[0].heading;
+      } else if (g.rosters.length > 1) {
+        const face = normalizeQualName(c.qualification_name);
+        const byFace = g.rosters.filter((r) => {
+          const rn = normalizeQualName(r.heading);
+          return rn && face && (face.includes(rn) || rn.includes(face));
+        });
+        if (byFace.length === 1) {
+          heading = byFace[0].heading;
+        } else {
+          // 証書面で決まらなければ holders に氏名がある名簿で確定を試みる
+          const byHolder = g.rosters.filter((r) => r.holders.some((h) => normalizePersonName(h) === norm));
+          if (byHolder.length === 1) heading = byHolder[0].heading;
+        }
+      }
+      const existing = heading ? holderRec.get(`${heading}::${norm}`) : null;
+      if (existing && existing._page_index == null) {
+        existing.qualification_name = heading;
+        fillCertInfo(existing, c, (c.page || 1) - 1);
+        applyStaff(existing, c.person_name, c.birth_date);
+      } else {
+        const qn = heading || (c.qualification_name || '').trim();
+        const rec = mkRec('certificate', c.person_name, qn);
+        fillCertInfo(rec, c, (c.page || 1) - 1);
+        applyStaff(rec, c.person_name, c.birth_date);
+        records.push(rec);
+      }
+    }
+  }
   return records;
 }
 
@@ -2503,14 +2502,6 @@ function fillCertInfo(rec, pg, pageIndex) {
 function resolveQualCategory(qualName, masters) {
   const matched = masters.find((m) => matchQualificationId(qualName, [m]) === m.id);
   return matched ? matched.category : '免許';
-}
-
-// 孤立証書レコードを records に追加（currentQual 確立前に来た証書）
-function flushOrphans(orphans, records, _staff, _masters) {
-  for (const rec of orphans) {
-    records.push(rec);
-  }
-  orphans.length = 0;
 }
 
 // PDF の特定ページ（0始まりインデックス）を単一ページPDFとして抽出し Buffer で返す
@@ -2551,8 +2542,10 @@ app.post('/api/qualifications/scan', requireAuth, requireEmployeeAdmin, upload.s
       supabase.from('staff_master').select('id, name, birth_date'),
     ]);
 
-    // 3) ページ配列を再構成してレコード配列を得る
-    const records = await reconcileCertPages(pages, staff || [], masters || []);
+    // 3) ページ配列を再構成してレコード配列を得る。
+    //    社員名簿に該当しない人（台帳未登録）は取り込まない方針のため、ここで除外する。
+    const allRecords = reconcileCertPages(pages, staff || [], masters || []);
+    const records = allRecords.filter((r) => r.matched_staff_id != null);
 
     // 4) 証書ページがある（_page_index が設定されている）レコードを Storage に保存
     await ensureCertBucket();
