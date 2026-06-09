@@ -2399,11 +2399,10 @@ function matchStaffWithBirth(personName, certBirthDate, staff) {
   return { staffRecord: null, match_method: 'none', birth_mismatch: false };
 }
 
-// ページ配列を走査し、確認用レコード配列を組み立てる純関数。
-// ページ順に「名簿見出しグループ→続く証書群」へ分割し、各証書を同グループの見出しへ紐付ける。
-// 見出しが複数（例: 同一ページに1級建築士と2級建築士）なら証書面の名称で確定する。
-// 資格名は名簿見出しを正とする（手書き名簿の氏名が空でも見出しは読めるため綺麗な資格名になる）。
-// roster の氏名一覧(holders)が読めている場合は、証書なしの保有者も登録対象にする。
+// ページ配列から「証書（合格証明書・免許証・技能講習修了証・特別教育修了証など）」だけを
+// 抽出してレコード化する純関数。
+// 方針（2026-06-10 ユーザー指示）: 資格別一覧表（索引）や名簿(roster)は登録源にせず無視し、
+//   証書1枚=1レコードとする。資格名は証書面の名称を採用し、氏名→社員 / 資格名→マスタ を突合する。
 function reconcileCertPages(pages, staff, masters) {
   const sorted = [...pages].sort((a, b) => (a.page || 0) - (b.page || 0));
   const blank = () => ({
@@ -2426,71 +2425,14 @@ function reconcileCertPages(pages, staff, masters) {
     matched_staff_id: null, matched_staff_name: null, match_method: 'none', ...blank(),
   });
 
-  // 見出しグループへ分割（連続する roster をまとめ、続く certificate を同グループへ）
-  const groups = [];
-  let cur = null;
-  let lastWasCert = true;
-  for (const pg of sorted) {
-    if (pg.type === 'roster') {
-      if (lastWasCert || !cur) { cur = { rosters: [], certs: [] }; groups.push(cur); }
-      cur.rosters.push({ heading: (pg.qualification_name || '').trim(), holders: pg.holders || [] });
-      lastWasCert = false;
-    } else if (pg.type === 'certificate') {
-      if (!cur) { cur = { rosters: [], certs: [] }; groups.push(cur); }
-      cur.certs.push(pg);
-      lastWasCert = true;
-    }
-    // index / other はスキップ
-  }
-
   const records = [];
-  for (const g of groups) {
-    // 1) holders から証書なし保有者レコードを先に作る（holders が空なら何も作られない）
-    const holderRec = new Map(); // `${heading}::${norm}` -> rec
-    for (const r of g.rosters) {
-      for (const h of r.holders) {
-        const norm = normalizePersonName(h);
-        if (!norm) continue;
-        const rec = mkRec('roster', h, r.heading);
-        applyStaff(rec, h, null);
-        records.push(rec);
-        holderRec.set(`${r.heading}::${norm}`, rec);
-      }
-    }
-
-    // 2) 証書を見出しへ割当
-    for (const c of g.certs) {
-      const norm = normalizePersonName(c.person_name);
-      let heading = null;
-      if (g.rosters.length === 1) {
-        heading = g.rosters[0].heading;
-      } else if (g.rosters.length > 1) {
-        const face = normalizeQualName(c.qualification_name);
-        const byFace = g.rosters.filter((r) => {
-          const rn = normalizeQualName(r.heading);
-          return rn && face && (face.includes(rn) || rn.includes(face));
-        });
-        if (byFace.length === 1) {
-          heading = byFace[0].heading;
-        } else {
-          // 証書面で決まらなければ holders に氏名がある名簿で確定を試みる
-          const byHolder = g.rosters.filter((r) => r.holders.some((h) => normalizePersonName(h) === norm));
-          if (byHolder.length === 1) heading = byHolder[0].heading;
-        }
-      }
-      const existing = heading ? holderRec.get(`${heading}::${norm}`) : null;
-      if (existing && existing._page_index == null) {
-        existing.qualification_name = heading;
-        fillCertInfo(existing, c, (c.page || 1) - 1);
-        applyStaff(existing, c.person_name, c.birth_date);
-      } else {
-        const qn = heading || (c.qualification_name || '').trim();
-        const rec = mkRec('certificate', c.person_name, qn);
-        fillCertInfo(rec, c, (c.page || 1) - 1);
-        applyStaff(rec, c.person_name, c.birth_date);
-        records.push(rec);
-      }
-    }
+  for (const pg of sorted) {
+    if (pg.type !== 'certificate') continue; // index / roster / other は登録源にしない
+    const qn = (pg.qualification_name || '').trim();
+    const rec = mkRec('certificate', pg.person_name, qn);
+    fillCertInfo(rec, pg, (pg.page || 1) - 1);
+    applyStaff(rec, pg.person_name, pg.birth_date);
+    records.push(rec);
   }
   return records;
 }
