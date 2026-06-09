@@ -18,13 +18,13 @@ for (const t of ['bid_projects', 'bid_documents', 'bid_status_history']) {
 }
 
 // 2) Storage バケットチェック
-const { data: buckets, error: bErr } = await sb.storage.listBuckets()
-if (bErr) {
-  console.log(`⚠️ バケット一覧の取得に失敗: ${bErr.message}（service_role キーなら取得可）`)
+//    listBuckets() は anon キーでは非公開バケットを列挙できず誤検知するため、
+//    バケット内の list() を試して存在判定する（"Bucket not found" なら未作成）。
+const { error: bErr } = await sb.storage.from('bid-documents').list('', { limit: 1 })
+if (bErr && /not found|does not exist/i.test(bErr.message)) {
+  console.log(`❌ バケット bid-documents: 未作成 (${bErr.message})`); ok = false
 } else {
-  const found = (buckets || []).some((b) => b.name === 'bid-documents')
-  if (found) console.log('✅ バケット bid-documents: OK')
-  else { console.log('❌ バケット bid-documents: 未作成'); ok = false }
+  console.log('✅ バケット bid-documents: OK')
 }
 
 console.log(ok ? '\n🎉 セットアップ完了。アプリから利用できます。' : '\n→ 上記の❌を 入札案件管理_セットアップ手順.md の手順で解消してください。')
