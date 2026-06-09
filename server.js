@@ -1961,12 +1961,24 @@ app.post('/api/qualifications', requireAuth, requireEmployeeAdmin, async (req, r
   try {
     const { id, name, category, has_expiry, sort_order } = req.body || {};
     if (!name) return res.status(400).json({ error: '資格名は必須です' });
+    // 同名マスタが既にあれば再利用する（一括取込で同じ新規資格が複数行あっても重複登録で失敗させない）
+    const { data: existing } = await supabase
+      .from('qualification_master').select('*').eq('name', name).maybeSingle();
+    if (existing) return res.json(existing);
     const newId = id || (await nextMasterId('qualification_master', 'Q'));
     const { data, error } = await supabase
       .from('qualification_master')
       .insert([{ id: newId, name, category: category || 'その他', has_expiry: !!has_expiry, sort_order: sort_order || 0 }])
       .select();
-    if (error) throw error;
+    if (error) {
+      // 同時実行などで一意制約に当たった場合も既存行を返す（23505 = unique_violation）
+      if (error.code === '23505') {
+        const { data: row } = await supabase
+          .from('qualification_master').select('*').eq('name', name).maybeSingle();
+        if (row) return res.json(row);
+      }
+      throw error;
+    }
     res.json(data[0]);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -2270,7 +2282,8 @@ async function extractCertificatePages(buffer, mimeType) {
     '',
     '【roster 要素のフィールド】',
     '- page: ページ番号(整数)',
-    '- qualification_name: その名簿の見出し資格名（1つだけ。例: 1級建築士）',
+    '- qualification_name: その名簿の見出しに実際に書かれている資格名（1つだけ。例: 1級建築士）。',
+    '    見出しに無い「技士補」「補」「（）内の補足」などを推測で付け足さず、書かれている通りに返す。',
     '- holders: 氏名の配列（姓名間の空白は除く。手書きでも読めるだけ読む）',
     '',
     '【certificate 要素のフィールド】',
