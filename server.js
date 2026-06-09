@@ -165,6 +165,42 @@ async function requireAdmin(req, res, next) {
   }
 }
 
+// ✅ 安全パトロールのアプリ内ロール（admin / member / none）
+//    権限は staff_app_permissions['safety-patrol'] に一本化（ポータル社員一覧と共通の付与先）。
+//    - グローバル管理者（ADMIN_EMAILS / staff_master.app_role='admin'）は常に admin
+//    - それ以外は staff_app_permissions['safety-patrol'] の access_level を見る
+//      （admin / member）。行が無ければ none（＝アプリ利用権限なし）。
+async function resolveSafetyPatrolRole(email) {
+  const perms = await resolvePermissions(email); // { role, staffId } グローバル
+  if (perms.role === 'admin') return { role: 'admin', staffId: perms.staffId };
+  let level = null;
+  if (perms.staffId) {
+    const { data } = await supabase
+      .from('staff_app_permissions')
+      .select('access_level')
+      .eq('staff_id', perms.staffId)
+      .eq('app_key', 'safety-patrol')
+      .maybeSingle();
+    level = data?.access_level || null;
+  }
+  const role = level === 'admin' ? 'admin' : level ? 'member' : 'none';
+  return { role, staffId: perms.staffId };
+}
+
+// ✅ 安全パトロールの管理者のみ許可するミドルウェア（要 requireAuth 後段）
+async function requireSafetyPatrolAdmin(req, res, next) {
+  try {
+    const r = await resolveSafetyPatrolRole(req.user?.email);
+    if (r.role !== 'admin') {
+      return res.status(403).json({ error: 'この操作は安全パトロールの管理者のみ可能です' });
+    }
+    req.spRole = r;
+    next();
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+}
+
 // ✅ 指摘内容テンプレートの蓄積
 //    点検保存時に「指摘あり」かつ指摘内容ありの明細を項目単位でストックする。
 //    既存（同一 item_id × 同一 content）があれば use_count を加算、無ければ新規登録。
@@ -224,8 +260,10 @@ app.get('/api/my-permissions', requireAuth, async (req, res) => {
   try {
     const perms = await resolvePermissions(req.user.email);
     const appPerms = await resolveAppPermissions(perms.staffId);
+    const spRole = await resolveSafetyPatrolRole(req.user.email);
     res.json({
-      role: perms.role,        // 'admin' | 'member'（安全パトロール互換のグローバルロール）
+      role: perms.role,        // 'admin' | 'member'（グローバルロール。ポータル全体の管理者判定に使用）
+      safety_patrol_role: spRole.role, // 安全パトロールのアプリ内ロール（admin|member|none）
       staff_id: perms.staffId, // 本人のスタッフID（未登録なら null）
       email: req.user.email,
       name: req.user.name,
@@ -415,10 +453,10 @@ app.get('/api/dashboard/stats', requireAuth, async (req, res) => {
 app.use('/api/inspections', requireAuth);
 app.use('/api/masters', requireAuth);
 
-// ✅ マスター管理は閲覧(GET)は全員可、登録/編集/削除は管理者のみ
+// ✅ マスター管理は閲覧(GET)は全員可、登録/編集/削除は安全パトロールの管理者のみ
 app.use('/api/masters', async (req, res, next) => {
   if (req.method === 'GET') return next();
-  return requireAdmin(req, res, next);
+  return requireSafetyPatrolAdmin(req, res, next);
 });
 
 // ✅ 安全パトロール - 点検一覧（各点検に指摘是正サマリ correction を付与）
@@ -1153,8 +1191,8 @@ app.post('/api/inspections/:id/details/:detailId/reject', async (req, res) => {
   }
 });
 
-// ✅ 安全パトロール - 点検削除（管理者のみ）
-app.delete('/api/inspections/:id', requireAdmin, async (req, res) => {
+// ✅ 安全パトロール - 点検削除（安全パトロールの管理者のみ）
+app.delete('/api/inspections/:id', requireSafetyPatrolAdmin, async (req, res) => {
   try {
     const { id } = req.params;
 
@@ -1229,14 +1267,34 @@ app.delete('/api/masters/projects/:id', async (req, res) => {
 });
 
 // ✅ マスター管理 - スタッフ一覧
+//    ?app=<アプリキー> 指定時は、そのアプリの利用権限(staff_app_permissions)を
+//    持つ社員のみ返す（各アプリの選択リストを権限保有者だけに絞るため）。
+//    未指定なら全件＝台帳の管理用（マスター管理タブはこちらを使う）。
 app.get('/api/masters/staff', async (req, res) => {
   try {
-    const { data, error } = await supabase
+    const appKey = req.query.app;
+    let levelById = null;
+    if (appKey) {
+      const { data: perms, error: pErr } = await supabase
+        .from('staff_app_permissions')
+        .select('staff_id, access_level')
+        .eq('app_key', appKey);
+      if (pErr) throw pErr;
+      levelById = {};
+      for (const p of perms || []) levelById[p.staff_id] = p.access_level;
+      if (Object.keys(levelById).length === 0) return res.json([]); // 権限保有者が居なければ空
+    }
+    let query = supabase
       .from('staff_master')
       .select('*')
       .order('id', { ascending: true });
+    if (levelById) query = query.in('id', Object.keys(levelById));
+    const { data, error } = await query;
     if (error) throw error;
-    res.json(data || []);
+    let rows = data || [];
+    // ?app= 指定時は各社員の現在のアプリ権限（member/admin）を付与
+    if (levelById) rows = rows.map((s) => ({ ...s, app_access_level: levelById[s.id] || null }));
+    res.json(rows);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -1280,6 +1338,28 @@ app.delete('/api/masters/staff/:id', async (req, res) => {
     const { error } = await supabase.from('staff_master').delete().eq('id', req.params.id);
     if (error) throw error;
     res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ マスター管理 - 安全パトロールのアプリ内権限（メンバー/管理者）を変更
+//    staff_app_permissions['safety-patrol'] の access_level を upsert する。
+//    社員の追加・削除はポータルの社員一覧で行い、ここでは権限の変更のみ。
+//    （非GET の /api/masters は requireSafetyPatrolAdmin で保護済み）
+app.put('/api/masters/staff/:id/app-permission', async (req, res) => {
+  try {
+    const staffId = req.params.id;
+    const level = req.body?.access_level;
+    if (!['member', 'admin'].includes(level)) {
+      return res.status(400).json({ error: 'access_level は member か admin を指定してください' });
+    }
+    const { error } = await supabase.from('staff_app_permissions').upsert(
+      { staff_id: staffId, app_key: 'safety-patrol', access_level: level, updated_at: new Date().toISOString() },
+      { onConflict: 'staff_id,app_key' }
+    );
+    if (error) throw error;
+    res.json({ success: true, staff_id: staffId, access_level: level });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
