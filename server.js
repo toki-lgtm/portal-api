@@ -345,6 +345,7 @@ app.get('/api/apps', requireAuth, async (req, res) => {
       { id: 1, key: 'safety-patrol', name: '安全パトロール', url: safetyPatrolUrl, icon: '✅' },
       { id: 2, key: 'employee-list', name: '社員一覧', icon: '👤', internal: true, view: 'employees' },
       { id: 7, key: 'announcements', name: 'お知らせ', icon: '📣', internal: true, view: 'announcements' },
+      { id: 8, key: 'bids', name: '入札案件管理', icon: '📋', internal: true, view: 'bids', description: '入札案件の進捗・期限・金額・資料を管理' },
       { id: 3, key: 'mailer', name: 'メーラー', url: '#', icon: '📧', status: 'coming_soon' },
       { id: 4, key: 'file-manager', name: 'ファイル管理', url: '#', icon: '📁', status: 'coming_soon' },
       { id: 5, key: 'evaluation', name: '社員評価', url: '#', icon: '⭐', status: 'coming_soon' },
@@ -1654,6 +1655,39 @@ async function requireEmployeeAdmin(req, res, next) {
   }
 }
 
+// ✅ 入札案件管理のアクセス権（入札担当のみ）
+//    権限は staff_app_permissions['bids'] に付与（社員一覧画面のアプリ別権限から設定）。
+//    - グローバル管理者（ADMIN_EMAILS / staff_master.app_role='admin'）は常に許可
+//    - それ以外は staff_app_permissions['bids'] に行があれば許可（access_level は問わない）
+//    入札担当のみが使う前提のため、閲覧/編集でロールを分けない（行があれば全操作可）。
+async function resolveBidRole(email) {
+  const perms = await resolvePermissions(email); // { role, staffId }
+  if (perms.role === 'admin') return { access: true, staffId: perms.staffId, globalAdmin: true };
+  let level = null;
+  if (perms.staffId) {
+    const { data } = await supabase
+      .from('staff_app_permissions')
+      .select('access_level')
+      .eq('staff_id', perms.staffId)
+      .eq('app_key', 'bids')
+      .maybeSingle();
+    level = data?.access_level || null;
+  }
+  return { access: !!level, staffId: perms.staffId, globalAdmin: false };
+}
+
+// 入札案件管理のアクセス権（行があれば許可）
+async function requireBidAccess(req, res, next) {
+  try {
+    const r = await resolveBidRole(req.user.email);
+    if (!r.access) return res.status(403).json({ error: '入札案件管理へのアクセス権がありません' });
+    req.bidRole = r;
+    next();
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+}
+
 // 期限切れ間近の判定日数（既定90日）
 const EXPIRY_SOON_DAYS = 90;
 
@@ -2785,6 +2819,410 @@ app.delete('/api/announcements/:id', requireAuth, requireAnnouncementAdmin, asyn
     res.json({ ok: true });
   } catch (error) {
     console.error('Error (announcement delete):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================================
+// 入札案件管理 API（all: requireAuth + requireBidAccess）
+// ============================================================
+
+const BID_BUCKET = 'bid-documents';
+const BID_STATUSES = ['collecting', 'judging', 'estimating', 'bid', 'won', 'lost', 'contracted', 'declined'];
+// 進行中（KPI: in_progress）とみなすステータス
+const BID_IN_PROGRESS = ['collecting', 'judging', 'estimating', 'bid'];
+// 「未入札」（期限間近判定の対象）
+const BID_NOT_YET_BID = ['collecting', 'judging', 'estimating'];
+
+// 現在のJST日付（YYYY-MM-DD）
+function jstToday() {
+  return new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10);
+}
+
+// staff_id→name のマップを取得
+async function loadStaffNameMap() {
+  const { data } = await supabase.from('staff_master').select('id, name');
+  const map = {};
+  for (const s of data || []) map[s.id] = s.name;
+  return map;
+}
+
+// 期間レンジを算出（fy=年度4-3月 / cy=暦年 / custom=from,to）。返り値 { from, to }（YYYY-MM-DD）
+function resolveBidPeriod(period, from, to) {
+  const today = jstToday();
+  const y = Number(today.slice(0, 4));
+  const m = Number(today.slice(5, 7));
+  if (period === 'custom' && from && to) return { from, to };
+  if (period === 'cy') return { from: `${y}-01-01`, to: `${y}-12-31` };
+  // 既定: 年度（4月開始）
+  const startY = m >= 4 ? y : y - 1;
+  return { from: `${startY}-04-01`, to: `${startY + 1}-03-31` };
+}
+
+// ✅ 入札 - KPI・分析集計（/:id より先に定義してルート衝突を防ぐ）
+app.get('/api/bids/stats', requireAuth, requireBidAccess, async (req, res) => {
+  try {
+    const { period = 'fy', from, to, group_by = 'client' } = req.query;
+    const range = resolveBidPeriod(period, from, to);
+    const today = jstToday();
+
+    const { data: rows, error } = await supabase
+      .from('bid_projects')
+      .select('*')
+      .eq('is_active', true);
+    if (error) throw error;
+    const all = rows || [];
+
+    // サマリ（進行中・今月入札・期限間近は現時点ベース、落札率は期間ベース）
+    const inProgress = all.filter((b) => BID_IN_PROGRESS.includes(b.status));
+    const estimating = all.filter((b) => b.status === 'estimating');
+    const ym = today.slice(0, 7);
+    const bidsThisMonth = all.filter((b) => b.bid_date && b.bid_date.slice(0, 7) === ym);
+
+    // 次の入札（今日以降で最も近い入札日の未入札案件）
+    const upcoming = inProgress
+      .filter((b) => b.bid_date && b.bid_date >= today)
+      .sort((a, b) => a.bid_date.localeCompare(b.bid_date));
+    const nextBid = upcoming[0]
+      ? { id: upcoming[0].id, project_name: upcoming[0].project_name, bid_date: upcoming[0].bid_date }
+      : null;
+
+    // 期限間近（今日〜7日以内 かつ 未入札）
+    const in7 = new Date(Date.now() + 9 * 3600 * 1000 + 7 * 86400 * 1000).toISOString().slice(0, 10);
+    const dueSoon = all
+      .filter((b) => BID_NOT_YET_BID.includes(b.status) && b.bid_date && b.bid_date >= today && b.bid_date <= in7)
+      .sort((a, b) => a.bid_date.localeCompare(b.bid_date))
+      .map((b) => ({ id: b.id, project_name: b.project_name, bid_date: b.bid_date }));
+
+    // 期間内（bid_date で判定）かつ結果確定のものを抽出
+    const inPeriod = all.filter((b) => b.bid_date && b.bid_date >= range.from && b.bid_date <= range.to);
+    const isWon = (s) => s === 'won' || s === 'contracted'; // 契約は落札の延長として勝ち扱い
+    const isLost = (s) => s === 'lost';
+
+    const wonRows = inPeriod.filter((b) => isWon(b.status));
+    const lostRows = inPeriod.filter((b) => isLost(b.status));
+
+    // 件数ベース落札率
+    const wc = wonRows.length;
+    const lc = lostRows.length;
+    const winRateCount = { won: wc, lost: lc, rate: wc + lc > 0 ? +(wc / (wc + lc)).toFixed(3) : null };
+
+    // 金額ベース落札率: 落札額合計 ÷ (落札+失注 の自社見積合計)
+    const wonTotal = wonRows.reduce((s, b) => s + (Number(b.awarded_price) || 0), 0);
+    const denomTotal = [...wonRows, ...lostRows].reduce((s, b) => s + (Number(b.our_estimate) || 0), 0);
+    const winRateAmount = {
+      won_total: wonTotal,
+      denom_total: denomTotal,
+      rate: denomTotal > 0 ? +(wonTotal / denomTotal).toFixed(3) : null,
+    };
+
+    // 平均応札率: 落札案件のうち予定価格ありの 平均(落札額/予定価格)
+    const ratios = wonRows
+      .filter((b) => Number(b.budget_price) > 0 && Number(b.awarded_price) > 0)
+      .map((b) => Number(b.awarded_price) / Number(b.budget_price));
+    const avgBidRatio = ratios.length ? +(ratios.reduce((s, r) => s + r, 0) / ratios.length).toFixed(3) : null;
+
+    // 集計軸別（client | work_type | staff）。結果確定（won/contracted/lost）のみ集計。
+    const keyOf = (b) => {
+      if (group_by === 'work_type') return b.work_type || '（未分類）';
+      if (group_by === 'staff') return b.staff_id || '（未割当）';
+      return b.client_name || '（未設定）';
+    };
+    const groupMap = new Map();
+    for (const b of inPeriod) {
+      if (!isWon(b.status) && !isLost(b.status)) continue;
+      const k = keyOf(b);
+      const g = groupMap.get(k) || { key: k, total: 0, won: 0, lost: 0 };
+      g.total += 1;
+      if (isWon(b.status)) g.won += 1;
+      else g.lost += 1;
+      groupMap.set(k, g);
+    }
+    let byGroup = [...groupMap.values()].map((g) => ({
+      ...g,
+      win_rate: g.won + g.lost > 0 ? +(g.won / (g.won + g.lost)).toFixed(3) : null,
+    }));
+    byGroup.sort((a, b) => b.total - a.total);
+
+    // staff 軸のときは ID を名前に置換
+    if (group_by === 'staff') {
+      const nameMap = await loadStaffNameMap();
+      byGroup = byGroup.map((g) => ({ ...g, key: nameMap[g.key] || g.key }));
+    }
+
+    res.json({
+      summary: {
+        in_progress: inProgress.length,
+        estimating: estimating.length,
+        bids_this_month: bidsThisMonth.length,
+        next_bid: nextBid,
+        due_soon: dueSoon,
+        win_rate_count: winRateCount,
+        win_rate_amount: winRateAmount,
+        avg_bid_ratio: avgBidRatio,
+      },
+      by_group: byGroup,
+      period: { type: period, from: range.from, to: range.to },
+    });
+  } catch (error) {
+    console.error('Error (bids stats):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 入札 - 一覧取得（?status= &staff_id= &q= &sort= で絞り込み・並び替え）
+app.get('/api/bids', requireAuth, requireBidAccess, async (req, res) => {
+  try {
+    const { status, staff_id, q, sort = 'bid_date' } = req.query;
+    let query = supabase.from('bid_projects').select('*').eq('is_active', true);
+    if (status && BID_STATUSES.includes(status)) query = query.eq('status', status);
+    if (staff_id) query = query.eq('staff_id', staff_id);
+
+    // 並び替え（既定: 入札日昇順。null は末尾）
+    const sortable = { bid_date: 'bid_date', created_at: 'created_at', project_name: 'project_name' };
+    const col = sortable[sort] || 'bid_date';
+    query = query.order(col, { ascending: col !== 'created_at', nullsFirst: false });
+
+    const { data, error } = await query;
+    if (error) throw error;
+    let rows = data || [];
+
+    // 検索（工事名・発注者の部分一致。件数規模が小さいためJS側で実施）
+    if (q) {
+      const needle = String(q).toLowerCase();
+      rows = rows.filter(
+        (b) =>
+          (b.project_name || '').toLowerCase().includes(needle) ||
+          (b.client_name || '').toLowerCase().includes(needle)
+      );
+    }
+
+    // 担当者名を付与
+    const nameMap = await loadStaffNameMap();
+    rows = rows.map((b) => ({ ...b, staff_name: b.staff_id ? nameMap[b.staff_id] || null : null }));
+
+    res.json(rows);
+  } catch (error) {
+    console.error('Error (bids list):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 入札 - 詳細取得（資料・履歴を含む）
+app.get('/api/bids/:id', requireAuth, requireBidAccess, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { data: bid, error } = await supabase
+      .from('bid_projects')
+      .select('*')
+      .eq('id', id)
+      .eq('is_active', true)
+      .maybeSingle();
+    if (error) throw error;
+    if (!bid) return res.status(404).json({ error: '案件が見つかりません' });
+
+    const [{ data: docs }, { data: history }, nameMap] = await Promise.all([
+      supabase.from('bid_documents').select('*').eq('bid_id', id).order('created_at', { ascending: false }),
+      supabase.from('bid_status_history').select('*').eq('bid_id', id).order('changed_at', { ascending: false }),
+      loadStaffNameMap(),
+    ]);
+
+    res.json({
+      ...bid,
+      staff_name: bid.staff_id ? nameMap[bid.staff_id] || null : null,
+      documents: docs || [],
+      history: history || [],
+    });
+  } catch (error) {
+    console.error('Error (bid detail):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 入札案件で受け付ける更新可能フィールド
+const BID_FIELDS = [
+  'project_name', 'client_name', 'location', 'work_type', 'bid_method', 'status',
+  'notice_date', 'question_due', 'bid_date', 'opening_date',
+  'budget_price', 'our_estimate', 'awarded_price', 'awarded_company',
+  'staff_id', 'note',
+];
+
+// req.body から許可フィールドのみ抽出（空文字は null に正規化）
+function pickBidFields(body) {
+  const out = {};
+  for (const k of BID_FIELDS) {
+    if (!(k in body)) continue;
+    let v = body[k];
+    if (v === '' || v === undefined) v = null;
+    out[k] = v;
+  }
+  return out;
+}
+
+// ✅ 入札 - 新規登録
+app.post('/api/bids', requireAuth, requireBidAccess, async (req, res) => {
+  try {
+    const payload = pickBidFields(req.body);
+    if (!payload.project_name) return res.status(400).json({ error: '工事名は必須です' });
+    if (payload.status && !BID_STATUSES.includes(payload.status)) {
+      return res.status(400).json({ error: '不正なステータスです' });
+    }
+    payload.created_by = req.user.email;
+
+    const { data, error } = await supabase.from('bid_projects').insert([payload]).select('*').single();
+    if (error) throw error;
+
+    // 初期ステータスの履歴を記録
+    await supabase.from('bid_status_history').insert([
+      { bid_id: data.id, from_status: null, to_status: data.status, changed_by: req.user.email },
+    ]);
+
+    res.json(data);
+  } catch (error) {
+    console.error('Error (bid create):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 入札 - 更新（ステータス変更時は履歴を自動追記）
+app.put('/api/bids/:id', requireAuth, requireBidAccess, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const payload = pickBidFields(req.body);
+    if ('project_name' in payload && !payload.project_name) {
+      return res.status(400).json({ error: '工事名は必須です' });
+    }
+    if (payload.status && !BID_STATUSES.includes(payload.status)) {
+      return res.status(400).json({ error: '不正なステータスです' });
+    }
+
+    // 既存を取得（ステータス差分の判定用）
+    const { data: existing, error: exErr } = await supabase
+      .from('bid_projects')
+      .select('status')
+      .eq('id', id)
+      .eq('is_active', true)
+      .maybeSingle();
+    if (exErr) throw exErr;
+    if (!existing) return res.status(404).json({ error: '案件が見つかりません' });
+
+    payload.updated_at = new Date().toISOString();
+    const { data, error } = await supabase
+      .from('bid_projects')
+      .update(payload)
+      .eq('id', id)
+      .select('*')
+      .single();
+    if (error) throw error;
+
+    // ステータスが変わっていれば履歴に記録
+    if (payload.status && payload.status !== existing.status) {
+      await supabase.from('bid_status_history').insert([
+        { bid_id: id, from_status: existing.status, to_status: payload.status, changed_by: req.user.email },
+      ]);
+    }
+
+    res.json(data);
+  } catch (error) {
+    console.error('Error (bid update):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 入札 - 論理削除
+app.delete('/api/bids/:id', requireAuth, requireBidAccess, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { data, error } = await supabase
+      .from('bid_projects')
+      .update({ is_active: false, updated_at: new Date().toISOString() })
+      .eq('id', id)
+      .select('id');
+    if (error) throw error;
+    if (!data || data.length === 0) return res.status(404).json({ error: '案件が見つかりません' });
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error (bid delete):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 入札 - 資料アップロード（multer → Supabase Storage）
+app.post('/api/bids/:id/documents', requireAuth, requireBidAccess, upload.single('file'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!req.file) return res.status(400).json({ error: 'file フィールドが必要です' });
+
+    const ext = (req.file.originalname.split('.').pop() || 'bin').toLowerCase();
+    const path = `${id}/${Date.now()}-${uuidv4()}.${ext}`;
+
+    const { error: upErr } = await supabase.storage
+      .from(BID_BUCKET)
+      .upload(path, req.file.buffer, { contentType: req.file.mimetype });
+    if (upErr) throw upErr;
+
+    const { data, error } = await supabase
+      .from('bid_documents')
+      .insert([{
+        bid_id: id,
+        file_name: req.file.originalname,
+        storage_path: path,
+        doc_type: req.body.doc_type || null,
+        size_bytes: req.file.size,
+        uploaded_by: req.user.email,
+      }])
+      .select('*')
+      .single();
+    if (error) throw error;
+
+    res.json(data);
+  } catch (error) {
+    console.error('Error (bid doc upload):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 入札 - 資料の署名付きダウンロードURL発行（120秒有効）
+app.get('/api/bids/:id/documents/:docId/url', requireAuth, requireBidAccess, async (req, res) => {
+  try {
+    const { docId } = req.params;
+    const { data: doc, error } = await supabase
+      .from('bid_documents')
+      .select('storage_path, file_name')
+      .eq('id', docId)
+      .maybeSingle();
+    if (error) throw error;
+    if (!doc) return res.status(404).json({ error: '資料が見つかりません' });
+
+    const { data, error: sErr } = await supabase.storage
+      .from(BID_BUCKET)
+      .createSignedUrl(doc.storage_path, 120);
+    if (sErr) throw sErr;
+
+    res.json({ url: data.signedUrl, file_name: doc.file_name });
+  } catch (error) {
+    console.error('Error (bid doc url):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 入札 - 資料削除（Storage実体 + メタ）
+app.delete('/api/bids/:id/documents/:docId', requireAuth, requireBidAccess, async (req, res) => {
+  try {
+    const { docId } = req.params;
+    const { data: doc } = await supabase
+      .from('bid_documents')
+      .select('storage_path')
+      .eq('id', docId)
+      .maybeSingle();
+    if (doc?.storage_path) {
+      await supabase.storage.from(BID_BUCKET).remove([doc.storage_path]);
+    }
+    const { error } = await supabase.from('bid_documents').delete().eq('id', docId);
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error (bid doc delete):', error.message);
     res.status(500).json({ error: error.message });
   }
 });
