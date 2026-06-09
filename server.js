@@ -1613,6 +1613,10 @@ app.get('/api/employees', requireAuth, requireEmployeeAccess, async (req, res) =
       qualification_expiring: qStat[s.id]?.expiring || 0,
       qualification_expired: qStat[s.id]?.expired || 0,
     }));
+    // メールパスワードは機微情報。社員一覧の管理者のみに返し、それ以外（member）には伏せる。
+    if (req.empRole?.role !== 'admin') {
+      for (const r of rows) delete r.email_password;
+    }
     res.json(rows);
   } catch (error) {
     console.error('Error (employees list):', error.message);
@@ -1640,6 +1644,7 @@ app.post('/api/employees', requireAuth, requireEmployeeAdmin, async (req, res) =
       postal_code: b.postal_code || null,
       address: b.address || null,
       hire_date: b.hire_date || null,
+      email_password: b.email_password || null,
       role: b.role || null,
       app_role: b.app_role || 'member',
       report_cc: !!b.report_cc,
@@ -1659,7 +1664,7 @@ app.put('/api/employees/:id', requireAuth, requireEmployeeAdmin, async (req, res
   try {
     const b = req.body || {};
     // 送られてきたフィールドのみ更新（部分更新）
-    const allowed = ['name', 'furigana', 'email', 'skill_id', 'job_type', 'department', 'company',
+    const allowed = ['name', 'furigana', 'email', 'email_password', 'skill_id', 'job_type', 'department', 'company',
       'birth_date', 'gender', 'phone', 'postal_code', 'address', 'hire_date', 'role', 'app_role', 'report_cc', 'is_active'];
     const patch = { updated_at: new Date().toISOString() };
     for (const k of allowed) {
