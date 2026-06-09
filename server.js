@@ -344,6 +344,7 @@ app.get('/api/apps', requireAuth, async (req, res) => {
     const allApps = [
       { id: 1, key: 'safety-patrol', name: '安全パトロール', url: safetyPatrolUrl, icon: '✅' },
       { id: 2, key: 'employee-list', name: '社員一覧', icon: '👤', internal: true, view: 'employees' },
+      { id: 7, key: 'announcements', name: 'お知らせ', icon: '📣', internal: true, view: 'announcements' },
       { id: 3, key: 'mailer', name: 'メーラー', url: '#', icon: '📧', status: 'coming_soon' },
       { id: 4, key: 'file-manager', name: 'ファイル管理', url: '#', icon: '📁', status: 'coming_soon' },
       { id: 5, key: 'evaluation', name: '社員評価', url: '#', icon: '⭐', status: 'coming_soon' },
@@ -1591,7 +1592,7 @@ app.put('/api/user/settings', requireAuth, async (req, res) => {
 // ============================================================
 
 // 既知のアプリキー（/api/apps と権限UIで共有）
-const APP_KEYS = ['safety-patrol', 'employee-list', 'mailer', 'file-manager', 'evaluation', 'dormitory'];
+const APP_KEYS = ['safety-patrol', 'employee-list', 'announcements', 'mailer', 'file-manager', 'evaluation', 'dormitory'];
 
 // staffId のアプリ別権限を { app_key: 'member'|'admin' } のマップで返す
 async function resolveAppPermissions(staffId) {
@@ -2267,6 +2268,523 @@ app.delete('/api/employees/:id/qualifications/:qid', requireAuth, requireEmploye
     if (error) throw error;
     res.json({ success: true });
   } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================================
+// ✅ 掲示板・お知らせ API（要認証）
+//    - 閲覧: 宛先に一致する認証済みユーザー全員
+//    - 既読/確認: 閲覧権限があれば可
+//    - 管理（作成/編集/削除/到達率）: announcements の admin のみ
+// ============================================================
+
+// お知らせアプリにおける本人ロールを解決
+//  - グローバル管理者（ADMIN_EMAILS / staff_master.app_role='admin'）は常に 'admin'
+//  - それ以外は staff_app_permissions の 'announcements' を見る（admin / member / none）
+async function resolveAnnouncementRole(email) {
+  const perms = await resolvePermissions(email); // { role, staffId }
+  if (perms.role === 'admin') return { role: 'admin', staffId: perms.staffId };
+  let level = null;
+  if (perms.staffId) {
+    const { data } = await supabase
+      .from('staff_app_permissions')
+      .select('access_level')
+      .eq('staff_id', perms.staffId)
+      .eq('app_key', 'announcements')
+      .maybeSingle();
+    level = data?.access_level || null;
+  }
+  const role = level === 'admin' ? 'admin' : level ? 'member' : 'none';
+  return { role, staffId: perms.staffId };
+}
+
+// お知らせ管理者のみ許可するミドルウェア（要 requireAuth 後段）
+async function requireAnnouncementAdmin(req, res, next) {
+  try {
+    const r = await resolveAnnouncementRole(req.user?.email);
+    if (r.role !== 'admin') {
+      return res.status(403).json({ error: 'この操作はお知らせの管理者のみ可能です' });
+    }
+    req.annRole = r;
+    next();
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+}
+
+// 現在ユーザーの staff_master から company / department を取得するヘルパー
+async function resolveStaffProfile(email) {
+  const lower = String(email || '').toLowerCase();
+  const { data } = await supabase
+    .from('staff_master')
+    .select('id, company, department')
+    .ilike('email', lower)
+    .maybeSingle();
+  return {
+    staffId: data?.id || null,
+    company: data?.company || null,
+    department: data?.department || null,
+  };
+}
+
+// お知らせの宛先一致チェック（target_type='all' は全員 / company / department は targets 配列で突合）
+// targets: announcement_targets の配列 [{kind, value}]
+function isAudienceMatch(ann, targets, profile) {
+  if (ann.target_type === 'all') return true;
+  return (targets || []).some((t) => {
+    if (t.kind === 'company') return t.value === profile.company;
+    if (t.kind === 'department') return t.value === profile.department;
+    return false;
+  });
+}
+
+// ✅ お知らせ一覧（GET /api/announcements）
+//    ?category=xxx  カテゴリで絞り込み
+//    ?unread_only=1 未読のみ
+//    ?manage=1      管理者用: 未公開/期限切れ/宛先フィルタなし・全件
+app.get('/api/announcements', requireAuth, async (req, res) => {
+  try {
+    const email = String(req.user.email || '').toLowerCase();
+    const annRole = await resolveAnnouncementRole(email);
+    const profile = await resolveStaffProfile(email);
+    const isManage = req.query.manage === '1' && annRole.role === 'admin';
+    const now = new Date().toISOString();
+
+    // お知らせ本体を取得
+    let query = supabase
+      .from('announcements')
+      .select('*')
+      .eq('is_active', true)
+      .order('is_pinned', { ascending: false })
+      .order('publish_at', { ascending: false });
+
+    if (!isManage) {
+      query = query.lte('publish_at', now);
+      // expire_at フィルタはJS側で処理（NULL OR > now）
+    }
+    if (req.query.category) {
+      query = query.eq('category', req.query.category);
+    }
+
+    const { data: rows, error } = await query;
+    if (error) throw error;
+    const announcements = rows || [];
+
+    // 宛先一覧を一括取得（対象アナウンスIDのみ）
+    const annIds = announcements.map((a) => a.id);
+    let targetsMap = {};
+    if (annIds.length > 0) {
+      const { data: tRows, error: tErr } = await supabase
+        .from('announcement_targets')
+        .select('announcement_id, kind, value')
+        .in('announcement_id', annIds);
+      if (tErr) throw tErr;
+      for (const t of tRows || []) {
+        (targetsMap[t.announcement_id] ||= []).push(t);
+      }
+    }
+
+    // 既読状況を一括取得
+    let readsMap = {};
+    if (annIds.length > 0) {
+      const { data: rRows, error: rErr } = await supabase
+        .from('announcement_reads')
+        .select('announcement_id, read_at, acknowledged_at')
+        .eq('user_email', email)
+        .in('announcement_id', annIds);
+      if (rErr) throw rErr;
+      for (const r of rRows || []) {
+        readsMap[r.announcement_id] = r;
+      }
+    }
+
+    // フィルタ・整形
+    const result = [];
+    for (const ann of announcements) {
+      // 期限切れチェック（管理モードでない場合）
+      if (!isManage && ann.expire_at && ann.expire_at <= now) continue;
+      // 宛先フィルタ（管理モードでない場合）
+      if (!isManage && !isAudienceMatch(ann, targetsMap[ann.id] || [], profile)) continue;
+
+      const readInfo = readsMap[ann.id] || null;
+      const is_read = !!readInfo?.read_at;
+      const is_acknowledged = !!readInfo?.acknowledged_at;
+
+      // unread_only フィルタ
+      if (req.query.unread_only === '1' && is_read) continue;
+
+      result.push({ ...ann, is_read, is_acknowledged });
+    }
+
+    res.json(result);
+  } catch (error) {
+    console.error('Error (announcements list):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 未読件数（GET /api/announcements/unread-count）← 固定パスのため :id より前に定義
+app.get('/api/announcements/unread-count', requireAuth, async (req, res) => {
+  try {
+    const email = String(req.user.email || '').toLowerCase();
+    const profile = await resolveStaffProfile(email);
+    const now = new Date().toISOString();
+
+    const { data: rows, error } = await supabase
+      .from('announcements')
+      .select('id, target_type, expire_at')
+      .eq('is_active', true)
+      .lte('publish_at', now);
+    if (error) throw error;
+    const announcements = rows || [];
+
+    const annIds = announcements.map((a) => a.id);
+    let targetsMap = {};
+    if (annIds.length > 0) {
+      const { data: tRows, error: tErr } = await supabase
+        .from('announcement_targets')
+        .select('announcement_id, kind, value')
+        .in('announcement_id', annIds);
+      if (tErr) throw tErr;
+      for (const t of tRows || []) {
+        (targetsMap[t.announcement_id] ||= []).push(t);
+      }
+    }
+
+    // 既読済みの ID セットを取得
+    let readIds = new Set();
+    if (annIds.length > 0) {
+      const { data: rRows, error: rErr } = await supabase
+        .from('announcement_reads')
+        .select('announcement_id')
+        .eq('user_email', email)
+        .not('read_at', 'is', null)
+        .in('announcement_id', annIds);
+      if (rErr) throw rErr;
+      for (const r of rRows || []) readIds.add(r.announcement_id);
+    }
+
+    let count = 0;
+    for (const ann of announcements) {
+      if (ann.expire_at && ann.expire_at <= now) continue;
+      if (!isAudienceMatch(ann, targetsMap[ann.id] || [], profile)) continue;
+      if (!readIds.has(ann.id)) count++;
+    }
+
+    res.json({ count });
+  } catch (error) {
+    console.error('Error (unread-count):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ お知らせ詳細（GET /api/announcements/:id）
+app.get('/api/announcements/:id', requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const email = String(req.user.email || '').toLowerCase();
+    const annRole = await resolveAnnouncementRole(email);
+    const profile = await resolveStaffProfile(email);
+
+    const { data: ann, error } = await supabase
+      .from('announcements')
+      .select('*')
+      .eq('id', id)
+      .eq('is_active', true)
+      .maybeSingle();
+    if (error) throw error;
+    if (!ann) return res.status(404).json({ error: 'お知らせが見つかりません' });
+
+    const { data: targets, error: tErr } = await supabase
+      .from('announcement_targets')
+      .select('id, kind, value')
+      .eq('announcement_id', id);
+    if (tErr) throw tErr;
+
+    // 閲覧権限チェック（admin はスキップ）
+    if (annRole.role !== 'admin') {
+      if (!isAudienceMatch(ann, targets || [], profile)) {
+        return res.status(403).json({ error: 'このお知らせへのアクセス権がありません' });
+      }
+    }
+
+    const { data: readRow } = await supabase
+      .from('announcement_reads')
+      .select('read_at, acknowledged_at')
+      .eq('announcement_id', id)
+      .eq('user_email', email)
+      .maybeSingle();
+
+    res.json({
+      ...ann,
+      targets: targets || [],
+      is_read: !!readRow?.read_at,
+      is_acknowledged: !!readRow?.acknowledged_at,
+    });
+  } catch (error) {
+    console.error('Error (announcement detail):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 既読登録（POST /api/announcements/:id/read）
+app.post('/api/announcements/:id/read', requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const email = String(req.user.email || '').toLowerCase();
+    const now = new Date().toISOString();
+
+    const { error } = await supabase
+      .from('announcement_reads')
+      .upsert(
+        { announcement_id: Number(id), user_email: email, read_at: now },
+        { onConflict: 'announcement_id,user_email' }
+      );
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error (announcement read):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 確認（acknowledge）登録（POST /api/announcements/:id/acknowledge）
+app.post('/api/announcements/:id/acknowledge', requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const email = String(req.user.email || '').toLowerCase();
+    const now = new Date().toISOString();
+
+    // 既存行を確認（read_at が null なら同時にセット）
+    const { data: existing } = await supabase
+      .from('announcement_reads')
+      .select('id, read_at')
+      .eq('announcement_id', id)
+      .eq('user_email', email)
+      .maybeSingle();
+
+    const upsertData = {
+      announcement_id: Number(id),
+      user_email: email,
+      acknowledged_at: now,
+      read_at: existing?.read_at || now,
+    };
+
+    const { error } = await supabase
+      .from('announcement_reads')
+      .upsert(upsertData, { onConflict: 'announcement_id,user_email' });
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error (announcement acknowledge):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 到達率（GET /api/announcements/:id/reads）※ 管理者のみ
+app.get('/api/announcements/:id/reads', requireAuth, requireAnnouncementAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // お知らせ本体を取得（宛先種別・values を確認するため）
+    const { data: ann, error: annErr } = await supabase
+      .from('announcements')
+      .select('id, target_type')
+      .eq('id', id)
+      .eq('is_active', true)
+      .maybeSingle();
+    if (annErr) throw annErr;
+    if (!ann) return res.status(404).json({ error: 'お知らせが見つかりません' });
+
+    // 宛先リスト
+    const { data: targets, error: tErr } = await supabase
+      .from('announcement_targets')
+      .select('kind, value')
+      .eq('announcement_id', id);
+    if (tErr) throw tErr;
+
+    // 受信対象者の絞り込み
+    //   target_type='all': is_active=true かつ email が NOT NULL の全社員
+    //   company / department: さらに値で絞る
+    let staffQuery = supabase
+      .from('staff_master')
+      .select('id, name, email')
+      .eq('is_active', true)
+      .not('email', 'is', null);
+
+    const targetRows = targets || [];
+    if (ann.target_type !== 'all' && targetRows.length > 0) {
+      // company / department フィルタ（OR結合）
+      const companyValues = targetRows.filter((t) => t.kind === 'company').map((t) => t.value);
+      const deptValues = targetRows.filter((t) => t.kind === 'department').map((t) => t.value);
+      // Supabase JS では OR フィルタを or() で指定
+      const orParts = [];
+      if (companyValues.length > 0) orParts.push(`company.in.(${companyValues.map((v) => `"${v}"`).join(',')})`);
+      if (deptValues.length > 0) orParts.push(`department.in.(${deptValues.map((v) => `"${v}"`).join(',')})`);
+      if (orParts.length > 0) staffQuery = staffQuery.or(orParts.join(','));
+    }
+
+    const { data: staffRows, error: sErr } = await staffQuery;
+    if (sErr) throw sErr;
+    const staff = staffRows || [];
+
+    // 既読情報を一括取得
+    const { data: readRows, error: rErr } = await supabase
+      .from('announcement_reads')
+      .select('user_email, read_at, acknowledged_at')
+      .eq('announcement_id', id);
+    if (rErr) throw rErr;
+
+    const readByEmail = {};
+    for (const r of readRows || []) readByEmail[r.user_email] = r;
+
+    // 受信者リストに既読情報をマージ
+    const recipients = staff.map((s) => {
+      const r = readByEmail[String(s.email || '').toLowerCase()] || null;
+      return {
+        user_email: s.email,
+        name: s.name,
+        read_at: r?.read_at || null,
+        acknowledged_at: r?.acknowledged_at || null,
+      };
+    });
+
+    const read_count = recipients.filter((r) => r.read_at).length;
+    const ack_count = recipients.filter((r) => r.acknowledged_at).length;
+
+    res.json({
+      targets_total: staff.length,
+      read_count,
+      ack_count,
+      recipients,
+    });
+  } catch (error) {
+    console.error('Error (announcement reads):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ お知らせ作成（POST /api/announcements）※ 管理者のみ
+app.post('/api/announcements', requireAuth, requireAnnouncementAdmin, async (req, res) => {
+  try {
+    const b = req.body || {};
+    if (!b.title?.trim()) return res.status(400).json({ error: 'タイトルは必須です' });
+
+    const row = {
+      title: b.title.trim(),
+      body: b.body || null,
+      category: b.category || null,
+      priority: ['low', 'normal', 'high', 'urgent'].includes(b.priority) ? b.priority : 'normal',
+      target_type: ['all', 'company', 'department'].includes(b.target_type) ? b.target_type : 'all',
+      is_pinned: !!b.is_pinned,
+      requires_ack: !!b.requires_ack,
+      publish_at: b.publish_at || new Date().toISOString(),
+      expire_at: b.expire_at || null,
+      attachments: Array.isArray(b.attachments) ? b.attachments : [],
+      author_email: req.user.email,
+      author_name: req.user.name || null,
+      is_active: true,
+    };
+
+    const { data, error } = await supabase
+      .from('announcements')
+      .insert([row])
+      .select();
+    if (error) throw error;
+    const ann = data[0];
+
+    // 宛先が company / department の場合は targets を挿入
+    if (ann.target_type !== 'all' && Array.isArray(b.targets) && b.targets.length > 0) {
+      const targetRows = b.targets
+        .filter((t) => t && ['company', 'department'].includes(t.kind) && t.value)
+        .map((t) => ({ announcement_id: ann.id, kind: t.kind, value: t.value }));
+      if (targetRows.length > 0) {
+        const { error: tErr } = await supabase.from('announcement_targets').insert(targetRows);
+        if (tErr) throw tErr;
+      }
+    }
+
+    res.json(ann);
+  } catch (error) {
+    console.error('Error (announcement create):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ お知らせ更新（PUT /api/announcements/:id）※ 管理者のみ
+app.put('/api/announcements/:id', requireAuth, requireAnnouncementAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const b = req.body || {};
+
+    const { data: existing, error: existErr } = await supabase
+      .from('announcements')
+      .select('id, target_type')
+      .eq('id', id)
+      .eq('is_active', true)
+      .maybeSingle();
+    if (existErr) throw existErr;
+    if (!existing) return res.status(404).json({ error: 'お知らせが見つかりません' });
+
+    const allowed = ['title', 'body', 'category', 'priority', 'target_type', 'is_pinned',
+      'requires_ack', 'publish_at', 'expire_at', 'attachments'];
+    const patch = { updated_at: new Date().toISOString() };
+    for (const k of allowed) {
+      if (b[k] !== undefined) patch[k] = b[k];
+    }
+    // priority / target_type のバリデーション
+    if (patch.priority !== undefined && !['low', 'normal', 'high', 'urgent'].includes(patch.priority)) {
+      patch.priority = 'normal';
+    }
+    if (patch.target_type !== undefined && !['all', 'company', 'department'].includes(patch.target_type)) {
+      patch.target_type = 'all';
+    }
+
+    const { data, error } = await supabase
+      .from('announcements')
+      .update(patch)
+      .eq('id', id)
+      .select();
+    if (error) throw error;
+    const ann = data[0];
+
+    // targets が渡されたら入れ替え（既存削除 → 再挿入）
+    if (b.targets !== undefined) {
+      await supabase.from('announcement_targets').delete().eq('announcement_id', id);
+      const newTargetType = ann.target_type;
+      if (newTargetType !== 'all' && Array.isArray(b.targets) && b.targets.length > 0) {
+        const targetRows = b.targets
+          .filter((t) => t && ['company', 'department'].includes(t.kind) && t.value)
+          .map((t) => ({ announcement_id: ann.id, kind: t.kind, value: t.value }));
+        if (targetRows.length > 0) {
+          const { error: tErr } = await supabase.from('announcement_targets').insert(targetRows);
+          if (tErr) throw tErr;
+        }
+      }
+    }
+
+    res.json(ann);
+  } catch (error) {
+    console.error('Error (announcement update):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ お知らせ論理削除（DELETE /api/announcements/:id）※ 管理者のみ
+app.delete('/api/announcements/:id', requireAuth, requireAnnouncementAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { data, error } = await supabase
+      .from('announcements')
+      .update({ is_active: false, updated_at: new Date().toISOString() })
+      .eq('id', id)
+      .select('id');
+    if (error) throw error;
+    if (!data || data.length === 0) return res.status(404).json({ error: 'お知らせが見つかりません' });
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error (announcement delete):', error.message);
     res.status(500).json({ error: error.message });
   }
 });
