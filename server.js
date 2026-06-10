@@ -8,7 +8,7 @@ import jwt from 'jsonwebtoken';
 import multer from 'multer';
 import nodemailer from 'nodemailer';
 import { PDFDocument } from 'pdf-lib';
-import { driveUpload, driveDownload, driveConfigured } from './googleDrive.js';
+import { driveUpload, driveDownload, driveConfigured, ensureFolderPath } from './googleDrive.js';
 
 dotenv.config();
 
@@ -2049,19 +2049,34 @@ async function ensureCertBucket() {
 // 未設定なら 'supabase'＝従来動作。Drive 連携の環境変数が揃っていない場合も安全に Supabase へフォールバック。
 const CERT_STORAGE = (process.env.CERT_STORAGE || 'supabase').toLowerCase();
 
+// Drive のフォルダ名・Supabase未使用に安全な文字へ整える。
+function sanitizeSeg(s) {
+  const v = String(s == null ? '' : s).replace(/[\\/:*?"<>|]/g, '_').replace(/\s+/g, ' ').trim().slice(0, 100);
+  return v || '_未分類';
+}
+
+// 資格者証の保存先サブフォルダ階層 [会社, 社員名] を決める（Drive: 会社別→社員別）。
+function certFolderSegments(staff) {
+  const company = (staff && staff.company ? String(staff.company).trim() : '') || '会社未設定';
+  const name = (staff && staff.name ? String(staff.name).trim() : '') || '_未分類';
+  return [sanitizeSeg(company), sanitizeSeg(name)];
+}
+
 // 資格者証ファイルを方針に従って保存し、DBの cert_image_path に入れる「参照」を返す。
 //   Supabase: バケット内のパス（従来どおり。例 "inbox/xxx.pdf"）
-//   Drive   : "drive:<fileId>"（接頭辞で見分ける）
-// nameOrPath は Supabase ではパスキー、Drive では表示用ファイル名に使う。
-async function storeCert(nameOrPath, buffer, mimeType) {
+//   Drive   : "drive:<fileId>"（接頭辞で見分ける）。segments があれば 会社\社員名 サブフォルダへ自動格納。
+// pathKey は Supabase ではパスキー、Drive では basename（末尾）をファイル名に使う。
+async function storeCert(pathKey, buffer, mimeType, segments) {
   if (CERT_STORAGE === 'drive' && driveConfigured()) {
-    const fileId = await driveUpload({ name: String(nameOrPath).replace(/\//g, '_'), buffer, mimeType });
+    const folderId = segments && segments.length ? await ensureFolderPath(segments) : undefined;
+    const name = String(pathKey).split('/').pop();
+    const fileId = await driveUpload({ name, buffer, mimeType, folderId });
     return `drive:${fileId}`;
   }
   await ensureCertBucket();
-  const { error } = await supabase.storage.from(CERT_BUCKET).upload(nameOrPath, buffer, { contentType: mimeType });
+  const { error } = await supabase.storage.from(CERT_BUCKET).upload(pathKey, buffer, { contentType: mimeType });
   if (error) throw error;
-  return nameOrPath;
+  return pathKey;
 }
 
 // 資格者証を一時表示するためのURL（既定1時間）。
@@ -2349,12 +2364,15 @@ app.post('/api/employees/:id/qualifications/scan', requireAuth, requireEmployeeA
     // 1) Gemini で内容を抽出
     const extracted = await extractCertificate(req.file.buffer, req.file.mimetype);
 
-    // 2) 原本画像を保存（方針に従い Drive または Supabase）
+    // 2) 原本画像を保存（方針に従い Drive または Supabase。Drive は 会社\社員名 サブフォルダへ）
+    const { data: staffRow } = await supabase
+      .from('staff_master').select('name, company').eq('id', req.params.id).maybeSingle();
     const ext = (req.file.originalname.split('.').pop() || 'jpg').toLowerCase();
     const path = await storeCert(
       `${req.params.id}/${Date.now()}-${uuidv4()}.${ext}`,
       req.file.buffer,
       req.file.mimetype,
+      certFolderSegments(staffRow),
     );
 
     // 3) 抽出した資格名を既存マスタへ突合
@@ -2619,8 +2637,9 @@ app.post('/api/qualifications/scan', requireAuth, requireEmployeeAdmin, upload.s
     // 2) 社員マスタ・資格マスタを取得
     const [{ data: masters }, { data: staff }] = await Promise.all([
       supabase.from('qualification_master').select('id, name, category'),
-      supabase.from('staff_master').select('id, name, birth_date'),
+      supabase.from('staff_master').select('id, name, birth_date, company'),
     ]);
+    const staffById = new Map((staff || []).map((s) => [s.id, s]));
 
     // 3) ページ配列を再構成してレコード配列を得る。
     //    社員名簿に該当しない人（台帳未登録）は取り込まない方針のため、ここで除外する。
@@ -2657,6 +2676,7 @@ app.post('/api/qualifications/scan', requireAuth, requireEmployeeAdmin, upload.s
           `inbox/${ts}-${uuidv4()}.${ext}`,
           uploadBuffer,
           uploadMimeType,
+          certFolderSegments(staffById.get(rec.matched_staff_id)),
         );
 
         rec.cert_image_path = storagePath;

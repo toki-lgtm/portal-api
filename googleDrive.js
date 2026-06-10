@@ -118,6 +118,58 @@ export async function driveUpload({ name, buffer, mimeType, folderId }) {
   return data.id;
 }
 
+// Drive 検索クエリ内のシングルクォートをエスケープする。
+function escapeQ(s) {
+  return String(s).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+}
+
+// 親フォルダ直下に name のサブフォルダを探し、無ければ作成して fileId を返す。
+// 結果はプロセス内キャッシュ（毎回の検索/作成を避ける）。共有ドライブ対応。
+const folderCache = new Map(); // key: `${parentId}/${name}` -> folderId
+export async function ensureFolder(name, parentId) {
+  const parent = parentId || process.env.DRIVE_FOLDER_ID;
+  if (!parent) throw new Error('DRIVE_FOLDER_ID が未設定です。');
+  const key = `${parent}/${name}`;
+  if (folderCache.has(key)) return folderCache.get(key);
+
+  const token = await getAccessToken();
+  // 1) 既存検索
+  const q = `name='${escapeQ(name)}' and '${parent}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`;
+  const searchUrl = `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(q)}`
+    + '&fields=files(id,name)&supportsAllDrives=true&includeItemsFromAllDrives=true&pageSize=1';
+  const sres = await fetch(searchUrl, { headers: { Authorization: `Bearer ${token}` } });
+  if (sres.ok) {
+    const sdata = await sres.json();
+    if (sdata.files && sdata.files.length > 0) {
+      folderCache.set(key, sdata.files[0].id);
+      return sdata.files[0].id;
+    }
+  }
+  // 2) 無ければ作成
+  const cres = await fetch('https://www.googleapis.com/drive/v3/files?supportsAllDrives=true&fields=id', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name, mimeType: 'application/vnd.google-apps.folder', parents: [parent] }),
+  });
+  if (!cres.ok) {
+    const text = await cres.text();
+    throw new Error(`Drive フォルダ作成に失敗（${name}, ${cres.status}）: ${text}`);
+  }
+  const cdata = await cres.json();
+  folderCache.set(key, cdata.id);
+  return cdata.id;
+}
+
+// ["中原建設","田中太郎"] のような階層を順に ensureFolder して、末端フォルダの fileId を返す。
+export async function ensureFolderPath(segments, rootId) {
+  let parent = rootId || process.env.DRIVE_FOLDER_ID;
+  for (const seg of segments) {
+    if (!seg) continue;
+    parent = await ensureFolder(seg, parent);
+  }
+  return parent;
+}
+
 // fileId のファイル本体を取得して { buffer, contentType } を返す（API経由のストリーム配信用）。
 export async function driveDownload(fileId) {
   const token = await getAccessToken();

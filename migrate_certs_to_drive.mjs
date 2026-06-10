@@ -17,9 +17,19 @@
 
 import dotenv from 'dotenv';
 import { createClient } from '@supabase/supabase-js';
-import { driveUpload, driveConfigured } from './googleDrive.js';
+import { driveUpload, driveConfigured, ensureFolderPath } from './googleDrive.js';
 
 dotenv.config();
+
+function sanitizeSeg(s) {
+  const v = String(s == null ? '' : s).replace(/[\\/:*?"<>|]/g, '_').replace(/\s+/g, ' ').trim().slice(0, 100);
+  return v || '_未分類';
+}
+function certFolderSegments(staff) {
+  const company = (staff && staff.company ? String(staff.company).trim() : '') || '会社未設定';
+  const name = (staff && staff.name ? String(staff.name).trim() : '') || '_未分類';
+  return [sanitizeSeg(company), sanitizeSeg(name)];
+}
 
 const DRY = process.argv.includes('--dry-run');
 const BUCKET = 'qualification-certs';
@@ -48,12 +58,16 @@ function guessMime(path) {
 
 const { data: rows, error } = await supabase
   .from('staff_qualifications')
-  .select('id, cert_image_path')
+  .select('id, cert_image_path, staff_id')
   .not('cert_image_path', 'is', null);
 if (error) {
   console.error('staff_qualifications の取得に失敗:', error.message);
   process.exit(1);
 }
+
+// 社員ID→会社/氏名 の対応表（Drive のサブフォルダ振り分け用）
+const { data: staffRows } = await supabase.from('staff_master').select('id, name, company');
+const staffById = new Map((staffRows || []).map((s) => [s.id, s]));
 
 const targets = rows.filter((r) => r.cert_image_path && !String(r.cert_image_path).startsWith('drive:'));
 console.log(`資格者証ファイル: 全 ${rows.length} 件中、移行対象（Supabase保存）= ${targets.length} 件${DRY ? '  [dry-run]' : ''}`);
@@ -67,13 +81,17 @@ for (const r of targets) {
     const buffer = Buffer.from(await blob.arrayBuffer());
     const mimeType = blob.type && blob.type !== 'application/octet-stream' ? blob.type : guessMime(r.cert_image_path);
 
+    const segments = certFolderSegments(staffById.get(r.staff_id));
+
     if (DRY) {
-      console.log(`[dry] id=${r.id}  ${r.cert_image_path}  (${buffer.length} bytes, ${mimeType})`);
+      console.log(`[dry] id=${r.id}  ${r.cert_image_path} -> ${segments.join('/')}/  (${buffer.length} bytes, ${mimeType})`);
       ok++;
       continue;
     }
 
-    const fileId = await driveUpload({ name: String(r.cert_image_path).replace(/\//g, '_'), buffer, mimeType });
+    const folderId = await ensureFolderPath(segments);
+    const name = String(r.cert_image_path).split('/').pop();
+    const fileId = await driveUpload({ name, buffer, mimeType, folderId });
     const { error: upErr } = await supabase
       .from('staff_qualifications')
       .update({ cert_image_path: `drive:${fileId}` })
