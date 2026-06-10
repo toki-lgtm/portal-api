@@ -3208,6 +3208,141 @@ function resolveBidPeriod(period, from, to) {
   return { from: `${startY}-04-01`, to: `${startY + 1}-03-31` };
 }
 
+// 文字列から数字のみ抽出して整数化（予定価格など）。数字が無ければ null。
+function digitsOrNull(s) {
+  const digits = String(s ?? '').replace(/[^0-9]/g, '');
+  if (!digits) return null;
+  const n = Number(digits);
+  return Number.isFinite(n) ? n : null;
+}
+
+// AI 読取の対象にする「主要書類」を自動で絞り込む。
+// 案件情報が載りやすい書類（指名通知・公告・設計書 等）を優先し、
+// 図面など大容量・情報の薄い資料は除外する。返すのは PDF/画像のみ。
+const BID_DOC_KEYWORDS = ['指名通知', '通知', '公告', '入札公告', '入札説明', '案内', '設計書', '設計図書', '特記', '仕様', '概要', '内訳', '現場説明', '入札'];
+const BID_DOC_EXCLUDE = ['図面', 'リーフレット', '参考例', '別紙', '質問書', '記載例', '取扱要領', '届出', 'ランダム', '改正'];
+function selectBidDocsForAI(files) {
+  const MAX_FILE = 15 * 1024 * 1024;   // 1ファイル上限（これ超は図面等とみなし対象外）
+  const MAX_TOTAL = 18 * 1024 * 1024;  // Gemini インライン合計上限の安全圏
+  const MAX_COUNT = 3;
+
+  const candidates = (files || []).filter(
+    (f) => (f.mimetype === 'application/pdf' || f.mimetype.startsWith('image/')) && f.size <= MAX_FILE
+  );
+  const scored = candidates.map((f) => {
+    const nm = f.originalname || '';
+    let score = 0;
+    for (const k of BID_DOC_KEYWORDS) if (nm.includes(k)) score += 2;
+    for (const k of BID_DOC_EXCLUDE) if (nm.includes(k)) score -= 1;
+    return { f, score };
+  });
+  // スコア降順 → 同点は小さいファイル優先（テキスト書類は概して小さい）
+  scored.sort((a, b) => b.score - a.score || a.f.size - b.f.size);
+
+  const picked = [];
+  let total = 0;
+  for (const { f } of scored) {
+    if (picked.length >= MAX_COUNT) break;
+    if (total + f.size > MAX_TOTAL) continue;
+    picked.push(f);
+    total += f.size;
+  }
+  // 合計上限で全部弾かれた場合でも、最小のものを最低1つは読む
+  if (picked.length === 0 && candidates.length) {
+    picked.push([...candidates].sort((a, b) => a.size - b.size)[0]);
+  }
+  return picked;
+}
+
+// 入札資料（PDF/画像）を Gemini で解析し、案件登録用フィールドを構造化して返す。
+async function extractBidInfo(files) {
+  if (!GEMINI_API_KEY) {
+    const e = new Error('GEMINI_API_KEY が未設定です。Render の環境変数に設定してください。');
+    e.status = 503;
+    throw e;
+  }
+  const prompt = [
+    'これは日本の公共工事「入札案件」に関する書類（指名通知書・入札公告・設計書・特記仕様書など）です。',
+    '記載内容を読み取り、入札案件の登録に必要な項目を JSON で返してください。',
+    '- project_name: 工事名（正式名称。例: 銘地区復旧治山工事）',
+    '- client_name: 発注者（例: 長崎県、○○市、△△県土木事務所）',
+    '- location: 工事場所（住所・地区名など）',
+    '- work_type: 工種（例: 治山 / 道路 / 橋梁 / 舗装 / 河川。工事名等から判断できる代表的な工種を短く）',
+    '- bid_method: 入札方式（例: 一般競争入札 / 指名競争入札 / 随意契約）',
+    '- notice_date: 公告日または指名通知日（YYYY-MM-DD）',
+    '- question_due: 質問書の提出期限（YYYY-MM-DD）',
+    '- bid_date: 入札書の提出日・入札日（提出に期間がある場合は締切日）（YYYY-MM-DD）',
+    '- opening_date: 開札日（YYYY-MM-DD）',
+    '- budget_price: 予定価格（円。半角数字のみ。公表されている場合のみ。非公表・記載なしは空文字）',
+    '- summary: 工事概要を1〜2文で（任意）',
+    '日付が和暦（令和・平成等）の場合は西暦に変換してください。',
+    '読み取れない項目は空文字にし、推測で埋めないでください。',
+    '複数の書類がある場合は内容を突き合わせ、最も確からしい値を返してください。',
+  ].join('\n');
+
+  const parts = [{ text: prompt }];
+  for (const f of files) {
+    parts.push({ inlineData: { mimeType: f.mimetype || 'application/pdf', data: f.buffer.toString('base64') } });
+  }
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+  const body = {
+    contents: [{ parts }],
+    generationConfig: {
+      temperature: 0,
+      responseMimeType: 'application/json',
+      responseSchema: {
+        type: 'OBJECT',
+        properties: {
+          project_name: { type: 'STRING' },
+          client_name: { type: 'STRING' },
+          location: { type: 'STRING' },
+          work_type: { type: 'STRING' },
+          bid_method: { type: 'STRING' },
+          notice_date: { type: 'STRING' },
+          question_due: { type: 'STRING' },
+          bid_date: { type: 'STRING' },
+          opening_date: { type: 'STRING' },
+          budget_price: { type: 'STRING' },
+          summary: { type: 'STRING' },
+        },
+        required: ['project_name'],
+      },
+    },
+  };
+
+  const resp = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!resp.ok) {
+    const t = await resp.text();
+    const e = new Error(`Gemini API エラー (${resp.status}): ${t.slice(0, 300)}`);
+    e.status = 502;
+    throw e;
+  }
+  const json = await resp.json();
+  const text = json?.candidates?.[0]?.content?.parts?.[0]?.text;
+  if (!text) throw new Error('Gemini から有効な応答が得られませんでした');
+  let p;
+  try { p = JSON.parse(text); } catch { throw new Error('Gemini 応答の解析に失敗しました'); }
+
+  return {
+    project_name: (p.project_name || '').trim(),
+    client_name: (p.client_name || '').trim(),
+    location: (p.location || '').trim(),
+    work_type: (p.work_type || '').trim(),
+    bid_method: (p.bid_method || '').trim(),
+    notice_date: cleanIsoDate(p.notice_date),
+    question_due: cleanIsoDate(p.question_due),
+    bid_date: cleanIsoDate(p.bid_date),
+    opening_date: cleanIsoDate(p.opening_date),
+    budget_price: digitsOrNull(p.budget_price),
+    note: (p.summary || '').trim(),
+  };
+}
+
 // ✅ 入札 - KPI・分析集計（/:id より先に定義してルート衝突を防ぐ）
 app.get('/api/bids/stats', requireAuth, requireBidAccess, async (req, res) => {
   try {
@@ -3493,6 +3628,26 @@ app.delete('/api/bids/:id', requireAuth, requireBidAccess, async (req, res) => {
   } catch (error) {
     console.error('Error (bid delete):', error.message);
     res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 入札 - 資料から案件情報を AI 抽出（登録前のプレフィル用。DBには保存しない）
+//    複数ファイルを受け取り、主要書類に自動で絞って Gemini で解析する。
+app.post('/api/bids/extract', requireAuth, requireBidAccess, upload.array('files', 20), async (req, res) => {
+  try {
+    const files = req.files || [];
+    if (!files.length) return res.status(400).json({ error: 'files（資料ファイル）が必要です' });
+
+    const picked = selectBidDocsForAI(files);
+    if (!picked.length) {
+      return res.status(400).json({ error: 'AIで読み取れる資料（PDF/画像）が見つかりませんでした。手入力で登録してください。' });
+    }
+
+    const fields = await extractBidInfo(picked);
+    res.json({ fields, used_files: picked.map((f) => f.originalname) });
+  } catch (error) {
+    console.error('Error (bid extract):', error.message);
+    res.status(error.status || 500).json({ error: error.message });
   }
 });
 
