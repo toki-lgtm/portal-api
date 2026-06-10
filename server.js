@@ -2190,14 +2190,68 @@ app.get('/api/employees/:id/qualifications', requireAuth, requireEmployeeAccess,
 
 // ✅ 社員へ資格を追加（管理者のみ）。cert_image_path があれば原本画像も紐付ける。
 //    issuer（発行者）・honseki（本籍地）は一括取込時に証書から抽出した値を受け取って保存する。
+//    ★既に同じ社員×資格が登録済みの場合は「更新（資格証の更新）」とみなし、日付の新しい方を残す。
+//      新しい証書の方が新しければ内容を更新、既存の方が新しければそのまま維持する。
+//      応答に _action（'inserted' | 'updated' | 'kept'）を含める。
 app.post('/api/employees/:id/qualifications', requireAuth, requireEmployeeAdmin, async (req, res) => {
   try {
     const { qualification_id, acquired_date, expiry_date, cert_number, note, cert_image_path, issuer, honseki } = req.body || {};
     if (!qualification_id) return res.status(400).json({ error: '資格を選択してください' });
+    const staff_id = req.params.id;
+
+    // 既存（同一社員×資格）を確認
+    const { data: existRows, error: exErr } = await supabase
+      .from('staff_qualifications')
+      .select('*')
+      .eq('staff_id', staff_id)
+      .eq('qualification_id', qualification_id)
+      .limit(1);
+    if (exErr) throw exErr;
+    const existing = existRows && existRows[0];
+
+    // 「新しさ」は 取得（修了/合格）日 を優先し、無ければ有効期限で比較する
+    const pickDate = (r) => (r && (r.acquired_date || r.expiry_date)) || null;
+
+    if (existing) {
+      const nd = acquired_date || expiry_date || null; // 今回アップ分
+      const od = pickDate(existing);                    // 既存分
+      // 既存の方が新しい（= 今回が古い）なら維持。日付比較は YYYY-MM-DD の文字列比較で可。
+      const incomingIsNewer = nd
+        ? (!od || nd > od)      // 今回に日付あり: 既存に日付が無いか、今回が新しければ更新
+        : (!od);               // 今回に日付なし: 既存も日付無しなら最新アップで上書き、既存に日付あれば維持
+      if (!incomingIsNewer) {
+        existing.cert_image_url = existing.cert_image_path ? await certSignedUrl(existing.cert_image_path) : null;
+        existing._action = 'kept';
+        return res.json(existing);
+      }
+      // 今回が新しい→更新（欠損項目は既存値を温存してデータを失わない）
+      const patch = {
+        acquired_date: acquired_date || existing.acquired_date || null,
+        expiry_date:   expiry_date   || existing.expiry_date   || null,
+        cert_number:   cert_number   || existing.cert_number   || null,
+        note:          note          || existing.note          || null,
+        cert_image_path: cert_image_path || existing.cert_image_path || null,
+        issuer:        issuer        || existing.issuer        || null,
+        honseki:       honseki       || existing.honseki       || null,
+        updated_at:    new Date().toISOString(),
+      };
+      const { data: upd, error: upErr } = await supabase
+        .from('staff_qualifications')
+        .update(patch)
+        .eq('id', existing.id)
+        .select('*, qualification_master(name, category, has_expiry)');
+      if (upErr) throw upErr;
+      const row = upd[0];
+      row.cert_image_url = row.cert_image_path ? await certSignedUrl(row.cert_image_path) : null;
+      row._action = 'updated';
+      return res.json(row);
+    }
+
+    // 新規登録
     const { data, error } = await supabase
       .from('staff_qualifications')
       .insert([{
-        staff_id: req.params.id,
+        staff_id,
         qualification_id,
         acquired_date: acquired_date || null,
         expiry_date: expiry_date || null,
@@ -2209,11 +2263,13 @@ app.post('/api/employees/:id/qualifications', requireAuth, requireEmployeeAdmin,
       }])
       .select('*, qualification_master(name, category, has_expiry)');
     if (error) {
-      if (error.code === '23505') return res.status(409).json({ error: 'この社員には既に同じ資格が登録されています' });
+      // 競合で既に作られていた場合は更新側で拾えるよう 409 ではなく簡潔に返す
+      if (error.code === '23505') return res.status(409).json({ error: 'この社員には既に同じ資格が登録されています（再実行してください）' });
       throw error;
     }
     const row = data[0];
     row.cert_image_url = row.cert_image_path ? await certSignedUrl(row.cert_image_path) : null;
+    row._action = 'inserted';
     res.json(row);
   } catch (error) {
     res.status(500).json({ error: error.message });
