@@ -129,14 +129,23 @@ function escapeQ(s) {
 }
 
 // 親フォルダ直下に name のサブフォルダを探し、無ければ作成して fileId を返す。
-// 結果はプロセス内キャッシュ（毎回の検索/作成を避ける）。共有ドライブ対応。
-const folderCache = new Map(); // key: `${parentId}/${name}` -> folderId
-export async function ensureFolder(name, parentId) {
+// ★ キャッシュには「Promise」を入れる。一括スキャンのように同じフォルダを同時(並列)に
+//   要求しても、最初の1件だけが検索+作成し、残りは同じ Promise を待つ＝重複フォルダを防ぐ。
+//   （結果値だけをキャッシュすると、並列呼び出しが全員「検索→無い→作成」を走らせて重複する）
+const folderCache = new Map(); // key: `${parentId}/${name}` -> Promise<folderId>
+export function ensureFolder(name, parentId) {
   const parent = parentId || process.env.DRIVE_FOLDER_ID;
-  if (!parent) throw new Error('DRIVE_FOLDER_ID が未設定です。');
+  if (!parent) return Promise.reject(new Error('DRIVE_FOLDER_ID が未設定です。'));
   const key = `${parent}/${name}`;
-  if (folderCache.has(key)) return folderCache.get(key);
+  const cached = folderCache.get(key);
+  if (cached) return cached;
+  // 失敗時はキャッシュから外して次回リトライ可能にする
+  const p = resolveFolder(name, parent).catch((e) => { folderCache.delete(key); throw e; });
+  folderCache.set(key, p);
+  return p;
+}
 
+async function resolveFolder(name, parent) {
   const token = await getAccessToken();
   // 1) 既存検索
   const q = `name='${escapeQ(name)}' and '${parent}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`;
@@ -145,10 +154,7 @@ export async function ensureFolder(name, parentId) {
   const sres = await fetch(searchUrl, { headers: { Authorization: `Bearer ${token}` } });
   if (sres.ok) {
     const sdata = await sres.json();
-    if (sdata.files && sdata.files.length > 0) {
-      folderCache.set(key, sdata.files[0].id);
-      return sdata.files[0].id;
-    }
+    if (sdata.files && sdata.files.length > 0) return sdata.files[0].id;
   }
   // 2) 無ければ作成
   const cres = await fetch('https://www.googleapis.com/drive/v3/files?supportsAllDrives=true&fields=id', {
@@ -161,8 +167,39 @@ export async function ensureFolder(name, parentId) {
     throw new Error(`Drive フォルダ作成に失敗（${name}, ${cres.status}）: ${text}`);
   }
   const cdata = await cres.json();
-  folderCache.set(key, cdata.id);
   return cdata.id;
+}
+
+// 親フォルダ直下の子（フォルダ/ファイル）を全件返す（ページング対応）。掃除・点検用。
+export async function driveListChildren(parentId) {
+  const parent = parentId || process.env.DRIVE_FOLDER_ID;
+  const token = await getAccessToken();
+  const out = [];
+  let pageToken = '';
+  do {
+    const q = `'${parent}' in parents and trashed=false`;
+    const url = `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(q)}`
+      + '&fields=nextPageToken,files(id,name,mimeType)&supportsAllDrives=true&includeItemsFromAllDrives=true&pageSize=1000'
+      + (pageToken ? `&pageToken=${pageToken}` : '');
+    const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+    if (!res.ok) throw new Error(`Drive 一覧取得に失敗（${res.status}）: ${await res.text()}`);
+    const data = await res.json();
+    out.push(...(data.files || []));
+    pageToken = data.nextPageToken || '';
+  } while (pageToken);
+  return out;
+}
+
+// ファイル/フォルダを別の親へ移動する（fileId は不変＝DBの drive:<id> 参照は壊れない）。
+export async function driveMove(fileId, addParentId, removeParentId) {
+  const token = await getAccessToken();
+  const url = `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?supportsAllDrives=true`
+    + `&addParents=${encodeURIComponent(addParentId)}`
+    + (removeParentId ? `&removeParents=${encodeURIComponent(removeParentId)}` : '')
+    + '&fields=id,parents';
+  const res = await fetch(url, { method: 'PATCH', headers: { Authorization: `Bearer ${token}` } });
+  if (!res.ok) throw new Error(`Drive 移動に失敗（${res.status}）: ${await res.text()}`);
+  return res.json();
 }
 
 // ["中原建設","田中太郎"] のような階層を順に ensureFolder して、末端フォルダの fileId を返す。
@@ -193,7 +230,26 @@ export async function driveDownload(fileId) {
   return { buffer, contentType };
 }
 
-// fileId のファイルを削除する（移行や差し替え時の後始末用）。失敗は呼び出し側で握り潰してよい。
+// fileId をゴミ箱へ移動する（trashed=true）。共有ドライブの「投稿者」権限でも実行可能で、
+// 30日間は復元可能。※完全削除(driveDelete)は「管理者」権限が必要なため、通常はこちらを使う。
+export async function driveTrash(fileId) {
+  const token = await getAccessToken();
+  const res = await fetch(
+    `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?supportsAllDrives=true&fields=id`,
+    {
+      method: 'PATCH',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ trashed: true }),
+    },
+  );
+  if (!res.ok && res.status !== 404) {
+    const text = await res.text();
+    throw new Error(`Drive のゴミ箱移動に失敗しました（${res.status}）: ${text}`);
+  }
+}
+
+// fileId のファイルを完全削除する（移行や差し替え時の後始末用）。
+// 注: 共有ドライブでは「管理者」権限が必要。投稿者権限だと 404 になるため driveTrash を推奨。
 export async function driveDelete(fileId) {
   const token = await getAccessToken();
   const res = await fetch(
