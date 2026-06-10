@@ -14,6 +14,7 @@
 // supportsAllDrives=true を付ける点に注意。
 
 import { createSign } from 'crypto';
+import { readFileSync } from 'fs';
 
 const SCOPE = 'https://www.googleapis.com/auth/drive';
 const TOKEN_URL = 'https://oauth2.googleapis.com/token';
@@ -26,9 +27,13 @@ function base64url(input) {
 let cachedCreds = null;
 function loadCreds() {
   if (cachedCreds) return cachedCreds;
-  const raw = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
+  // 鍵の渡し方は2通り: 環境変数に中身を直接（Render向け）/ ファイルパス指定（ローカル向け）。
+  let raw = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
+  if (!raw && process.env.GOOGLE_SERVICE_ACCOUNT_FILE) {
+    raw = readFileSync(process.env.GOOGLE_SERVICE_ACCOUNT_FILE, 'utf8');
+  }
   if (!raw) {
-    const e = new Error('GOOGLE_SERVICE_ACCOUNT_JSON が未設定です。サービスアカウントの鍵JSONを環境変数に設定してください。');
+    const e = new Error('GOOGLE_SERVICE_ACCOUNT_JSON（中身）または GOOGLE_SERVICE_ACCOUNT_FILE（鍵JSONのパス）を設定してください。');
     e.status = 503;
     throw e;
   }
@@ -201,7 +206,8 @@ export async function driveDelete(fileId) {
   }
 }
 
-// Drive 連携が使える状態か（環境変数が揃っているか）を返す。
+// Drive 連携が使える状態か（鍵 と 保存先フォルダID が揃っているか）を返す。
 export function driveConfigured() {
-  return Boolean(process.env.GOOGLE_SERVICE_ACCOUNT_JSON && process.env.DRIVE_FOLDER_ID);
+  const hasKey = Boolean(process.env.GOOGLE_SERVICE_ACCOUNT_JSON || process.env.GOOGLE_SERVICE_ACCOUNT_FILE);
+  return Boolean(hasKey && process.env.DRIVE_FOLDER_ID);
 }

@@ -58,13 +58,14 @@ DBの `cert_image_path` を `drive:<fileID>` に書き換えるだけで、Supab
 **前提**: 上の①〜③（サービスアカウント・フォルダID）が済んでいること。
 
 **実行手順**（このPCの portal-api フォルダで）:
-1. `.env` に4つの値が入っているか確認（無ければ追記）:
+1. `.env` に以下が入っているか確認（`DRIVE_FOLDER_ID` は設定済み）。鍵はローカルでは**ファイルのパス指定**が簡単:
    ```
-   SUPABASE_URL=...
-   SUPABASE_SERVICE_ROLE_KEY=...
-   GOOGLE_SERVICE_ACCOUNT_JSON={...鍵JSONの中身全部...}
-   DRIVE_FOLDER_ID=...
+   SUPABASE_URL=...                         （設定済み）
+   DRIVE_FOLDER_ID=...                       （設定済み = 02.資格者証）
+   SUPABASE_SERVICE_ROLE_KEY=...             ← Supabase管理画面 Settings>API の service_role を貼る
+   GOOGLE_SERVICE_ACCOUNT_FILE=C:\Users\toki\Downloads\＜ダウンロードした鍵＞.json   ← 鍵JSONの保存パス
    ```
+   ※ `SUPABASE_SERVICE_ROLE_KEY` が必要なのは、資格者証バケットが非公開でanonキーでは読めないため。
 2. まず件数確認（何も変更しない）:
    ```
    node migrate_certs_to_drive.mjs --dry-run
