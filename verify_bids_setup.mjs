@@ -12,7 +12,8 @@ let ok = true
 
 // 1) テーブル存在チェック
 for (const t of ['bid_projects', 'bid_documents', 'bid_status_history']) {
-  const { error } = await sb.from(t).select('id', { count: 'exact', head: true })
+  // head:true のカウント問い合わせは未作成テーブルのエラーを拾い損ねるため、実データ取得で判定する
+  const { error } = await sb.from(t).select('id').limit(1)
   if (error) { console.log(`❌ テーブル ${t}: 未作成または不可 (${error.message})`); ok = false }
   else console.log(`✅ テーブル ${t}: OK`)
 }
