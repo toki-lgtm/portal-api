@@ -8,6 +8,7 @@ import jwt from 'jsonwebtoken';
 import multer from 'multer';
 import nodemailer from 'nodemailer';
 import { PDFDocument } from 'pdf-lib';
+import { parseEstimateFromXlsx } from './bidEstimate.js';
 import { driveUpload, driveDownload, driveConfigured, ensureFolderPath } from './googleDrive.js';
 
 dotenv.config();
@@ -3617,7 +3618,7 @@ app.get('/api/bids/:id', requireAuth, requireBidAccess, async (req, res) => {
 const BID_FIELDS = [
   'project_name', 'client_name', 'location', 'work_type', 'bid_method', 'status',
   'notice_date', 'question_due', 'bid_start_date', 'bid_date', 'opening_date',
-  'budget_price', 'our_estimate', 'awarded_price', 'awarded_company',
+  'budget_price', 'our_estimate', 'bid_amount', 'awarded_price', 'awarded_company',
   'staff_id', 'note', 'remarks', 'reason',
 ];
 
@@ -3821,6 +3822,70 @@ app.delete('/api/bids/:id/documents/:docId', requireAuth, requireBidAccess, asyn
     res.json({ ok: true });
   } catch (error) {
     console.error('Error (bid doc delete):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 入札 - 積算データ(Excel)取込: 金額を自動検出して積算金額(our_estimate・税抜)に反映し、
+//    ファイルは資料(doc_type='積算')として添付する。入札金額(bid_amount)は別途手入力。
+app.post('/api/bids/:id/import-estimate', requireAuth, requireBidAccess, upload.single('file'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!req.file) return res.status(400).json({ error: 'file フィールドが必要です' });
+
+    const { data: bid, error: bidErr } = await supabase
+      .from('bid_projects').select('id').eq('id', id).eq('is_active', true).maybeSingle();
+    if (bidErr) throw bidErr;
+    if (!bid) return res.status(404).json({ error: '案件が見つかりません' });
+
+    const originalName = decodeUploadName(req.file.originalname);
+    const ext = (originalName.split('.').pop() || '').toLowerCase();
+    if (!['xlsx', 'xlsm'].includes(ext)) {
+      return res.status(400).json({ error: 'Excel(.xlsx)形式の積算データをアップロードしてください（古い.xls形式は非対応）' });
+    }
+
+    // 金額抽出（失敗してもファイル添付は行う）
+    let parsed = { amount: null, label: null, candidates: [] };
+    try {
+      parsed = await parseEstimateFromXlsx(req.file.buffer);
+    } catch (e) {
+      console.error('Excel parse error:', e.message);
+    }
+
+    // 資料として Storage 保存＋メタ登録
+    const path = `${id}/${Date.now()}-${uuidv4()}.${ext}`;
+    const { error: upErr } = await supabase.storage
+      .from(BID_BUCKET).upload(path, req.file.buffer, { contentType: req.file.mimetype });
+    if (upErr) throw upErr;
+    await supabase.from('bid_documents').insert([{
+      bid_id: id,
+      file_name: originalName,
+      storage_path: path,
+      doc_type: '積算',
+      size_bytes: req.file.size,
+      uploaded_by: req.user.email,
+    }]);
+
+    // 金額が取れたら積算金額(our_estimate)を更新（入札金額は触らない）
+    let updated = false;
+    if (parsed.amount != null) {
+      const { error: updErr } = await supabase
+        .from('bid_projects')
+        .update({ our_estimate: parsed.amount, updated_at: new Date().toISOString() })
+        .eq('id', id);
+      if (updErr) throw updErr;
+      updated = true;
+    }
+
+    res.json({
+      estimated_amount: parsed.amount,
+      label_used: parsed.label,
+      candidates: parsed.candidates,
+      updated,
+      file_name: originalName,
+    });
+  } catch (error) {
+    console.error('Error (bid import-estimate):', error.message);
     res.status(500).json({ error: error.message });
   }
 });
