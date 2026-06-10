@@ -8,6 +8,7 @@ import jwt from 'jsonwebtoken';
 import multer from 'multer';
 import nodemailer from 'nodemailer';
 import { PDFDocument } from 'pdf-lib';
+import { driveUpload, driveDownload, driveConfigured } from './googleDrive.js';
 
 dotenv.config();
 
@@ -2044,12 +2045,62 @@ async function ensureCertBucket() {
   certBucketEnsured = true;
 }
 
-// 非公開バケットの画像を一時表示するための署名付きURL（既定1時間）
-async function certSignedUrl(path, expiresIn = 3600) {
-  if (!path) return null;
-  const { data } = await supabase.storage.from(CERT_BUCKET).createSignedUrl(path, expiresIn);
+// 保存先の方針（標準ストレージ方針）: 'drive' で共有ドライブ(Google Drive)、それ以外は Supabase。
+// 未設定なら 'supabase'＝従来動作。Drive 連携の環境変数が揃っていない場合も安全に Supabase へフォールバック。
+const CERT_STORAGE = (process.env.CERT_STORAGE || 'supabase').toLowerCase();
+
+// 資格者証ファイルを方針に従って保存し、DBの cert_image_path に入れる「参照」を返す。
+//   Supabase: バケット内のパス（従来どおり。例 "inbox/xxx.pdf"）
+//   Drive   : "drive:<fileId>"（接頭辞で見分ける）
+// nameOrPath は Supabase ではパスキー、Drive では表示用ファイル名に使う。
+async function storeCert(nameOrPath, buffer, mimeType) {
+  if (CERT_STORAGE === 'drive' && driveConfigured()) {
+    const fileId = await driveUpload({ name: String(nameOrPath).replace(/\//g, '_'), buffer, mimeType });
+    return `drive:${fileId}`;
+  }
+  await ensureCertBucket();
+  const { error } = await supabase.storage.from(CERT_BUCKET).upload(nameOrPath, buffer, { contentType: mimeType });
+  if (error) throw error;
+  return nameOrPath;
+}
+
+// 資格者証を一時表示するためのURL（既定1時間）。
+//   "drive:" 参照 → 署名トークン付きの API プロキシURL（/api/cert-file）。<img src> から認証ヘッダ無しで開ける。
+//   それ以外     → Supabase の署名付きURL（既存の保存済みファイルもそのまま表示できる）。
+async function certSignedUrl(ref, expiresIn = 3600) {
+  if (!ref) return null;
+  if (String(ref).startsWith('drive:')) {
+    const fileId = String(ref).slice('drive:'.length);
+    const token = jwt.sign({ fileId, kind: 'cert' }, JWT_SECRET, { expiresIn });
+    const base = process.env.PUBLIC_API_URL || 'https://portal-api-hhlx.onrender.com';
+    return `${base}/api/cert-file?t=${encodeURIComponent(token)}`;
+  }
+  const { data } = await supabase.storage.from(CERT_BUCKET).createSignedUrl(ref, expiresIn);
   return data?.signedUrl || null;
 }
+
+// 署名トークンで保護された資格者証プロキシ。Drive 上の非公開ファイルを API 経由で配信する。
+// 認証は requireAuth ではなく certSignedUrl が発行する短命JWT（?t=）で行う（署名付きURL相当）。
+app.get('/api/cert-file', async (req, res) => {
+  try {
+    const token = req.query.t;
+    if (!token) return res.status(400).send('missing token');
+    let payload;
+    try {
+      payload = jwt.verify(token, JWT_SECRET);
+    } catch {
+      return res.status(401).send('invalid or expired token');
+    }
+    if (payload.kind !== 'cert' || !payload.fileId) return res.status(400).send('bad token');
+    const { buffer, contentType } = await driveDownload(payload.fileId);
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('Cache-Control', 'private, max-age=600');
+    res.send(buffer);
+  } catch (error) {
+    console.error('Error (cert-file proxy):', error.message);
+    res.status(error.status || 500).send(error.message);
+  }
+});
 
 // 資格名の正規化（空白・括弧書きを除去して突合精度を上げる）
 // 漢数字→算用数字（「二級建築士免許証」と「2級建築士」を突合できるようにする）
@@ -2298,14 +2349,13 @@ app.post('/api/employees/:id/qualifications/scan', requireAuth, requireEmployeeA
     // 1) Gemini で内容を抽出
     const extracted = await extractCertificate(req.file.buffer, req.file.mimetype);
 
-    // 2) 原本画像を非公開バケットへ保存
-    await ensureCertBucket();
+    // 2) 原本画像を保存（方針に従い Drive または Supabase）
     const ext = (req.file.originalname.split('.').pop() || 'jpg').toLowerCase();
-    const path = `${req.params.id}/${Date.now()}-${uuidv4()}.${ext}`;
-    const { error: upErr } = await supabase.storage
-      .from(CERT_BUCKET)
-      .upload(path, req.file.buffer, { contentType: req.file.mimetype });
-    if (upErr) throw upErr;
+    const path = await storeCert(
+      `${req.params.id}/${Date.now()}-${uuidv4()}.${ext}`,
+      req.file.buffer,
+      req.file.mimetype,
+    );
 
     // 3) 抽出した資格名を既存マスタへ突合
     const { data: masters } = await supabase.from('qualification_master').select('id, name');
@@ -2577,8 +2627,7 @@ app.post('/api/qualifications/scan', requireAuth, requireEmployeeAdmin, upload.s
     const allRecords = reconcileCertPages(pages, staff || [], masters || []);
     const records = allRecords.filter((r) => r.matched_staff_id != null);
 
-    // 4) 証書ページがある（_page_index が設定されている）レコードを Storage に保存
-    await ensureCertBucket();
+    // 4) 証書ページがある（_page_index が設定されている）レコードを保存（方針に従い Drive または Supabase）
     const ts = Date.now();
 
     await Promise.all(records.map(async (rec) => {
@@ -2604,11 +2653,11 @@ app.post('/api/qualifications/scan', requireAuth, requireEmployeeAdmin, upload.s
         }
 
         const ext = isPdf ? 'pdf' : (req.file.originalname.split('.').pop() || 'jpg').toLowerCase();
-        const storagePath = `inbox/${ts}-${uuidv4()}.${ext}`;
-        const { error: upErr } = await supabase.storage
-          .from(CERT_BUCKET)
-          .upload(storagePath, uploadBuffer, { contentType: uploadMimeType });
-        if (upErr) throw upErr;
+        const storagePath = await storeCert(
+          `inbox/${ts}-${uuidv4()}.${ext}`,
+          uploadBuffer,
+          uploadMimeType,
+        );
 
         rec.cert_image_path = storagePath;
         rec.cert_image_url  = await certSignedUrl(storagePath);

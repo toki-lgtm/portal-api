@@ -1,0 +1,155 @@
+// ===== Google Drive（共有ドライブ）ストレージ連携 =====
+//
+// 社内ポータルの「標準ストレージ方針」（重いファイルは Google Workspace 共有ドライブへ、
+// 構造化データは Supabase 無料枠）を実現するための低レベルヘルパー。
+//
+// 既存コード（Gemini 連携）と同じく SDK を足さず、Node 標準の crypto と fetch で
+// サービスアカウント認証（JWT → アクセストークン）と Drive REST を直接叩く。
+//
+// 必要な環境変数:
+//   GOOGLE_SERVICE_ACCOUNT_JSON … サービスアカウントの鍵JSON（中身そのものを1行で）
+//   DRIVE_FOLDER_ID             … 保存先フォルダ（共有ドライブ「社内システム」配下）のID
+//
+// 共有ドライブ（Shared Drive）配下のため、すべての API 呼び出しに
+// supportsAllDrives=true を付ける点に注意。
+
+import { createSign } from 'crypto';
+
+const SCOPE = 'https://www.googleapis.com/auth/drive';
+const TOKEN_URL = 'https://oauth2.googleapis.com/token';
+
+function base64url(input) {
+  return Buffer.from(input).toString('base64')
+    .replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+}
+
+let cachedCreds = null;
+function loadCreds() {
+  if (cachedCreds) return cachedCreds;
+  const raw = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
+  if (!raw) {
+    const e = new Error('GOOGLE_SERVICE_ACCOUNT_JSON が未設定です。サービスアカウントの鍵JSONを環境変数に設定してください。');
+    e.status = 503;
+    throw e;
+  }
+  try {
+    cachedCreds = JSON.parse(raw);
+  } catch {
+    const e = new Error('GOOGLE_SERVICE_ACCOUNT_JSON のJSON解析に失敗しました。鍵JSONの中身をそのまま設定してください。');
+    e.status = 500;
+    throw e;
+  }
+  return cachedCreds;
+}
+
+let cachedToken = null; // { token, expMs }
+async function getAccessToken() {
+  if (cachedToken && cachedToken.expMs > Date.now() + 60_000) return cachedToken.token;
+
+  const creds = loadCreds();
+  const now = Math.floor(Date.now() / 1000);
+  const header = base64url(JSON.stringify({ alg: 'RS256', typ: 'JWT' }));
+  const claim = base64url(JSON.stringify({
+    iss: creds.client_email,
+    scope: SCOPE,
+    aud: TOKEN_URL,
+    iat: now,
+    exp: now + 3600,
+  }));
+  const signer = createSign('RSA-SHA256');
+  signer.update(`${header}.${claim}`);
+  const signature = base64url(signer.sign(creds.private_key));
+  const assertion = `${header}.${claim}.${signature}`;
+
+  const res = await fetch(TOKEN_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+      assertion,
+    }),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Drive 認証に失敗しました（${res.status}）: ${text}`);
+  }
+  const data = await res.json();
+  cachedToken = { token: data.access_token, expMs: Date.now() + (data.expires_in || 3600) * 1000 };
+  return cachedToken.token;
+}
+
+// ファイルを共有ドライブのフォルダへアップロードし、fileId を返す。
+// folderId 省略時は DRIVE_FOLDER_ID 直下に保存する。
+export async function driveUpload({ name, buffer, mimeType, folderId }) {
+  const parent = folderId || process.env.DRIVE_FOLDER_ID;
+  if (!parent) {
+    const e = new Error('DRIVE_FOLDER_ID が未設定です。共有ドライブの保存先フォルダIDを設定してください。');
+    e.status = 503;
+    throw e;
+  }
+  const token = await getAccessToken();
+  const boundary = `boundary_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+  const metadata = { name, parents: [parent] };
+
+  const body = Buffer.concat([
+    Buffer.from(`--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n`),
+    Buffer.from(JSON.stringify(metadata)),
+    Buffer.from(`\r\n--${boundary}\r\nContent-Type: ${mimeType || 'application/octet-stream'}\r\n\r\n`),
+    buffer,
+    Buffer.from(`\r\n--${boundary}--\r\n`),
+  ]);
+
+  const res = await fetch(
+    'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&supportsAllDrives=true&fields=id',
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': `multipart/related; boundary=${boundary}`,
+      },
+      body,
+    },
+  );
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Drive へのアップロードに失敗しました（${res.status}）: ${text}`);
+  }
+  const data = await res.json();
+  return data.id;
+}
+
+// fileId のファイル本体を取得して { buffer, contentType } を返す（API経由のストリーム配信用）。
+export async function driveDownload(fileId) {
+  const token = await getAccessToken();
+  const res = await fetch(
+    `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?alt=media&supportsAllDrives=true`,
+    { headers: { Authorization: `Bearer ${token}` } },
+  );
+  if (!res.ok) {
+    const text = await res.text();
+    const e = new Error(`Drive からの取得に失敗しました（${res.status}）: ${text}`);
+    e.status = res.status === 404 ? 404 : 502;
+    throw e;
+  }
+  const contentType = res.headers.get('content-type') || 'application/octet-stream';
+  const buffer = Buffer.from(await res.arrayBuffer());
+  return { buffer, contentType };
+}
+
+// fileId のファイルを削除する（移行や差し替え時の後始末用）。失敗は呼び出し側で握り潰してよい。
+export async function driveDelete(fileId) {
+  const token = await getAccessToken();
+  const res = await fetch(
+    `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?supportsAllDrives=true`,
+    { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } },
+  );
+  if (!res.ok && res.status !== 404) {
+    const text = await res.text();
+    throw new Error(`Drive の削除に失敗しました（${res.status}）: ${text}`);
+  }
+}
+
+// Drive 連携が使える状態か（環境変数が揃っているか）を返す。
+export function driveConfigured() {
+  return Boolean(process.env.GOOGLE_SERVICE_ACCOUNT_JSON && process.env.DRIVE_FOLDER_ID);
+}
