@@ -49,5 +49,29 @@ Render ダッシュボード → portal-api → Environment に追加:
 - **既存の Supabase 保存分** → そのまま表示できる（`drive:` が付かない参照は従来の Supabase 署名URLで配信）。
 - **元に戻す** → `CERT_STORAGE` を消す（または `supabase`）だけで従来動作へ戻る。
 
-## 既存ファイルの移行（任意・後でOK）
-すでに Supabase バケット `qualification-certs` にある資格者証を Drive へ移したい場合は、別途移行スクリプトを用意します（DBの `cert_image_path` を `drive:<id>` へ書き換え）。急がなければ現状のまま併存で問題ありません。
+## 既存ファイルの移行（`migrate_certs_to_drive.mjs`）
+すでに Supabase バケット `qualification-certs` にある資格者証を共有ドライブへ移します。
+DBの `cert_image_path` を `drive:<fileID>` に書き換えるだけで、Supabase の元ファイルは消さずに残します（バックアップ）。
+
+**前提**: 上の①〜③（サービスアカウント・フォルダID）が済んでいること。
+
+**実行手順**（このPCの portal-api フォルダで）:
+1. `.env` に4つの値が入っているか確認（無ければ追記）:
+   ```
+   SUPABASE_URL=...
+   SUPABASE_SERVICE_ROLE_KEY=...
+   GOOGLE_SERVICE_ACCOUNT_JSON={...鍵JSONの中身全部...}
+   DRIVE_FOLDER_ID=...
+   ```
+2. まず件数確認（何も変更しない）:
+   ```
+   node migrate_certs_to_drive.mjs --dry-run
+   ```
+3. 問題なければ本実行:
+   ```
+   node migrate_certs_to_drive.mjs
+   ```
+- 冪等なので途中で止めても再実行で続きから。`drive:` 済みは自動スキップ。
+- 移行後、ポータルの社員一覧で資格者証が表示されることを確認したら、Supabase の元ファイルは不要なら手動削除でOK。
+
+急がなければ移行せず併存のままでも問題ありません（新規はDrive・既存はSupabaseで両方表示できる）。
