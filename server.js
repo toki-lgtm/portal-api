@@ -14,6 +14,18 @@ dotenv.config();
 // ✅ multer: 写真アップロード用（メモリストレージ）
 const upload = multer({ storage: multer.memoryStorage() });
 
+// multer/busboy は日本語ファイル名を latin1 として解釈し文字化けする。
+// 元の UTF-8 へ復元する（既に日本語が含まれる場合は変換不要としてそのまま返す）。
+function decodeUploadName(name) {
+  if (!name) return name;
+  if (/[぀-ゟ゠-ヿ一-鿿]/.test(name)) return name; // 既に正しくデコード済み
+  try {
+    return Buffer.from(name, 'latin1').toString('utf8');
+  } catch {
+    return name;
+  }
+}
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -3638,6 +3650,9 @@ app.post('/api/bids/extract', requireAuth, requireBidAccess, upload.array('files
     const files = req.files || [];
     if (!files.length) return res.status(400).json({ error: 'files（資料ファイル）が必要です' });
 
+    // 日本語ファイル名の文字化けを補正（書類の絞り込みキーワード判定に必須）
+    for (const f of files) f.originalname = decodeUploadName(f.originalname);
+
     const picked = selectBidDocsForAI(files);
     if (!picked.length) {
       return res.status(400).json({ error: 'AIで読み取れる資料（PDF/画像）が見つかりませんでした。手入力で登録してください。' });
@@ -3657,7 +3672,8 @@ app.post('/api/bids/:id/documents', requireAuth, requireBidAccess, upload.single
     const { id } = req.params;
     if (!req.file) return res.status(400).json({ error: 'file フィールドが必要です' });
 
-    const ext = (req.file.originalname.split('.').pop() || 'bin').toLowerCase();
+    const originalName = decodeUploadName(req.file.originalname); // 日本語ファイル名の文字化け補正
+    const ext = (originalName.split('.').pop() || 'bin').toLowerCase();
     const path = `${id}/${Date.now()}-${uuidv4()}.${ext}`;
 
     const { error: upErr } = await supabase.storage
@@ -3669,7 +3685,7 @@ app.post('/api/bids/:id/documents', requireAuth, requireBidAccess, upload.single
       .from('bid_documents')
       .insert([{
         bid_id: id,
-        file_name: req.file.originalname,
+        file_name: originalName,
         storage_path: path,
         doc_type: req.body.doc_type || null,
         size_bytes: req.file.size,
