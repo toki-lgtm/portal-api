@@ -44,8 +44,13 @@ CREATE TABLE bid_projects (
   -- 重要日付
   notice_date     DATE,                                -- 公告日
   question_due    DATE,                                -- 質問期限
-  bid_date        DATE,                                -- 入札日
+  bid_start_date  DATE,                                -- 入札開始日（札入れ期間の開始。単日入札では空）
+  bid_date        DATE,                                -- 入札締切日（入札書提出締切＝札入れ期間の終了。単日入札では入札日）
   opening_date    DATE,                                -- 開札日
+
+  -- 通知書からの転記（社内メモ note とは別枠）
+  remarks         TEXT,                                -- 備考（指名通知書等の記載を転記）
+  reason          TEXT,                                -- 理由（指名通知書等の記載を転記）
 
   -- 金額（円・整数。税区分は持たない）
   budget_price    BIGINT,                              -- 予定価格（公表されている場合）

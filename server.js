@@ -3332,11 +3332,14 @@ async function extractBidInfo(files) {
     '- bid_method: 入札方式（例: 一般競争入札 / 指名競争入札 / 随意契約）',
     '- notice_date: 公告日または指名通知日（YYYY-MM-DD）',
     '- question_due: 質問書の提出期限（YYYY-MM-DD）',
-    '- bid_date: 入札書の提出日・入札日（提出に期間がある場合は締切日）（YYYY-MM-DD）',
-    '- opening_date: 開札日（YYYY-MM-DD）',
+    '- bid_start_date: 入札開始日（札入れ期間の開始。「入札開始日時」等。札入れに期間がある場合のみ。単日入札や記載なしは空文字）（YYYY-MM-DD）',
+    '- bid_date: 入札締切日（入札書提出締切日。「入札書提出締切日時」等。札入れに期間がある場合は締切日、単日入札ならその入札日）（YYYY-MM-DD）',
+    '- opening_date: 開札日（「開札予定日時」等。YYYY-MM-DD）',
     '- budget_price: 予定価格（円。半角数字のみ。公表されている場合のみ。非公表・記載なしは空文字）',
+    '- remarks: 備考（「備考」欄に記載された内容をそのまま転記。なければ空文字）',
+    '- reason: 理由（「理由」欄に記載された内容をそのまま転記。なければ空文字）',
     '- summary: 工事概要を1〜2文で（任意）',
-    '日付が和暦（令和・平成等）の場合は西暦に変換してください。',
+    '日付が和暦（令和・平成等）の場合は西暦に変換してください。時刻が併記されていても日付のみ抽出してください。',
     '読み取れない項目は空文字にし、推測で埋めないでください。',
     '複数の書類がある場合は内容を突き合わせ、最も確からしい値を返してください。',
   ].join('\n');
@@ -3362,9 +3365,12 @@ async function extractBidInfo(files) {
           bid_method: { type: 'STRING' },
           notice_date: { type: 'STRING' },
           question_due: { type: 'STRING' },
+          bid_start_date: { type: 'STRING' },
           bid_date: { type: 'STRING' },
           opening_date: { type: 'STRING' },
           budget_price: { type: 'STRING' },
+          remarks: { type: 'STRING' },
+          reason: { type: 'STRING' },
           summary: { type: 'STRING' },
         },
         required: ['project_name'],
@@ -3397,9 +3403,12 @@ async function extractBidInfo(files) {
     bid_method: (p.bid_method || '').trim(),
     notice_date: cleanIsoDate(p.notice_date),
     question_due: cleanIsoDate(p.question_due),
+    bid_start_date: cleanIsoDate(p.bid_start_date),
     bid_date: cleanIsoDate(p.bid_date),
     opening_date: cleanIsoDate(p.opening_date),
     budget_price: digitsOrNull(p.budget_price),
+    remarks: (p.remarks || '').trim(),
+    reason: (p.reason || '').trim(),
     note: (p.summary || '').trim(),
   };
 }
@@ -3587,9 +3596,9 @@ app.get('/api/bids/:id', requireAuth, requireBidAccess, async (req, res) => {
 // 入札案件で受け付ける更新可能フィールド
 const BID_FIELDS = [
   'project_name', 'client_name', 'location', 'work_type', 'bid_method', 'status',
-  'notice_date', 'question_due', 'bid_date', 'opening_date',
+  'notice_date', 'question_due', 'bid_start_date', 'bid_date', 'opening_date',
   'budget_price', 'our_estimate', 'awarded_price', 'awarded_company',
-  'staff_id', 'note',
+  'staff_id', 'note', 'remarks', 'reason',
 ];
 
 // req.body から許可フィールドのみ抽出（空文字は null に正規化）
