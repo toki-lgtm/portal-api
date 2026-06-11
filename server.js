@@ -361,6 +361,7 @@ app.get('/api/apps', requireAuth, async (req, res) => {
       { id: 2, key: 'employee-list', name: '社員一覧', icon: '👤', internal: true, view: 'employees' },
       { id: 7, key: 'announcements', name: 'お知らせ', icon: '📣', internal: true, view: 'announcements' },
       { id: 8, key: 'bids', name: '入札案件管理', icon: '📋', internal: true, view: 'bids', description: '入札案件の進捗・期限・金額・資料を管理' },
+      { id: 9, key: 'feedback', name: 'バグ報告・改善要望', icon: '🐞', internal: true, view: 'feedback', description: '不具合の報告や「こうしてほしい」を投稿' },
       { id: 3, key: 'mailer', name: 'メーラー', url: '#', icon: '📧', status: 'coming_soon' },
       { id: 4, key: 'file-manager', name: 'ファイル管理', url: '#', icon: '📁', status: 'coming_soon' },
       { id: 5, key: 'evaluation', name: '社員評価', url: '#', icon: '⭐', status: 'coming_soon' },
@@ -373,6 +374,8 @@ app.get('/api/apps', requireAuth, async (req, res) => {
     const appPerms = await resolveAppPermissions(perms.staffId);
     const apps = allApps.filter((a) => {
       if (a.status === 'coming_soon') return true;
+      // バグ報告・改善要望は全社員が利用できる窓口（権限フィルタの対象外）
+      if (a.key === 'feedback') return true;
       if (perms.role === 'admin') return true;
       return !!appPerms[a.key];
     });
@@ -3886,6 +3889,337 @@ app.post('/api/bids/:id/import-estimate', requireAuth, requireBidAccess, upload.
     });
   } catch (error) {
     console.error('Error (bid import-estimate):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================================
+// バグ報告・改善要望（フィードバック）機能  ← migration 019
+//   - 投稿・自分の報告閲覧: 全社員（requireAuth のみ）
+//   - 全件閲覧 / トリアージ / エクスポート: feedback 管理者のみ
+//   収集データは Claude Code が実装着手しやすいよう構造化して保持し、
+//   未対応分を Markdown バックログとして取り出せる（GET /api/feedback/export）。
+// ============================================================
+
+const FEEDBACK_BUCKET = 'feedback-photos';
+let feedbackBucketEnsured = false;
+async function ensureFeedbackBucket() {
+  if (feedbackBucketEnsured) return;
+  const { data: buckets, error } = await supabase.storage.listBuckets();
+  if (error) throw error;
+  if (!buckets?.some((b) => b.name === FEEDBACK_BUCKET)) {
+    const { error: createError } = await supabase.storage.createBucket(FEEDBACK_BUCKET, { public: true });
+    if (createError && !/exist/i.test(createError.message || '')) throw createError;
+  }
+  feedbackBucketEnsured = true;
+}
+
+// 対象アプリ識別子 → 日本語表示名（エクスポート/一覧の見出し用）
+const FEEDBACK_APP_LABELS = {
+  portal: 'ポータル全般',
+  'safety-patrol': '安全パトロール',
+  'employee-list': '社員一覧',
+  announcements: 'お知らせ',
+  bids: '入札案件管理',
+  other: 'その他',
+};
+const FEEDBACK_STATUS_LABELS = {
+  new: '未対応', triaged: '確認済', in_progress: '対応中', done: '完了', wont_fix: '対応しない',
+};
+const FEEDBACK_SEVERITY_LABELS = { low: '低', medium: '中', high: '高', critical: '致命的' };
+const FEEDBACK_FREQ_LABELS = { always: '毎回', sometimes: '時々', once: '一度だけ' };
+const FEEDBACK_PRIORITY_LABELS = { low: '低', normal: '通常', high: '高' };
+
+// フィードバック管理者か判定（グローバル管理者 or staff_app_permissions['feedback']='admin'）
+async function resolveFeedbackRole(email) {
+  const perms = await resolvePermissions(email); // { role, staffId } グローバル
+  if (perms.role === 'admin') return { role: 'admin', staffId: perms.staffId };
+  let level = null;
+  if (perms.staffId) {
+    const { data } = await supabase
+      .from('staff_app_permissions')
+      .select('access_level')
+      .eq('staff_id', perms.staffId)
+      .eq('app_key', 'feedback')
+      .maybeSingle();
+    level = data?.access_level || null;
+  }
+  const role = level === 'admin' ? 'admin' : level ? 'member' : 'none';
+  return { role, staffId: perms.staffId };
+}
+
+async function requireFeedbackAdmin(req, res, next) {
+  try {
+    const r = await resolveFeedbackRole(req.user?.email);
+    if (r.role !== 'admin') {
+      return res.status(403).json({ error: 'この操作はフィードバック管理者のみ可能です' });
+    }
+    req.fbRole = r;
+    next();
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+}
+
+// 1件を Claude Code 向け Markdown ブロックに整形
+function feedbackToMarkdown(f) {
+  const typeIcon = f.type === 'bug' ? '🐞バグ' : '💡改善要望';
+  const sev = f.severity ? ` / ${FEEDBACK_SEVERITY_LABELS[f.severity] || f.severity}` : '';
+  const appName = FEEDBACK_APP_LABELS[f.app_key] || f.app_key || '不明';
+  const appLine = f.app_label ? `${appName}（${f.app_label}）` : appName;
+  const created = f.created_at ? new Date(f.created_at).toLocaleString('ja-JP') : '';
+  const reporter = [f.reporter_name, f.reporter_email].filter(Boolean).join(' ');
+  const lines = [];
+  lines.push(`## [#${f.id}] ${typeIcon}${sev} — ${f.title}`);
+  lines.push('');
+  lines.push(`- **対象アプリ**: ${appLine} \`${f.app_key}\``);
+  lines.push(`- **状態**: ${FEEDBACK_STATUS_LABELS[f.status] || f.status} / 優先度: ${FEEDBACK_PRIORITY_LABELS[f.priority] || f.priority}` +
+    (f.frequency ? ` / 頻度: ${FEEDBACK_FREQ_LABELS[f.frequency] || f.frequency}` : ''));
+  lines.push(`- **報告者**: ${reporter || '不明'} / ${created}`);
+  if (f.page_url) lines.push(`- **発生ページ**: ${f.page_url}`);
+  const env = [f.screen_info, f.app_version ? `ver ${f.app_version}` : null, f.user_agent]
+    .filter(Boolean).join(' / ');
+  if (env) lines.push(`- **環境**: ${env}`);
+  lines.push('');
+  if (f.description) { lines.push('**説明**', '', f.description, ''); }
+  if (f.steps) { lines.push('**再現手順**', '', f.steps, ''); }
+  if (f.expected) { lines.push('**期待する動作**', '', f.expected, ''); }
+  if (f.actual) { lines.push('**実際の動作**', '', f.actual, ''); }
+  const shots = Array.isArray(f.screenshot_urls) ? f.screenshot_urls : [];
+  if (shots.length) {
+    lines.push('**スクリーンショット**', '');
+    for (const u of shots) lines.push(`- ${u}`);
+    lines.push('');
+  }
+  if (f.admin_note) { lines.push('**管理メモ / 指示**', '', f.admin_note, ''); }
+  return lines.join('\n');
+}
+
+// 複数件＋見出しを Markdown バックログに（エクスポート/ローカルスクリプト共通の体裁）
+function buildFeedbackBacklog(rows, meta = {}) {
+  const now = new Date().toLocaleString('ja-JP');
+  const statusText = (meta.statuses || []).map((s) => FEEDBACK_STATUS_LABELS[s] || s).join('・') || 'すべて';
+  const header = [
+    '# バグ報告・改善要望 バックログ（Claude Code 向け）',
+    '',
+    `> 生成日時: ${now}`,
+    `> 対象ステータス: ${statusText} ／ 全 ${rows.length} 件`,
+    '>',
+    '> 各項目を上から順に対応してください。着手時は status を `in_progress`、',
+    '> 完了時は `done`（見送りは `wont_fix`）に更新します。',
+    '> 更新はポータルの管理画面、または `PATCH /api/feedback/:id` で行えます。',
+    '',
+    '---',
+    '',
+  ].join('\n');
+  if (rows.length === 0) {
+    return header + '_対象のフィードバックはありません。_\n';
+  }
+  return header + rows.map(feedbackToMarkdown).join('\n\n---\n\n') + '\n';
+}
+
+// ✅ フィードバック - スクリーンショットアップロード（公開バケット feedback-photos）
+//    固定パスのため :id ルートより前に定義する
+app.post('/api/feedback/upload-photo', requireAuth, upload.single('photo'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'photo フィールドが必要です' });
+    await ensureFeedbackBucket();
+    const ext = (req.file.originalname.split('.').pop() || 'png').toLowerCase();
+    const path = `${Date.now()}-${uuidv4()}.${ext}`;
+    const { error: uploadError } = await supabase.storage
+      .from(FEEDBACK_BUCKET)
+      .upload(path, req.file.buffer, { contentType: req.file.mimetype });
+    if (uploadError) throw uploadError;
+    const { data: urlData } = supabase.storage.from(FEEDBACK_BUCKET).getPublicUrl(path);
+    res.json({ url: urlData.publicUrl });
+  } catch (error) {
+    console.error('Error (feedback upload):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ フィードバック - Claude Code 向け Markdown バックログをエクスポート（管理者のみ）
+//    固定パスのため :id ルートより前に定義する
+//    ?status=new,triaged,in_progress（既定: 未完了の3状態） ?type=bug|improvement ?app=bids
+app.get('/api/feedback/export', requireAuth, requireFeedbackAdmin, async (req, res) => {
+  try {
+    const statuses = (req.query.status
+      ? String(req.query.status).split(',')
+      : ['new', 'triaged', 'in_progress']
+    ).map((s) => s.trim()).filter(Boolean);
+
+    let query = supabase
+      .from('feedback')
+      .select('*')
+      .eq('is_active', true)
+      .in('status', statuses)
+      // 優先度高→新しい順（priority は文字列のため JS 側で安定ソート）
+      .order('created_at', { ascending: true });
+    if (req.query.type) query = query.eq('type', req.query.type);
+    if (req.query.app) query = query.eq('app_key', req.query.app);
+
+    const { data, error } = await query;
+    if (error) throw error;
+
+    const prRank = { high: 0, normal: 1, low: 2 };
+    const rows = (data || []).sort(
+      (a, b) => (prRank[a.priority] ?? 1) - (prRank[b.priority] ?? 1)
+    );
+
+    const md = buildFeedbackBacklog(rows, { statuses });
+    if (req.query.format === 'json') {
+      return res.json({ count: rows.length, markdown: md, items: rows });
+    }
+    res.set('Content-Type', 'text/markdown; charset=utf-8');
+    res.send(md);
+  } catch (error) {
+    console.error('Error (feedback export):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ フィードバック一覧（管理者=全件 / 一般=自分の報告のみ）
+//    ?status= ?type= ?app= で絞り込み
+app.get('/api/feedback', requireAuth, async (req, res) => {
+  try {
+    const email = String(req.user.email || '').toLowerCase();
+    const fbRole = await resolveFeedbackRole(email);
+    const isAdmin = fbRole.role === 'admin';
+
+    let query = supabase
+      .from('feedback')
+      .select('*')
+      .eq('is_active', true)
+      .order('created_at', { ascending: false });
+
+    if (!isAdmin) query = query.ilike('reporter_email', email);
+    if (req.query.status) query = query.eq('status', req.query.status);
+    if (req.query.type) query = query.eq('type', req.query.type);
+    if (req.query.app) query = query.eq('app_key', req.query.app);
+
+    const { data, error } = await query;
+    if (error) throw error;
+    res.json({ is_admin: isAdmin, items: data || [] });
+  } catch (error) {
+    console.error('Error (feedback list):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ フィードバック詳細（管理者 or 本人）
+app.get('/api/feedback/:id', requireAuth, async (req, res) => {
+  try {
+    const email = String(req.user.email || '').toLowerCase();
+    const fbRole = await resolveFeedbackRole(email);
+    const { data: f, error } = await supabase
+      .from('feedback')
+      .select('*')
+      .eq('id', req.params.id)
+      .eq('is_active', true)
+      .maybeSingle();
+    if (error) throw error;
+    if (!f) return res.status(404).json({ error: 'フィードバックが見つかりません' });
+    if (fbRole.role !== 'admin' && String(f.reporter_email || '').toLowerCase() !== email) {
+      return res.status(403).json({ error: 'この報告へのアクセス権がありません' });
+    }
+    res.json({ ...f, markdown: feedbackToMarkdown(f) });
+  } catch (error) {
+    console.error('Error (feedback detail):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ フィードバック投稿（全社員）
+app.post('/api/feedback', requireAuth, async (req, res) => {
+  try {
+    const {
+      type, title, app_key, app_label, description,
+      steps, expected, actual, severity, frequency,
+      page_url, user_agent, screen_info, app_version, screenshot_urls,
+    } = req.body;
+
+    if (!title || !String(title).trim()) {
+      return res.status(400).json({ error: 'タイトルを入力してください' });
+    }
+    const t = type === 'improvement' ? 'improvement' : 'bug';
+    const validSeverity = ['low', 'medium', 'high', 'critical'].includes(severity) ? severity : null;
+    const validFrequency = ['always', 'sometimes', 'once'].includes(frequency) ? frequency : null;
+
+    const row = {
+      type: t,
+      title: String(title).trim(),
+      app_key: app_key || 'portal',
+      app_label: app_label || null,
+      description: description || null,
+      steps: steps || null,
+      expected: expected || null,
+      actual: actual || null,
+      severity: t === 'bug' ? validSeverity : null,
+      frequency: t === 'bug' ? validFrequency : null,
+      page_url: page_url || null,
+      user_agent: user_agent || null,
+      screen_info: screen_info || null,
+      app_version: app_version || null,
+      screenshot_urls: Array.isArray(screenshot_urls) ? screenshot_urls.filter(Boolean) : [],
+      reporter_email: req.user.email || null,
+      reporter_name: req.user.name || null,
+    };
+
+    const { data, error } = await supabase.from('feedback').insert([row]).select();
+    if (error) throw error;
+    res.json(data[0]);
+  } catch (error) {
+    console.error('Error (feedback create):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ フィードバック更新（トリアージ: 管理者のみ）
+//    status / priority / admin_note / resolution_note を更新
+app.patch('/api/feedback/:id', requireAuth, requireFeedbackAdmin, async (req, res) => {
+  try {
+    const { status, priority, admin_note, resolution_note } = req.body;
+    const patch = { updated_at: new Date().toISOString() };
+    if (status !== undefined) {
+      if (!['new', 'triaged', 'in_progress', 'done', 'wont_fix'].includes(status)) {
+        return res.status(400).json({ error: '不正なステータスです' });
+      }
+      patch.status = status;
+    }
+    if (priority !== undefined) {
+      if (!['low', 'normal', 'high'].includes(priority)) {
+        return res.status(400).json({ error: '不正な優先度です' });
+      }
+      patch.priority = priority;
+    }
+    if (admin_note !== undefined) patch.admin_note = admin_note || null;
+    if (resolution_note !== undefined) patch.resolution_note = resolution_note || null;
+
+    const { data, error } = await supabase
+      .from('feedback')
+      .update(patch)
+      .eq('id', req.params.id)
+      .select();
+    if (error) throw error;
+    if (!data || data.length === 0) return res.status(404).json({ error: 'フィードバックが見つかりません' });
+    res.json(data[0]);
+  } catch (error) {
+    console.error('Error (feedback update):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ フィードバック削除（論理削除: 管理者のみ）
+app.delete('/api/feedback/:id', requireAuth, requireFeedbackAdmin, async (req, res) => {
+  try {
+    const { error } = await supabase
+      .from('feedback')
+      .update({ is_active: false, updated_at: new Date().toISOString() })
+      .eq('id', req.params.id);
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error (feedback delete):', error.message);
     res.status(500).json({ error: error.message });
   }
 });
