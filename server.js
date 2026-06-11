@@ -2809,6 +2809,91 @@ function isAudienceMatch(ann, targets, profile) {
   });
 }
 
+// ── お知らせ添付ファイル（非公開バケット + 署名URL）───────────────
+const ANNOUNCEMENT_BUCKET = 'announcement-files';
+let announcementBucketEnsured = false;
+async function ensureAnnouncementBucket() {
+  if (announcementBucketEnsured) return;
+  const { data: buckets, error } = await supabase.storage.listBuckets();
+  if (error) throw error;
+  if (!buckets?.some((b) => b.name === ANNOUNCEMENT_BUCKET)) {
+    const { error: createError } = await supabase.storage.createBucket(ANNOUNCEMENT_BUCKET, { public: false });
+    if (createError && !/exist/i.test(createError.message || '')) throw createError;
+  }
+  announcementBucketEnsured = true;
+}
+
+// ✅ お知らせ - 添付ファイルのアップロード（管理者のみ）
+//    本体作成前にフロントから呼ばれ、返した {name, path, size} を attachments 配列に積んで作成/更新時に送る。
+app.post('/api/announcements/upload-file', requireAuth, requireAnnouncementAdmin, upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'file フィールドが必要です' });
+    await ensureAnnouncementBucket();
+
+    const originalName = decodeUploadName(req.file.originalname); // 日本語ファイル名の文字化け補正
+    const ext = (originalName.split('.').pop() || 'bin').toLowerCase();
+    const path = `files/${Date.now()}-${uuidv4()}.${ext}`;
+
+    const { error: upErr } = await supabase.storage
+      .from(ANNOUNCEMENT_BUCKET)
+      .upload(path, req.file.buffer, { contentType: req.file.mimetype });
+    if (upErr) throw upErr;
+
+    res.json({ name: originalName, path, size: req.file.size });
+  } catch (error) {
+    console.error('Error (announcement upload):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ お知らせ - 添付ファイルの署名付きダウンロードURL（閲覧権限者のみ・120秒有効）
+//    ?path=... が当該お知らせの attachments に含まれるか検証してから署名する（任意パス署名を防止）。
+app.get('/api/announcements/:id/attachment-url', requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const path = req.query.path;
+    if (!path) return res.status(400).json({ error: 'path が必要です' });
+
+    const email = String(req.user.email || '').toLowerCase();
+    const annRole = await resolveAnnouncementRole(email);
+
+    const { data: ann, error } = await supabase
+      .from('announcements')
+      .select('id, target_type, attachments')
+      .eq('id', id)
+      .eq('is_active', true)
+      .maybeSingle();
+    if (error) throw error;
+    if (!ann) return res.status(404).json({ error: 'お知らせが見つかりません' });
+
+    // 閲覧権限チェック（admin はスキップ）
+    if (annRole.role !== 'admin') {
+      const { data: targets } = await supabase
+        .from('announcement_targets')
+        .select('kind, value')
+        .eq('announcement_id', id);
+      const profile = await resolveStaffProfile(email);
+      if (!isAudienceMatch(ann, targets || [], profile)) {
+        return res.status(403).json({ error: 'このお知らせへのアクセス権がありません' });
+      }
+    }
+
+    // 指定パスが本当にこのお知らせの添付かを検証
+    const att = (ann.attachments || []).find((a) => a && a.path === path);
+    if (!att) return res.status(404).json({ error: '添付ファイルが見つかりません' });
+
+    const { data, error: sErr } = await supabase.storage
+      .from(ANNOUNCEMENT_BUCKET)
+      .createSignedUrl(path, 120);
+    if (sErr) throw sErr;
+
+    res.json({ url: data.signedUrl, name: att.name });
+  } catch (error) {
+    console.error('Error (announcement attachment url):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // ✅ お知らせ一覧（GET /api/announcements）
 //    ?category=xxx  カテゴリで絞り込み
 //    ?unread_only=1 未読のみ
