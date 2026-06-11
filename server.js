@@ -361,7 +361,7 @@ app.get('/api/apps', requireAuth, async (req, res) => {
       { id: 2, key: 'employee-list', name: '社員一覧', icon: '👤', internal: true, view: 'employees' },
       { id: 7, key: 'announcements', name: 'お知らせ', icon: '📣', internal: true, view: 'announcements' },
       { id: 8, key: 'bids', name: '入札案件管理', icon: '📋', internal: true, view: 'bids', description: '入札案件の進捗・期限・金額・資料を管理' },
-      { id: 9, key: 'feedback', name: 'バグ報告・改善要望', icon: '🐞', internal: true, view: 'feedback', description: '不具合の報告や「こうしてほしい」を投稿' },
+      { id: 9, key: 'feedback', name: 'バグ報告・改善 一覧', icon: '🐞', internal: true, view: 'feedback', description: '寄せられた不具合・改善要望の確認とトリアージ' },
       { id: 3, key: 'mailer', name: 'メーラー', url: '#', icon: '📧', status: 'coming_soon' },
       { id: 4, key: 'file-manager', name: 'ファイル管理', url: '#', icon: '📁', status: 'coming_soon' },
       { id: 5, key: 'evaluation', name: '社員評価', url: '#', icon: '⭐', status: 'coming_soon' },
@@ -372,10 +372,12 @@ app.get('/api/apps', requireAuth, async (req, res) => {
     // coming_soon（プレースホルダ）は誰にでも表示する。
     const perms = await resolvePermissions(req.user.email);
     const appPerms = await resolveAppPermissions(perms.staffId);
+    const fbRole = await resolveFeedbackRole(req.user.email);
     const apps = allApps.filter((a) => {
       if (a.status === 'coming_soon') return true;
-      // バグ報告・改善要望は全社員が利用できる窓口（権限フィルタの対象外）
-      if (a.key === 'feedback') return true;
+      // バグ報告・改善の「一覧」はフィードバック管理者のみに表示する。
+      // 投稿自体は全社員が画面右下の常駐ボタンからいつでも可能（このカードとは別導線）。
+      if (a.key === 'feedback') return fbRole.role === 'admin';
       if (perms.role === 'admin') return true;
       return !!appPerms[a.key];
     });
