@@ -9,7 +9,7 @@ import multer from 'multer';
 import nodemailer from 'nodemailer';
 import { PDFDocument } from 'pdf-lib';
 import { parseEstimateFromXlsx } from './bidEstimate.js';
-import { driveUpload, driveDownload, driveConfigured, ensureFolderPath } from './googleDrive.js';
+import { driveUpload, driveDownload, driveTrash, driveConfigured, ensureFolderPath } from './googleDrive.js';
 
 dotenv.config();
 
@@ -362,6 +362,7 @@ app.get('/api/apps', requireAuth, async (req, res) => {
       { id: 7, key: 'announcements', name: 'お知らせ', icon: '📣', internal: true, view: 'announcements' },
       { id: 8, key: 'bids', name: '入札案件管理', icon: '📋', internal: true, view: 'bids', description: '入札案件の進捗・期限・金額・資料を管理' },
       { id: 9, key: 'feedback', name: 'バグ報告・改善 一覧', icon: '🐞', internal: true, view: 'feedback', description: '寄せられた不具合・改善要望の確認とトリアージ' },
+      { id: 10, key: 'documents', name: '文書回覧', icon: '🗂️', internal: true, view: 'documents', description: '回覧書類の電子化・既読/対応管理' },
       { id: 3, key: 'mailer', name: 'メーラー', url: '#', icon: '📧', status: 'coming_soon' },
       { id: 4, key: 'file-manager', name: 'ファイル管理', url: '#', icon: '📁', status: 'coming_soon' },
       { id: 5, key: 'evaluation', name: '社員評価', url: '#', icon: '⭐', status: 'coming_soon' },
@@ -1613,7 +1614,7 @@ app.put('/api/user/settings', requireAuth, async (req, res) => {
 // ============================================================
 
 // 既知のアプリキー（/api/apps と権限UIで共有）
-const APP_KEYS = ['safety-patrol', 'employee-list', 'announcements', 'mailer', 'file-manager', 'evaluation', 'dormitory'];
+const APP_KEYS = ['safety-patrol', 'employee-list', 'announcements', 'mailer', 'file-manager', 'evaluation', 'dormitory', 'documents'];
 
 // staffId のアプリ別権限を { app_key: 'member'|'admin' } のマップで返す
 async function resolveAppPermissions(staffId) {
@@ -4307,6 +4308,816 @@ app.delete('/api/feedback/:id', requireAuth, requireFeedbackAdmin, async (req, r
     res.json({ ok: true });
   } catch (error) {
     console.error('Error (feedback delete):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================================
+// ✅ 文書回覧 API
+//    - 閲覧: 宛先に一致する認証済みユーザー全員
+//    - 既読/フラグ/対応: 閲覧権限があれば可
+//    - 管理（アップロード/作成/編集/削除/到達率）: documents の admin のみ
+// ============================================================
+
+// 文書回覧アプリにおける本人ロールを解決
+//  - グローバル管理者（ADMIN_EMAILS / staff_master.app_role='admin'）は常に 'admin'
+//  - それ以外は staff_app_permissions の 'documents' を見る（admin / member / none）
+async function resolveDocRole(email) {
+  const perms = await resolvePermissions(email); // { role, staffId }
+  if (perms.role === 'admin') return { role: 'admin', staffId: perms.staffId };
+  let level = null;
+  if (perms.staffId) {
+    const { data } = await supabase
+      .from('staff_app_permissions')
+      .select('access_level')
+      .eq('staff_id', perms.staffId)
+      .eq('app_key', 'documents')
+      .maybeSingle();
+    level = data?.access_level || null;
+  }
+  const role = level === 'admin' ? 'admin' : level ? 'member' : 'none';
+  return { role, staffId: perms.staffId };
+}
+
+// 文書回覧管理者のみ許可するミドルウェア（要 requireAuth 後段）
+async function requireDocAdmin(req, res, next) {
+  try {
+    const r = await resolveDocRole(req.user?.email);
+    if (r.role !== 'admin') {
+      return res.status(403).json({ error: 'この操作は文書回覧の管理者のみ可能です' });
+    }
+    req.docRole = r;
+    next();
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+}
+
+// ── ストレージ抽象（証明書と同型） ────────────────────────────────
+
+// 文書回覧の原本を入れる Supabase Storage バケット（非公開）。
+const CIRCULAR_BUCKET = 'circular-files';
+let circularBucketEnsured = false;
+async function ensureCircularBucket() {
+  if (circularBucketEnsured) return;
+  const { data: buckets, error } = await supabase.storage.listBuckets();
+  if (error) throw error;
+  if (!buckets?.some((b) => b.name === CIRCULAR_BUCKET)) {
+    const { error: createError } = await supabase.storage.createBucket(CIRCULAR_BUCKET, { public: false });
+    if (createError && !/exist/i.test(createError.message || '')) throw createError;
+  }
+  circularBucketEnsured = true;
+}
+
+// 保存先の方針: 'drive'（既定）で共有ドライブ、それ以外は Supabase。
+// Drive 連携の環境変数が揃っていない場合は安全に Supabase へフォールバック。
+const CIRCULAR_STORAGE = (process.env.CIRCULAR_STORAGE || 'drive').toLowerCase();
+
+// 回覧書類ファイルを方針に従って保存し、DBの original_ref に入れる「参照」を返す。
+//   Drive   : "drive:<fileId>"（接頭辞で見分ける）。segments があれば サブフォルダへ自動格納。
+//   Supabase: バケット内のパス（例 "docs/xxx.pdf"）
+async function storeCircular(pathKey, buffer, mimeType, segments) {
+  if (CIRCULAR_STORAGE === 'drive' && driveConfigured()) {
+    const folderId = segments && segments.length ? await ensureFolderPath(segments) : undefined;
+    const name = String(pathKey).split('/').pop();
+    const fileId = await driveUpload({ name, buffer, mimeType, folderId });
+    return `drive:${fileId}`;
+  }
+  await ensureCircularBucket();
+  const { error } = await supabase.storage.from(CIRCULAR_BUCKET).upload(pathKey, buffer, { contentType: mimeType, upsert: true });
+  if (error) throw error;
+  return pathKey;
+}
+
+// 回覧書類を一時表示するための URL（既定 1 時間）。
+//   "drive:" 参照 → 署名トークン付きの API プロキシURL（/api/circular-file）
+//   それ以外      → Supabase の署名付きURL
+async function circularSignedUrl(ref, expiresIn = 3600) {
+  if (!ref) return null;
+  if (String(ref).startsWith('drive:')) {
+    const fileId = String(ref).slice('drive:'.length);
+    const token = jwt.sign({ fileId, kind: 'circular' }, JWT_SECRET, { expiresIn });
+    const base = process.env.PUBLIC_API_URL || 'https://portal-api-hhlx.onrender.com';
+    return `${base}/api/circular-file?t=${encodeURIComponent(token)}`;
+  }
+  const { data } = await supabase.storage.from(CIRCULAR_BUCKET).createSignedUrl(ref, expiresIn);
+  return data?.signedUrl || null;
+}
+
+// 署名トークンで保護された回覧書類プロキシ。Drive 上の非公開ファイルを API 経由で配信する。
+app.get('/api/circular-file', async (req, res) => {
+  try {
+    const token = req.query.t;
+    if (!token) return res.status(400).send('missing token');
+    let payload;
+    try {
+      payload = jwt.verify(token, JWT_SECRET);
+    } catch {
+      return res.status(401).send('invalid or expired token');
+    }
+    if (payload.kind !== 'circular' || !payload.fileId) return res.status(400).send('bad token');
+    const { buffer, contentType } = await driveDownload(payload.fileId);
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('Cache-Control', 'private, max-age=600');
+    res.send(buffer);
+  } catch (error) {
+    console.error('Error (circular-file proxy):', error.message);
+    res.status(error.status || 500).send(error.message);
+  }
+});
+
+// ── Gemini による束ねPDF分割解析 ─────────────────────────────────
+
+// まとめてスキャンした回覧書類PDF/画像を Gemini に1回渡し、
+// 書類の境界と内容を { start_page, end_page, doc_type, sender, title, ocr_text } の配列で返す。
+async function analyzeCircularBatch(buffer, mimeType) {
+  if (!GEMINI_API_KEY) {
+    const e = new Error('GEMINI_API_KEY が未設定です。Render の環境変数に設定してください。');
+    e.status = 503;
+    throw e;
+  }
+
+  const prompt = [
+    'これはまとめてスキャンした社内回覧書類のPDF/画像です。',
+    '書類の境界を判定し、各書類を1要素として返してください。',
+    '1枚の用紙が1つの書類に対応することが多いですが、複数ページにわたる書類もあります。',
+    '',
+    '【フィールド説明】',
+    '- start_page: この書類が始まるページ番号（1始まり）',
+    '- end_page:   この書類が終わるページ番号（1始まり。1ページのみなら start_page と同値）',
+    '- doc_type:   書類の種別。次のいずれか1つ: 通達 / 案内 / 依頼 / 報告 / その他',
+    '- sender:     発信元・差出人（機関名・部署名。読めなければ空文字）',
+    '- title:      書類のタイトル・件名（書かれているタイトルをそのまま読み取る。読めなければ空文字）',
+    '- ocr_text:   この書類に書かれている本文テキスト全体（検索インデックス用。読み取れる範囲で。改行は \\n で）',
+    '',
+    '読み取れない項目は空文字にしてください。推測で埋めないでください。',
+  ].join('\n');
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+  const body = {
+    contents: [{
+      parts: [
+        { text: prompt },
+        { inlineData: { mimeType: mimeType || 'application/pdf', data: buffer.toString('base64') } },
+      ],
+    }],
+    generationConfig: {
+      temperature: 0,
+      responseMimeType: 'application/json',
+      maxOutputTokens: 32768,
+      responseSchema: {
+        type: 'ARRAY',
+        items: {
+          type: 'OBJECT',
+          properties: {
+            start_page: { type: 'INTEGER' },
+            end_page:   { type: 'INTEGER' },
+            doc_type:   { type: 'STRING', enum: ['通達', '案内', '依頼', '報告', 'その他'] },
+            sender:     { type: 'STRING' },
+            title:      { type: 'STRING' },
+            ocr_text:   { type: 'STRING' },
+          },
+          required: ['start_page', 'end_page', 'title'],
+        },
+      },
+    },
+  };
+
+  const resp = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!resp.ok) {
+    const t = await resp.text();
+    const e = new Error(`Gemini API エラー (${resp.status}): ${t.slice(0, 300)}`);
+    e.status = 502;
+    throw e;
+  }
+  const json = await resp.json();
+  const cand = json?.candidates?.[0];
+  if (cand?.finishReason === 'MAX_TOKENS') {
+    const e = new Error('PDFの情報量が多く、AIが読み切れませんでした。書類を分割してアップロードしてください。');
+    e.status = 413;
+    throw e;
+  }
+  const text = cand?.content?.parts?.[0]?.text;
+  if (!text) throw new Error('Gemini から有効な応答が得られませんでした');
+  let parsed;
+  try { parsed = JSON.parse(text); } catch { throw new Error('Gemini 応答の解析に失敗しました'); }
+  if (!Array.isArray(parsed)) throw new Error('Gemini 応答が配列形式ではありません');
+  return parsed;
+}
+
+// ── pdf-lib によるページ範囲分割 ─────────────────────────────────
+
+// buffer（PDFバイト列）から startPage〜endPage（1始まり）を切り出して新しい PDF Buffer を返す。
+// 画像ファイルはそのまま返す（mime が image/* の場合はスキップを呼び出し側で判断）。
+async function splitPdfByRange(buffer, startPage, endPage) {
+  const srcDoc = await PDFDocument.load(buffer);
+  const total = srcDoc.getPageCount();
+  // ページ番号を 0 始まりにクランプ
+  const from = Math.max(0, (startPage || 1) - 1);
+  const to   = Math.min(total - 1, (endPage || total) - 1);
+  const newDoc = await PDFDocument.create();
+  const indices = [];
+  for (let i = from; i <= to; i++) indices.push(i);
+  const copied = await newDoc.copyPages(srcDoc, indices);
+  for (const page of copied) newDoc.addPage(page);
+  const bytes = await newDoc.save();
+  return Buffer.from(bytes);
+}
+
+// ── 文書回覧の宛先一致チェック（isAudienceMatch の文書回覧版） ────
+
+// targets: circular_targets の配列 [{kind, value}]
+// profile: { staffId, company, department } + email
+function isCircularAudienceMatch(doc, targets, profile, email) {
+  if (doc.target_type === 'all') return true;
+  const lowerEmail = String(email || '').toLowerCase();
+  return (targets || []).some((t) => {
+    if (t.kind === 'company') return t.value === profile.company;
+    if (t.kind === 'department') return t.value === profile.department;
+    if (t.kind === 'user') return String(t.value || '').toLowerCase() === lowerEmail;
+    return false;
+  });
+}
+
+// ── API エンドポイント ──────────────────────────────────────────
+
+// ✅ 文書回覧 - バッチ解析（POST /api/circulars/analyze）※ 管理者のみ
+//    ファイルを受領してGeminiに掛け、書類境界の解析結果を返す（DBには保存しない）。
+app.post('/api/circulars/analyze', requireAuth, requireDocAdmin, upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'file フィールドが必要です' });
+
+    const buffer = req.file.buffer;
+    const mimeType = req.file.mimetype;
+    const isImage = mimeType.startsWith('image/');
+
+    // 一時領域に保存して batch_ref を取得
+    const year = new Date().getFullYear();
+    const tmpName = `tmp_${Date.now()}_${uuidv4()}.${isImage ? mimeType.split('/')[1] : 'pdf'}`;
+    const tmpRef = await storeCircular(`tmp/${tmpName}`, buffer, mimeType, ['文書回覧', '_一時']);
+
+    let splits;
+    if (isImage) {
+      // 画像は 1 書類扱い
+      splits = [{ start_page: 1, end_page: 1, doc_type: 'その他', sender: '', title: '', ocr_text: '' }];
+    } else {
+      splits = await analyzeCircularBatch(buffer, mimeType);
+    }
+
+    // PDF のページ数を取得（pdf-lib で計算）
+    let page_count = 1;
+    if (!isImage) {
+      try {
+        const srcDoc = await PDFDocument.load(buffer);
+        page_count = srcDoc.getPageCount();
+      } catch {
+        page_count = splits.length;
+      }
+    }
+
+    res.json({ batch_ref: tmpRef, page_count, splits });
+  } catch (error) {
+    console.error('Error (circulars analyze):', error.message);
+    res.status(error.status || 500).json({ error: error.message });
+  }
+});
+
+// ✅ 文書回覧 - 一括登録（POST /api/circulars）※ 管理者のみ
+//    analyze で得た batch_ref と編集済み splits を受け取り、各書類を分割・保存・DB登録する。
+app.post('/api/circulars', requireAuth, requireDocAdmin, async (req, res) => {
+  try {
+    const b = req.body || {};
+    const { batch_ref, documents } = b;
+    if (!batch_ref) return res.status(400).json({ error: 'batch_ref は必須です' });
+    if (!Array.isArray(documents) || documents.length === 0) return res.status(400).json({ error: 'documents は空にできません' });
+
+    // バッチIDを生成（同一アップロードを束ねる）
+    const batch_id = uuidv4();
+
+    // 原本バッファを Drive/Supabase から取得
+    let srcBuffer = null;
+    let srcMime = 'application/pdf';
+    if (String(batch_ref).startsWith('drive:')) {
+      const fileId = String(batch_ref).slice('drive:'.length);
+      const dl = await driveDownload(fileId);
+      srcBuffer = dl.buffer;
+      srcMime = dl.contentType || 'application/pdf';
+    } else {
+      // Supabase バケットからダウンロード
+      const { data, error: dlErr } = await supabase.storage.from(CIRCULAR_BUCKET).download(batch_ref);
+      if (dlErr) throw dlErr;
+      srcBuffer = Buffer.from(await data.arrayBuffer());
+    }
+
+    const isImage = srcMime.startsWith('image/');
+    const year = String(new Date().getFullYear());
+    const createdIds = [];
+
+    for (const doc of documents) {
+      const {
+        start_page = 1, end_page = 1, title, doc_type = 'その他',
+        sender = '', ocr_text = '', target_type = 'all', targets = [],
+      } = doc;
+
+      if (!title?.trim()) continue; // タイトル無しはスキップ
+
+      // ページ分割（画像はそのまま）
+      let docBuffer;
+      let docMime;
+      let docSize;
+      if (isImage) {
+        docBuffer = srcBuffer;
+        docMime = srcMime;
+        docSize = srcBuffer.length;
+      } else {
+        docBuffer = await splitPdfByRange(srcBuffer, start_page, end_page);
+        docMime = 'application/pdf';
+        docSize = docBuffer.length;
+      }
+
+      // ファイル保存
+      const ext = isImage ? (srcMime.split('/')[1] || 'jpg') : 'pdf';
+      const fileName = `${Date.now()}_${uuidv4()}.${ext}`;
+      const docRef = await storeCircular(
+        `docs/${year}/${fileName}`,
+        docBuffer,
+        docMime,
+        ['文書回覧', year, sanitizeSeg(doc_type || 'その他')],
+      );
+
+      // circular_documents 挿入
+      const { data: inserted, error: insErr } = await supabase
+        .from('circular_documents')
+        .insert([{
+          batch_id,
+          title: title.trim(),
+          doc_type: doc_type || null,
+          sender: sender || null,
+          original_ref: docRef,
+          mime: docMime,
+          size: docSize,
+          page_from: isImage ? null : start_page,
+          page_to:   isImage ? null : end_page,
+          ocr_text:  ocr_text || null,
+          target_type: ['all', 'company', 'department', 'user'].includes(target_type) ? target_type : 'all',
+          created_by: req.user.email,
+        }])
+        .select('id');
+      if (insErr) throw insErr;
+      const docId = inserted[0].id;
+      createdIds.push(docId);
+
+      // 宛先 targets 挿入（target_type !== 'all' の場合）
+      const validTargets = (targets || []).filter(
+        (t) => t && ['company', 'department', 'user'].includes(t.kind) && t.value,
+      );
+      if (validTargets.length > 0) {
+        const targetRows = validTargets.map((t) => ({ document_id: docId, kind: t.kind, value: t.value }));
+        const { error: tErr } = await supabase.from('circular_targets').insert(targetRows);
+        if (tErr) throw tErr;
+      }
+    }
+
+    // 一時ファイルを削除（失敗しても無視）
+    try {
+      if (String(batch_ref).startsWith('drive:')) {
+        await driveTrash(String(batch_ref).slice('drive:'.length));
+      } else {
+        await supabase.storage.from(CIRCULAR_BUCKET).remove([batch_ref]);
+      }
+    } catch {
+      // 一時ファイル削除の失敗は無視
+    }
+
+    res.json({ created: createdIds.length, batch_id });
+  } catch (error) {
+    console.error('Error (circulars create):', error.message);
+    res.status(error.status || 500).json({ error: error.message });
+  }
+});
+
+// ✅ 文書回覧 一覧（GET /api/circulars）
+//    ?unread_only=1  未読のみ
+//    ?action=要対応   フラグ絞り込み
+//    ?manage=1       管理者用: 宛先フィルタなし・全件
+app.get('/api/circulars', requireAuth, async (req, res) => {
+  try {
+    const email = String(req.user.email || '').toLowerCase();
+    const docRole = await resolveDocRole(email);
+    const profile = await resolveStaffProfile(email);
+    const isManage = req.query.manage === '1' && docRole.role === 'admin';
+
+    // 書類本体を取得（activeのみ）
+    const { data: rows, error } = await supabase
+      .from('circular_documents')
+      .select('*')
+      .eq('status', 'active')
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+    const docs = rows || [];
+
+    // 宛先を一括取得
+    const docIds = docs.map((d) => d.id);
+    let targetsMap = {};
+    if (docIds.length > 0) {
+      const { data: tRows, error: tErr } = await supabase
+        .from('circular_targets')
+        .select('document_id, kind, value')
+        .in('document_id', docIds);
+      if (tErr) throw tErr;
+      for (const t of tRows || []) {
+        (targetsMap[t.document_id] ||= []).push(t);
+      }
+    }
+
+    // 自分のレスポンスを一括取得
+    let responseMap = {};
+    if (docIds.length > 0) {
+      const { data: rRows, error: rErr } = await supabase
+        .from('circular_responses')
+        .select('document_id, read_at, action_label, action_status')
+        .eq('user_email', email)
+        .in('document_id', docIds);
+      if (rErr) throw rErr;
+      for (const r of rRows || []) responseMap[r.document_id] = r;
+    }
+
+    // フィルタ・整形
+    const result = [];
+    for (const doc of docs) {
+      // 宛先フィルタ（管理モードでない場合）
+      if (!isManage && !isCircularAudienceMatch(doc, targetsMap[doc.id] || [], profile, email)) continue;
+
+      const resp = responseMap[doc.id] || null;
+      const is_read = !!resp?.read_at;
+
+      // unread_only フィルタ
+      if (req.query.unread_only === '1' && is_read) continue;
+      // action フィルタ
+      if (req.query.action && resp?.action_label !== req.query.action) continue;
+
+      result.push({
+        id: doc.id,
+        title: doc.title,
+        doc_type: doc.doc_type,
+        sender: doc.sender,
+        summary: doc.summary,
+        created_at: doc.created_at,
+        status: doc.status,
+        target_type: doc.target_type,
+        read: is_read,
+        action_label: resp?.action_label || null,
+        action_status: resp?.action_status || null,
+      });
+    }
+
+    res.json(result);
+  } catch (error) {
+    console.error('Error (circulars list):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 文書回覧 インボックスカウント（GET /api/circulars/inbox-count）← 固定パスのため :id より前に定義
+app.get('/api/circulars/inbox-count', requireAuth, async (req, res) => {
+  try {
+    const email = String(req.user.email || '').toLowerCase();
+    const profile = await resolveStaffProfile(email);
+
+    // active な書類を全取得
+    const { data: rows, error } = await supabase
+      .from('circular_documents')
+      .select('id, target_type')
+      .eq('status', 'active');
+    if (error) throw error;
+    const docs = rows || [];
+
+    const docIds = docs.map((d) => d.id);
+    let targetsMap = {};
+    if (docIds.length > 0) {
+      const { data: tRows, error: tErr } = await supabase
+        .from('circular_targets')
+        .select('document_id, kind, value')
+        .in('document_id', docIds);
+      if (tErr) throw tErr;
+      for (const t of tRows || []) {
+        (targetsMap[t.document_id] ||= []).push(t);
+      }
+    }
+
+    // 自分のレスポンスを取得
+    let responseMap = {};
+    if (docIds.length > 0) {
+      const { data: rRows, error: rErr } = await supabase
+        .from('circular_responses')
+        .select('document_id, read_at, action_label, action_status')
+        .eq('user_email', email)
+        .in('document_id', docIds);
+      if (rErr) throw rErr;
+      for (const r of rRows || []) responseMap[r.document_id] = r;
+    }
+
+    let unread = 0;
+    let action_required_pending = 0;
+    for (const doc of docs) {
+      if (!isCircularAudienceMatch(doc, targetsMap[doc.id] || [], profile, email)) continue;
+      const resp = responseMap[doc.id] || null;
+      if (!resp?.read_at) unread++;
+      if (resp?.action_label === '要対応' && resp?.action_status !== '対応済') action_required_pending++;
+    }
+
+    res.json({ unread, action_required_pending });
+  } catch (error) {
+    console.error('Error (circulars inbox-count):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 文書回覧 詳細（GET /api/circulars/:id）
+//    宛先チェック後、詳細データ・署名URL・自分の対応状況を返す。
+//    同時に当該ユーザーの read_at を未設定なら now() で自動セット（自動既読）。
+app.get('/api/circulars/:id', requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const email = String(req.user.email || '').toLowerCase();
+    const docRole = await resolveDocRole(email);
+    const profile = await resolveStaffProfile(email);
+
+    const { data: doc, error } = await supabase
+      .from('circular_documents')
+      .select('*')
+      .eq('id', id)
+      .eq('status', 'active')
+      .maybeSingle();
+    if (error) throw error;
+    if (!doc) return res.status(404).json({ error: '書類が見つかりません' });
+
+    const { data: targets, error: tErr } = await supabase
+      .from('circular_targets')
+      .select('id, kind, value')
+      .eq('document_id', id);
+    if (tErr) throw tErr;
+
+    // 閲覧権限チェック（admin はスキップ）
+    if (docRole.role !== 'admin') {
+      if (!isCircularAudienceMatch(doc, targets || [], profile, email)) {
+        return res.status(403).json({ error: 'この書類へのアクセス権がありません' });
+      }
+    }
+
+    // 自動既読: read_at が null の場合のみ upsert
+    const now = new Date().toISOString();
+    const { data: existingResp } = await supabase
+      .from('circular_responses')
+      .select('id, read_at, action_label, action_status, note')
+      .eq('document_id', Number(id))
+      .eq('user_email', email)
+      .maybeSingle();
+
+    if (!existingResp?.read_at) {
+      await supabase
+        .from('circular_responses')
+        .upsert(
+          {
+            document_id: Number(id),
+            user_email: email,
+            read_at: now,
+            updated_at: now,
+            ...(existingResp ? {} : { created_at: now }),
+          },
+          { onConflict: 'document_id,user_email' },
+        );
+    }
+
+    const original_url = await circularSignedUrl(doc.original_ref);
+
+    res.json({
+      ...doc,
+      targets: targets || [],
+      original_url,
+      my: {
+        read_at: existingResp?.read_at || now,
+        action_label: existingResp?.action_label || null,
+        action_status: existingResp?.action_status || null,
+        note: existingResp?.note || null,
+      },
+    });
+  } catch (error) {
+    console.error('Error (circular detail):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 文書回覧 フラグ設定（POST /api/circulars/:id/flag）
+//    action_label（要対応 / 重要）と任意メモを設定する。
+app.post('/api/circulars/:id/flag', requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const email = String(req.user.email || '').toLowerCase();
+    const { action_label, note } = req.body || {};
+
+    if (!['要対応', '重要'].includes(action_label)) {
+      return res.status(400).json({ error: 'action_label は「要対応」または「重要」を指定してください' });
+    }
+
+    const now = new Date().toISOString();
+    // 要対応 かつ action_status 未設定なら '未対応' をセット
+    const { data: existing } = await supabase
+      .from('circular_responses')
+      .select('action_status, read_at')
+      .eq('document_id', Number(id))
+      .eq('user_email', email)
+      .maybeSingle();
+
+    const upsertData = {
+      document_id: Number(id),
+      user_email: email,
+      action_label,
+      updated_at: now,
+      read_at: existing?.read_at || now,
+    };
+    if (note !== undefined) upsertData.note = note || null;
+    if (action_label === '要対応' && !existing?.action_status) {
+      upsertData.action_status = '未対応';
+    }
+
+    const { error } = await supabase
+      .from('circular_responses')
+      .upsert(upsertData, { onConflict: 'document_id,user_email' });
+    if (error) throw error;
+
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error (circular flag):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 文書回覧 対応完了（POST /api/circulars/:id/action-done）
+//    自分の action_status を '対応済' に更新する。
+app.post('/api/circulars/:id/action-done', requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const email = String(req.user.email || '').toLowerCase();
+    const now = new Date().toISOString();
+
+    const { data: existing } = await supabase
+      .from('circular_responses')
+      .select('read_at')
+      .eq('document_id', Number(id))
+      .eq('user_email', email)
+      .maybeSingle();
+
+    const { error } = await supabase
+      .from('circular_responses')
+      .upsert(
+        {
+          document_id: Number(id),
+          user_email: email,
+          action_status: '対応済',
+          read_at: existing?.read_at || now,
+          updated_at: now,
+        },
+        { onConflict: 'document_id,user_email' },
+      );
+    if (error) throw error;
+
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error (circular action-done):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 文書回覧 到達率（GET /api/circulars/:id/responses）※ 管理者のみ
+app.get('/api/circulars/:id/responses', requireAuth, requireDocAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const { data: doc, error: docErr } = await supabase
+      .from('circular_documents')
+      .select('id, target_type')
+      .eq('id', id)
+      .maybeSingle();
+    if (docErr) throw docErr;
+    if (!doc) return res.status(404).json({ error: '書類が見つかりません' });
+
+    const { data: responses, error: rErr } = await supabase
+      .from('circular_responses')
+      .select('user_email, read_at, action_label, action_status')
+      .eq('document_id', id);
+    if (rErr) throw rErr;
+
+    const respList = responses || [];
+    const summary = {
+      read: respList.filter((r) => r.read_at).length,
+      要対応: respList.filter((r) => r.action_label === '要対応').length,
+      重要:   respList.filter((r) => r.action_label === '重要').length,
+      対応済: respList.filter((r) => r.action_status === '対応済').length,
+    };
+
+    res.json({ document_id: Number(id), responses: respList, summary });
+  } catch (error) {
+    console.error('Error (circular responses):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 文書回覧 更新（PUT /api/circulars/:id）※ 管理者のみ
+//    title / doc_type / sender / target_type / targets / status を更新する。
+app.put('/api/circulars/:id', requireAuth, requireDocAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const b = req.body || {};
+
+    const { data: existing, error: existErr } = await supabase
+      .from('circular_documents')
+      .select('id, target_type')
+      .eq('id', id)
+      .maybeSingle();
+    if (existErr) throw existErr;
+    if (!existing) return res.status(404).json({ error: '書類が見つかりません' });
+
+    const allowed = ['title', 'doc_type', 'sender', 'target_type', 'status', 'summary'];
+    const patch = { updated_at: new Date().toISOString() };
+    for (const k of allowed) {
+      if (b[k] !== undefined) patch[k] = b[k];
+    }
+    if (patch.target_type !== undefined && !['all', 'company', 'department', 'user'].includes(patch.target_type)) {
+      patch.target_type = 'all';
+    }
+    if (patch.status !== undefined && !['active', 'archived'].includes(patch.status)) {
+      delete patch.status;
+    }
+
+    const { data, error } = await supabase
+      .from('circular_documents')
+      .update(patch)
+      .eq('id', id)
+      .select();
+    if (error) throw error;
+    const updated = data[0];
+
+    // targets が渡されたら入れ替え
+    if (b.targets !== undefined) {
+      await supabase.from('circular_targets').delete().eq('document_id', id);
+      const newTargetType = updated.target_type;
+      if (newTargetType !== 'all' && Array.isArray(b.targets) && b.targets.length > 0) {
+        const targetRows = b.targets
+          .filter((t) => t && ['company', 'department', 'user'].includes(t.kind) && t.value)
+          .map((t) => ({ document_id: updated.id, kind: t.kind, value: t.value }));
+        if (targetRows.length > 0) {
+          const { error: tErr } = await supabase.from('circular_targets').insert(targetRows);
+          if (tErr) throw tErr;
+        }
+      }
+    }
+
+    res.json(updated);
+  } catch (error) {
+    console.error('Error (circular update):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 文書回覧 削除（DELETE /api/circulars/:id）※ 管理者のみ
+//    原本ファイルを削除してからレコードを削除する。
+app.delete('/api/circulars/:id', requireAuth, requireDocAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const { data: doc, error: docErr } = await supabase
+      .from('circular_documents')
+      .select('id, original_ref')
+      .eq('id', id)
+      .maybeSingle();
+    if (docErr) throw docErr;
+    if (!doc) return res.status(404).json({ error: '書類が見つかりません' });
+
+    // 原本ファイルを削除
+    if (doc.original_ref) {
+      try {
+        if (String(doc.original_ref).startsWith('drive:')) {
+          await driveTrash(String(doc.original_ref).slice('drive:'.length));
+        } else {
+          await supabase.storage.from(CIRCULAR_BUCKET).remove([doc.original_ref]);
+        }
+      } catch (e) {
+        console.warn('circular ファイル削除失敗（無視）:', e.message);
+      }
+    }
+
+    // レコード削除（circular_targets / circular_responses は CASCADE で自動削除）
+    const { error } = await supabase.from('circular_documents').delete().eq('id', id);
+    if (error) throw error;
+
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error (circular delete):', error.message);
     res.status(500).json({ error: error.message });
   }
 });
