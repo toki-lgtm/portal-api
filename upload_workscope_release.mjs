@@ -43,7 +43,7 @@ async function main() {
       version: VERSION,
       file_path: path,
       file_size: buf.length,
-      notes: '薄いロガー版（社員PCは取得＋G:送信のみ、処理は管理者PC）',
+      notes: process.argv[4] || null,
       uploaded_by: 'toki@nakahara131.co.jp',
     })
     .select()
