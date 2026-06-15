@@ -1679,7 +1679,7 @@ async function requireEmployeeAdmin(req, res, next) {
 //    入札担当のみが使う前提のため、閲覧/編集でロールを分けない（行があれば全操作可）。
 async function resolveBidRole(email) {
   const perms = await resolvePermissions(email); // { role, staffId }
-  if (perms.role === 'admin') return { access: true, staffId: perms.staffId, globalAdmin: true };
+  if (perms.role === 'admin') return { role: 'admin', access: true, staffId: perms.staffId, globalAdmin: true };
   let level = null;
   if (perms.staffId) {
     const { data } = await supabase
@@ -1690,7 +1690,8 @@ async function resolveBidRole(email) {
       .maybeSingle();
     level = data?.access_level || null;
   }
-  return { access: !!level, staffId: perms.staffId, globalAdmin: false };
+  const role = level === 'admin' ? 'admin' : level ? 'member' : 'none';
+  return { role, access: role !== 'none', staffId: perms.staffId, globalAdmin: false };
 }
 
 // 入札案件管理のアクセス権（行があれば許可）
@@ -1698,6 +1699,18 @@ async function requireBidAccess(req, res, next) {
   try {
     const r = await resolveBidRole(req.user.email);
     if (!r.access) return res.status(403).json({ error: '入札案件管理へのアクセス権がありません' });
+    req.bidRole = r;
+    next();
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+}
+
+// 入札案件管理の管理者のみ許可（既存案件の編集・削除）。要 requireAuth 後段。
+async function requireBidAdmin(req, res, next) {
+  try {
+    const r = await resolveBidRole(req.user.email);
+    if (r.role !== 'admin') return res.status(403).json({ error: 'この操作は入札案件管理の管理者のみ可能です' });
     req.bidRole = r;
     next();
   } catch (e) {
@@ -3747,7 +3760,7 @@ app.post('/api/bids', requireAuth, requireBidAccess, async (req, res) => {
 });
 
 // ✅ 入札 - 更新（ステータス変更時は履歴を自動追記）
-app.put('/api/bids/:id', requireAuth, requireBidAccess, async (req, res) => {
+app.put('/api/bids/:id', requireAuth, requireBidAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     const payload = pickBidFields(req.body);
@@ -3792,7 +3805,7 @@ app.put('/api/bids/:id', requireAuth, requireBidAccess, async (req, res) => {
 });
 
 // ✅ 入札 - 論理削除
-app.delete('/api/bids/:id', requireAuth, requireBidAccess, async (req, res) => {
+app.delete('/api/bids/:id', requireAuth, requireBidAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     const { data, error } = await supabase
@@ -3893,7 +3906,7 @@ app.get('/api/bids/:id/documents/:docId/url', requireAuth, requireBidAccess, asy
 });
 
 // ✅ 入札 - 資料削除（Storage実体 + メタ）
-app.delete('/api/bids/:id/documents/:docId', requireAuth, requireBidAccess, async (req, res) => {
+app.delete('/api/bids/:id/documents/:docId', requireAuth, requireBidAdmin, async (req, res) => {
   try {
     const { docId } = req.params;
     const { data: doc } = await supabase
