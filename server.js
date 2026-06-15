@@ -362,7 +362,8 @@ app.get('/api/apps', requireAuth, async (req, res) => {
       { id: 7, key: 'announcements', name: 'お知らせ', icon: '📣', internal: true, view: 'announcements' },
       { id: 8, key: 'bids', name: '入札案件管理', icon: '📋', internal: true, view: 'bids', description: '入札案件の進捗・期限・金額・資料を管理' },
       { id: 9, key: 'feedback', name: 'バグ報告・改善 一覧', icon: '🐞', internal: true, view: 'feedback', description: '寄せられた不具合・改善要望の確認とトリアージ' },
-      { id: 10, key: 'documents', name: '文書回覧', icon: '🗂️', internal: true, view: 'documents', description: '回覧書類の電子化・既読/対応管理' }
+      { id: 10, key: 'documents', name: '文書回覧', icon: '🗂️', internal: true, view: 'documents', description: '回覧書類の電子化・既読/対応管理' },
+      { id: 11, key: 'workscope', name: 'WorkScope 導入', icon: '🖥️', internal: true, view: 'workscope', description: '業務記録ツールの導入（インストーラーのダウンロード）' }
     ];
 
     // 権限フィルタ: グローバル管理者は全件。それ以外は app_permissions に行があるアプリのみ。
@@ -375,6 +376,8 @@ app.get('/api/apps', requireAuth, async (req, res) => {
       // バグ報告・改善の「一覧」はフィードバック管理者のみに表示する。
       // 投稿自体は全社員が画面右下の常駐ボタンからいつでも可能（このカードとは別導線）。
       if (a.key === 'feedback') return fbRole.role === 'admin';
+      // WorkScope 導入は全社員に配布したいので常に表示する（管理用UIは画面内で admin のみ表示）。
+      if (a.key === 'workscope') return true;
       if (perms.role === 'admin') return true;
       return !!appPerms[a.key];
     });
@@ -2900,6 +2903,191 @@ app.get('/api/announcements/:id/attachment-url', requireAuth, async (req, res) =
     res.json({ url: data.signedUrl, name: att.name });
   } catch (error) {
     console.error('Error (announcement attachment url):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ── WorkScope 配布（インストーラー配布 + 利用ログ）──────────────────
+//    ポータルを WorkScope（PC業務記録ツール）の配布入口にする。
+//    インストーラーzipは非公開バケット 'app-downloads' に置き、署名URLで配布する。
+//    現行版は workscope_release の最新行。ダウンロードは workscope_downloads に記録する。
+const APP_DOWNLOADS_BUCKET = 'app-downloads';
+let appDownloadsBucketEnsured = false;
+async function ensureAppDownloadsBucket() {
+  if (appDownloadsBucketEnsured) return;
+  const { data: buckets, error } = await supabase.storage.listBuckets();
+  if (error) throw error;
+  if (!buckets?.some((b) => b.name === APP_DOWNLOADS_BUCKET)) {
+    const { error: createError } = await supabase.storage.createBucket(APP_DOWNLOADS_BUCKET, { public: false });
+    if (createError && !/exist/i.test(createError.message || '')) throw createError;
+  }
+  appDownloadsBucketEnsured = true;
+}
+
+// 現行（最新）の WorkScope リリースを1件返すヘルパー（無ければ null）
+async function getLatestWorkscopeRelease() {
+  const { data, error } = await supabase
+    .from('workscope_release')
+    .select('id, version, file_path, file_size, notes, uploaded_at')
+    .order('uploaded_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (error) throw error;
+  return data || null;
+}
+
+// ✅ WorkScope - 現行インストーラーの情報（要認証・全社員）
+//    フロントの導入ページが配布有無・版・サイズ・自分の前回DL日時を表示するために使う。
+app.get('/api/downloads/workscope/info', requireAuth, async (req, res) => {
+  try {
+    const release = await getLatestWorkscopeRelease();
+    let myLast = null;
+    try {
+      const { data } = await supabase
+        .from('workscope_downloads')
+        .select('created_at, version')
+        .ilike('user_email', String(req.user.email || '').toLowerCase())
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      myLast = data || null;
+    } catch (_) { /* ログ未取得でも情報表示は妨げない */ }
+
+    res.json({
+      available: !!release,
+      version: release?.version || null,
+      file_size: release?.file_size || null,
+      uploaded_at: release?.uploaded_at || null,
+      notes: release?.notes || null,
+      my_last_download_at: myLast?.created_at || null,
+    });
+  } catch (error) {
+    console.error('Error (workscope info):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ WorkScope - インストーラーのダウンロード（要認証・全社員）
+//    署名URLを発行しつつ、誰が導入したかを workscope_downloads に記録する。
+app.get('/api/downloads/workscope/file', requireAuth, async (req, res) => {
+  try {
+    const release = await getLatestWorkscopeRelease();
+    if (!release) return res.status(404).json({ error: 'インストーラーがまだ登録されていません' });
+
+    const { data, error: sErr } = await supabase.storage
+      .from(APP_DOWNLOADS_BUCKET)
+      .createSignedUrl(release.file_path, 300); // 5分間有効
+    if (sErr) throw sErr;
+
+    // 利用ログを記録（失敗してもダウンロード自体は妨げない）
+    try {
+      const perms = await resolvePermissions(req.user.email);
+      const fwd = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+      await supabase.from('workscope_downloads').insert({
+        user_email: req.user.email,
+        user_name: req.user.name,
+        staff_id: perms.staffId,
+        version: release.version,
+        ip: fwd || req.ip || null,
+        user_agent: req.headers['user-agent'] || null,
+      });
+    } catch (logErr) {
+      console.error('Error (workscope download log):', logErr.message);
+    }
+
+    res.json({ url: data.signedUrl, filename: 'WorkScope_setup.zip', version: release.version });
+  } catch (error) {
+    console.error('Error (workscope download):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ WorkScope - インストーラーのアップロード/更新（管理者のみ）
+//    zip をバケットに保存し、workscope_release に新しい現行版として1行追加する。
+app.post('/api/admin/workscope/release', requireAuth, requireAdmin, upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'file フィールド（インストーラーzip）が必要です' });
+    const version = String(req.body.version || '').trim();
+    if (!version) return res.status(400).json({ error: 'version（バージョン表記）が必要です' });
+    await ensureAppDownloadsBucket();
+
+    const path = `workscope/${Date.now()}-${uuidv4()}.zip`;
+    const { error: upErr } = await supabase.storage
+      .from(APP_DOWNLOADS_BUCKET)
+      .upload(path, req.file.buffer, { contentType: req.file.mimetype || 'application/zip' });
+    if (upErr) throw upErr;
+
+    const { data, error: insErr } = await supabase
+      .from('workscope_release')
+      .insert({
+        version,
+        file_path: path,
+        file_size: req.file.size,
+        notes: req.body.notes || null,
+        uploaded_by: req.user.email,
+      })
+      .select()
+      .maybeSingle();
+    if (insErr) throw insErr;
+
+    res.json(data);
+  } catch (error) {
+    console.error('Error (workscope release upload):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ WorkScope - 導入状況の集計（管理者のみ）
+//    「誰が導入済み / 未導入か」を staff_master（在籍者）と突合して返す。
+app.get('/api/admin/workscope/downloads', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const { data: logs, error } = await supabase
+      .from('workscope_downloads')
+      .select('user_email, user_name, staff_id, version, created_at')
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+
+    // メールごとに集計（最新DL日時・回数・最終版）
+    const byEmail = new Map();
+    for (const r of (logs || [])) {
+      const key = String(r.user_email || '').toLowerCase();
+      if (!key) continue;
+      if (!byEmail.has(key)) {
+        byEmail.set(key, {
+          email: r.user_email,
+          name: r.user_name,
+          last_at: r.created_at,
+          version: r.version,
+          count: 1,
+        });
+      } else {
+        byEmail.get(key).count += 1;
+      }
+    }
+    const downloaded = [...byEmail.values()];
+    const downloadedSet = new Set(byEmail.keys());
+
+    // 在籍社員のうち未導入の人を抽出
+    let notDownloaded = [];
+    try {
+      const { data: staff } = await supabase
+        .from('staff_master')
+        .select('name, email, department, is_active');
+      notDownloaded = (staff || [])
+        .filter((s) => s.is_active !== false && s.email)
+        .filter((s) => !downloadedSet.has(String(s.email).toLowerCase()))
+        .map((s) => ({ name: s.name, email: s.email, department: s.department }));
+    } catch (_) { /* 名簿未整備でも集計は返す */ }
+
+    res.json({
+      total_downloads: (logs || []).length,
+      unique_users: downloaded.length,
+      not_downloaded_count: notDownloaded.length,
+      downloaded,
+      not_downloaded: notDownloaded,
+    });
+  } catch (error) {
+    console.error('Error (workscope downloads admin):', error.message);
     res.status(500).json({ error: error.message });
   }
 });
