@@ -4373,12 +4373,18 @@ async function ensureCircularBucket() {
 // Drive 連携の環境変数が揃っていない場合は安全に Supabase へフォールバック。
 const CIRCULAR_STORAGE = (process.env.CIRCULAR_STORAGE || 'drive').toLowerCase();
 
+// 文書回覧の Drive 保存ルート（共有ドライブ「社内システム」直下）。
+// 資格者証(DRIVE_FOLDER_ID)とは別フォルダに出すため専用ルートを使う。env で上書き可。
+const CIRCULAR_DRIVE_FOLDER_ID = process.env.CIRCULAR_DRIVE_FOLDER_ID || '0AK5TgtO_Sr4RUk9PVA';
+
 // 回覧書類ファイルを方針に従って保存し、DBの original_ref に入れる「参照」を返す。
 //   Drive   : "drive:<fileId>"（接頭辞で見分ける）。segments があれば サブフォルダへ自動格納。
 //   Supabase: バケット内のパス（例 "docs/xxx.pdf"）
 async function storeCircular(pathKey, buffer, mimeType, segments) {
   if (CIRCULAR_STORAGE === 'drive' && driveConfigured()) {
-    const folderId = segments && segments.length ? await ensureFolderPath(segments) : undefined;
+    const folderId = segments && segments.length
+      ? await ensureFolderPath(segments, CIRCULAR_DRIVE_FOLDER_ID)
+      : CIRCULAR_DRIVE_FOLDER_ID;
     const name = String(pathKey).split('/').pop();
     const fileId = await driveUpload({ name, buffer, mimeType, folderId });
     return `drive:${fileId}`;
