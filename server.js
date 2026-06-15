@@ -3068,6 +3068,75 @@ app.get('/api/downloads/workscope/my-status', requireAuth, async (req, res) => {
   }
 });
 
+// ✅ WorkScope - 利用規約の同意を中央記録（ダウンロード前にフロントから呼ぶ）
+//    社員PCの config.json だけでなく、誰がいつどの版に同意したかをサーバに残す。
+app.post('/api/downloads/workscope/consent', requireAuth, async (req, res) => {
+  try {
+    const email = req.user.email;
+    let name = req.user.name || '';
+    let staffId = null;
+    try {
+      const { data: staff } = await supabase
+        .from('staff_master')
+        .select('id, name')
+        .ilike('email', String(email).toLowerCase())
+        .maybeSingle();
+      if (staff) { staffId = staff.id; if (staff.name) name = staff.name; }
+    } catch (_) { /* 社員一覧に無くても記録は残す */ }
+
+    const fwd = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+    const { error } = await supabase.from('workscope_consents').insert({
+      user_email: email,
+      user_name: name,
+      staff_id: staffId,
+      eula_version: String(req.body?.eula_version || '').slice(0, 40) || null,
+      ip: fwd || req.ip || null,
+      user_agent: req.headers['user-agent'] || null,
+    });
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error (workscope consent):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ WorkScope - 同意状況の一覧（管理者のみ）。社員ごとの最新同意＋未同意者を返す。
+app.get('/api/admin/workscope/consents', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const { data: rows, error } = await supabase
+      .from('workscope_consents')
+      .select('user_email, user_name, eula_version, agreed_at')
+      .order('agreed_at', { ascending: false });
+    if (error) throw error;
+
+    const byEmail = new Map();
+    for (const r of (rows || [])) {
+      const k = String(r.user_email || '').toLowerCase();
+      if (!k || byEmail.has(k)) continue;
+      byEmail.set(k, { email: r.user_email, name: r.user_name, eula_version: r.eula_version, agreed_at: r.agreed_at });
+    }
+    const consented = [...byEmail.values()];
+    const consentedSet = new Set(byEmail.keys());
+
+    let notConsented = [];
+    try {
+      const { data: staff } = await supabase
+        .from('staff_master')
+        .select('name, email, department, is_active');
+      notConsented = (staff || [])
+        .filter((s) => s.is_active !== false && s.email)
+        .filter((s) => !consentedSet.has(String(s.email).toLowerCase()))
+        .map((s) => ({ name: s.name, email: s.email, department: s.department }));
+    } catch (_) { /* 名簿未整備でも返す */ }
+
+    res.json({ total: consented.length, consented, not_consented: notConsented });
+  } catch (error) {
+    console.error('Error (workscope consents admin):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // ✅ WorkScope - インストーラーのアップロード/更新（管理者のみ）
 //    zip をバケットに保存し、workscope_release に新しい現行版として1行追加する。
 app.post('/api/admin/workscope/release', requireAuth, requireAdmin, upload.single('file'), async (req, res) => {
