@@ -8,6 +8,7 @@ import jwt from 'jsonwebtoken';
 import multer from 'multer';
 import nodemailer from 'nodemailer';
 import { PDFDocument } from 'pdf-lib';
+import JSZip from 'jszip';
 import { parseEstimateFromXlsx } from './bidEstimate.js';
 import { driveUpload, driveDownload, driveTrash, driveConfigured, ensureFolderPath } from './googleDrive.js';
 
@@ -2974,19 +2975,47 @@ app.get('/api/downloads/workscope/file', requireAuth, async (req, res) => {
     const release = await getLatestWorkscopeRelease();
     if (!release) return res.status(404).json({ error: 'インストーラーがまだ登録されていません' });
 
-    const { data, error: sErr } = await supabase.storage
+    // ストレージから zip 本体を取得
+    const { data: blob, error: dErr } = await supabase.storage
       .from(APP_DOWNLOADS_BUCKET)
-      .createSignedUrl(release.file_path, 300); // 5分間有効
-    if (sErr) throw sErr;
+      .download(release.file_path);
+    if (dErr) throw dErr;
+    const zipBuf = Buffer.from(await blob.arrayBuffer());
+
+    // ログイン中の本人情報で identity を解決（社員一覧の氏名を優先、無ければGoogleアカウント名）
+    const email = req.user.email;
+    let name = req.user.name || '';
+    let staffId = null;
+    try {
+      const { data: staff } = await supabase
+        .from('staff_master')
+        .select('id, name')
+        .ilike('email', String(email).toLowerCase())
+        .maybeSingle();
+      if (staff) {
+        staffId = staff.id;
+        if (staff.name) name = staff.name;
+      }
+    } catch (_) { /* 社員一覧に無くてもGoogleアカウント名で続行 */ }
+
+    // zip に src/identity.json を埋め込む（インストーラが氏名/メール入力を省略するため）。
+    // 失敗しても元zipをそのまま配る（手入力フォームにフォールバックできる）。
+    let outBuf = zipBuf;
+    try {
+      const zip = await JSZip.loadAsync(zipBuf);
+      zip.file('src/identity.json', JSON.stringify({ employee_name: name, email }, null, 2));
+      outBuf = await zip.generateAsync({ type: 'nodebuffer' });
+    } catch (zErr) {
+      console.error('Error (workscope identity inject):', zErr.message);
+    }
 
     // 利用ログを記録（失敗してもダウンロード自体は妨げない）
     try {
-      const perms = await resolvePermissions(req.user.email);
       const fwd = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
       await supabase.from('workscope_downloads').insert({
-        user_email: req.user.email,
-        user_name: req.user.name,
-        staff_id: perms.staffId,
+        user_email: email,
+        user_name: name,
+        staff_id: staffId,
         version: release.version,
         ip: fwd || req.ip || null,
         user_agent: req.headers['user-agent'] || null,
@@ -2995,7 +3024,9 @@ app.get('/api/downloads/workscope/file', requireAuth, async (req, res) => {
       console.error('Error (workscope download log):', logErr.message);
     }
 
-    res.json({ url: data.signedUrl, filename: 'WorkScope_setup.zip', version: release.version });
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', 'attachment; filename="WorkScope_setup.zip"');
+    res.send(outBuf);
   } catch (error) {
     console.error('Error (workscope download):', error.message);
     res.status(500).json({ error: error.message });
