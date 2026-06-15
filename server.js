@@ -3033,6 +3033,41 @@ app.get('/api/downloads/workscope/file', requireAuth, async (req, res) => {
   }
 });
 
+// ✅ WorkScope - 本人の導入状況（初回アクセス時の必須ポップアップ判定）
+//    required=true の間、フロントは画面をふさぐ導入モーダルを表示する。
+//    判定: インストーラ配布中 かつ 本人が未DL かつ 管理者でない → 必須。
+app.get('/api/downloads/workscope/my-status', requireAuth, async (req, res) => {
+  try {
+    const release = await getLatestWorkscopeRelease();
+    const email = String(req.user.email || '').toLowerCase();
+
+    let downloaded = false;
+    try {
+      const { count } = await supabase
+        .from('workscope_downloads')
+        .select('id', { count: 'exact', head: true })
+        .ilike('user_email', email);
+      downloaded = (count || 0) > 0;
+    } catch (_) { /* 取得失敗時は未DL扱いにしない（誤ブロック回避のため後段で安全側） */ }
+
+    let isAdmin = false;
+    try {
+      const perms = await resolvePermissions(req.user.email);
+      isAdmin = perms.role === 'admin';
+    } catch (_) {}
+
+    res.json({
+      available: !!release,
+      downloaded,
+      is_admin: isAdmin,
+      required: !!release && !downloaded && !isAdmin,
+    });
+  } catch (error) {
+    console.error('Error (workscope my-status):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // ✅ WorkScope - インストーラーのアップロード/更新（管理者のみ）
 //    zip をバケットに保存し、workscope_release に新しい現行版として1行追加する。
 app.post('/api/admin/workscope/release', requireAuth, requireAdmin, upload.single('file'), async (req, res) => {
