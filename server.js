@@ -3804,6 +3804,44 @@ app.put('/api/bids/:id', requireAuth, requireBidAdmin, async (req, res) => {
   }
 });
 
+// ✅ 入札 - ステータス変更のみ（利用可=member 以上に開放。編集とは別枠）
+app.patch('/api/bids/:id/status', requireAuth, requireBidAccess, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const status = req.body?.status;
+    if (!status || !BID_STATUSES.includes(status)) {
+      return res.status(400).json({ error: '不正なステータスです' });
+    }
+    const { data: existing, error: exErr } = await supabase
+      .from('bid_projects')
+      .select('status')
+      .eq('id', id)
+      .eq('is_active', true)
+      .maybeSingle();
+    if (exErr) throw exErr;
+    if (!existing) return res.status(404).json({ error: '案件が見つかりません' });
+
+    const { data, error } = await supabase
+      .from('bid_projects')
+      .update({ status, updated_at: new Date().toISOString() })
+      .eq('id', id)
+      .select('*')
+      .single();
+    if (error) throw error;
+
+    if (status !== existing.status) {
+      await supabase.from('bid_status_history').insert([
+        { bid_id: id, from_status: existing.status, to_status: status, changed_by: req.user.email },
+      ]);
+    }
+
+    res.json(data);
+  } catch (error) {
+    console.error('Error (bid status change):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // ✅ 入札 - 論理削除
 app.delete('/api/bids/:id', requireAuth, requireBidAdmin, async (req, res) => {
   try {
@@ -4045,6 +4083,20 @@ async function resolveFeedbackRole(email) {
   return { role, staffId: perms.staffId };
 }
 
+// バグ報告・改善の利用権限（member 以上＝報告できる）。要 requireAuth 後段。
+async function requireFeedbackAccess(req, res, next) {
+  try {
+    const r = await resolveFeedbackRole(req.user?.email);
+    if (r.role === 'none') {
+      return res.status(403).json({ error: 'バグ報告・改善の利用権限がありません' });
+    }
+    req.fbRole = r;
+    next();
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+}
+
 async function requireFeedbackAdmin(req, res, next) {
   try {
     const r = await resolveFeedbackRole(req.user?.email);
@@ -4117,7 +4169,7 @@ function buildFeedbackBacklog(rows, meta = {}) {
 
 // ✅ フィードバック - スクリーンショットアップロード（公開バケット feedback-photos）
 //    固定パスのため :id ルートより前に定義する
-app.post('/api/feedback/upload-photo', requireAuth, upload.single('photo'), async (req, res) => {
+app.post('/api/feedback/upload-photo', requireAuth, requireFeedbackAccess, upload.single('photo'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'photo フィールドが必要です' });
     await ensureFeedbackBucket();
@@ -4227,7 +4279,7 @@ app.get('/api/feedback/:id', requireAuth, async (req, res) => {
 });
 
 // ✅ フィードバック投稿（全社員）
-app.post('/api/feedback', requireAuth, async (req, res) => {
+app.post('/api/feedback', requireAuth, requireFeedbackAccess, async (req, res) => {
   try {
     const {
       type, title, app_key, app_label, description,
