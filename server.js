@@ -4635,6 +4635,7 @@ app.get('/api/construction/projects/:id', requireAuth, requireConstructionAccess
       const url = await constructionFileSignedUrl(f.file_ref);
       (filesByDoc[f.document_id] = filesByDoc[f.document_id] || []).push({
         id: f.id, file_name: f.file_name, mime_type: f.mime_type, size_bytes: f.size_bytes, url,
+        source: f.source || 'manual', ai_classified: !!f.ai_classified, ai_confidence: f.ai_confidence ?? null,
       });
     }
     const documents = (docs || []).map((d) => ({
@@ -4715,8 +4716,24 @@ app.post('/api/construction/projects/from-bid/:bidId', requireAuth, requireConst
     const { data, error: insErr } = await supabase
       .from('construction_projects').insert([payload]).select('*').single();
     if (insErr) throw insErr;
-    const generated = await generateChecklist(data, req.user.email);
-    res.json({ ...data, generated_documents: generated });
+
+    // 入札資料を工事へ引き継ぐ（AIで工事情報を補完＋各資料を分類して提出書類へ添付）。
+    // best-effort: 失敗しても工事登録・チェックリスト生成は成立させる。
+    let carry = { carried: 0, classified: 0, extracted: false, project: data };
+    try {
+      carry = await carryOverBidDocuments({ project: data, bidId: bid.id, email: req.user.email });
+    } catch (e) { console.error('carryOverBidDocuments:', e.message); }
+
+    // 必要書類チェックリストを生成（抽出後の工事情報＝契約日等から締切を計算）。
+    // 引き継ぎ時に作成済みのテンプレ書類は generateChecklist 側で重複生成しない。
+    const generated = await generateChecklist(carry.project || data, req.user.email);
+    res.json({
+      ...(carry.project || data),
+      generated_documents: generated,
+      carried_files: carry.carried,
+      ai_classified: carry.classified,
+      ai_extracted: carry.extracted,
+    });
   } catch (error) {
     console.error('Error (construction from-bid):', error.message);
     res.status(500).json({ error: error.message });
@@ -4992,6 +5009,7 @@ app.get('/api/construction/documents/:docId/files', requireAuth, requireConstruc
     const withUrls = await Promise.all((data || []).map(async (f) => ({
       id: f.id, file_name: f.file_name, mime_type: f.mime_type, size_bytes: f.size_bytes,
       url: await constructionFileSignedUrl(f.file_ref),
+      source: f.source || 'manual', ai_classified: !!f.ai_classified, ai_confidence: f.ai_confidence ?? null,
     })));
     res.json(withUrls);
   } catch (error) {
@@ -5018,6 +5036,386 @@ app.delete('/api/construction/files/:fileId', requireAuth, requireConstructionAc
   } catch (error) {
     console.error('Error (construction file delete):', error.message);
     res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================================
+// 工事管理 - 書類のAI解析（Gemini）: 自動振り分け & 工事情報の自動抽出
+//   既存の入札資料AI抽出（extractBidInfo）と同じ Gemini 連携方式を踏襲。
+//   - classifyConstructionDoc : 1ファイルの内容＋ファイル名から「必要書類マスタ」のどれかを判定
+//   - extractConstructionInfo : 契約・設計図書から工事の基本情報を構造化抽出
+//   GEMINI_API_KEY 未設定なら AI 機能はスキップ（書類引継ぎ・登録などコア機能は継続）。
+// ============================================================
+
+const CONS_AI_MAX_FILE = 15 * 1024 * 1024;    // 1ファイル上限（超過は図面等とみなしAI対象外）
+const CONS_AI_EXTRACT_TOTAL = 18 * 1024 * 1024; // 抽出時のインライン合計上限の安全圏
+
+// 大分類No→名称（必要書類マスタのシードと一致。AIプロンプト/手動作成時の補完に使う）
+const CONSTRUCTION_CATEGORY_NAMES = [
+  { no: 1, name: '契約・設計図書' }, { no: 2, name: '着手・届出' }, { no: 3, name: '施工計画' },
+  { no: 4, name: '施工管理' }, { no: 5, name: '品質・出来形' }, { no: 6, name: '安全・環境' },
+  { no: 7, name: '工事写真' }, { no: 8, name: '検査' }, { no: 9, name: '完成・引渡' },
+];
+
+// drive:<id> もしくはストレージバケットのパスから実バイト列を取得
+async function loadStoredFileBuffer(ref, bucket) {
+  if (!ref) return null;
+  if (String(ref).startsWith('drive:')) {
+    const { buffer } = await driveDownload(String(ref).slice('drive:'.length));
+    return buffer;
+  }
+  const { data, error } = await supabase.storage.from(bucket).download(ref);
+  if (error) throw error;
+  return Buffer.from(await data.arrayBuffer());
+}
+function guessMimeByName(name) {
+  const ext = String(name || '').split('.').pop().toLowerCase();
+  const map = {
+    pdf: 'application/pdf', png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg',
+    gif: 'image/gif', webp: 'image/webp',
+    xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', xls: 'application/vnd.ms-excel',
+    docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', doc: 'application/msword',
+  };
+  return map[ext] || 'application/octet-stream';
+}
+// Gemini にインラインで渡せる形式・サイズか（PDF/画像、かつ上限以内）
+function geminiAnalyzable(mimeType, size) {
+  const mt = mimeType || '';
+  return (mt === 'application/pdf' || mt.startsWith('image/')) && (size == null || size <= CONS_AI_MAX_FILE);
+}
+async function getActiveDocTemplates() {
+  const { data } = await supabase
+    .from('required_doc_templates').select('*').eq('is_active', true).order('sort_order', { ascending: true });
+  return data || [];
+}
+
+// 1ファイルの内容＋ファイル名から、必要書類マスタのどれに該当するかを判定
+async function classifyConstructionDoc({ fileName, buffer, mimeType, templates }) {
+  if (!GEMINI_API_KEY) return null;
+  const catalog = (templates || [])
+    .map((t) => `${t.category_no}\t${t.doc_name}\t${t.trade || '共通'}`)
+    .join('\n');
+  const catNames = CONSTRUCTION_CATEGORY_NAMES.map((c) => `${c.no}:${c.name}`).join(' / ');
+  const prompt = [
+    'これは日本の公共建築工事（発注者: 九州防衛局）で扱う書類の1つです。',
+    'ファイル名と内容（PDF/画像）から、この書類が「必要書類マスタ」のどれに該当するかを1つだけ判定してください。',
+    `大分類(category_no): ${catNames}`,
+    '必要書類マスタ（タブ区切り: category_no / 書類名 / 工種）:',
+    catalog,
+    '出力JSON:',
+    '- category_no: 1〜9の整数（最も適切な大分類）',
+    '- doc_name: マスタの「書類名」のうち最も一致するものを正確に転記。該当が無ければ内容に基づき簡潔な書類名を記述',
+    '- matched: マスタに一致する書類名があれば true、無ければ false',
+    '- trade: 工種（マスタに合わせる。不明なら「共通」）',
+    '- confidence: 判定の確信度 0.0〜1.0',
+    '- reason: 判定理由を簡潔に（20字程度）',
+    `ファイル名: ${fileName || '(不明)'}`,
+  ].join('\n');
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+  const body = {
+    contents: [{ parts: [
+      { text: prompt },
+      { inlineData: { mimeType: mimeType || 'application/pdf', data: buffer.toString('base64') } },
+    ] }],
+    generationConfig: {
+      temperature: 0,
+      responseMimeType: 'application/json',
+      responseSchema: {
+        type: 'OBJECT',
+        properties: {
+          category_no: { type: 'INTEGER' },
+          doc_name: { type: 'STRING' },
+          matched: { type: 'BOOLEAN' },
+          trade: { type: 'STRING' },
+          confidence: { type: 'NUMBER' },
+          reason: { type: 'STRING' },
+        },
+        required: ['category_no', 'doc_name'],
+      },
+    },
+  };
+  const resp = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  if (!resp.ok) {
+    const t = await resp.text();
+    const e = new Error(`Gemini API エラー (${resp.status}): ${t.slice(0, 300)}`); e.status = 502; throw e;
+  }
+  const json = await resp.json();
+  const text = json?.candidates?.[0]?.content?.parts?.[0]?.text;
+  if (!text) return null;
+  let p; try { p = JSON.parse(text); } catch { return null; }
+  let no = Number(p.category_no);
+  if (!Number.isInteger(no) || no < 1 || no > 9) no = null;
+  return {
+    category_no: no,
+    doc_name: (p.doc_name || '').trim(),
+    matched: !!p.matched,
+    trade: (p.trade || '共通').trim() || '共通',
+    confidence: typeof p.confidence === 'number' ? Math.max(0, Math.min(1, p.confidence)) : null,
+    reason: (p.reason || '').trim(),
+  };
+}
+
+// 分類結果から、紐付け先の提出書類(submission_documents)を解決（無ければ作成）
+async function routeFileToDocument({ projectId, classification, email }) {
+  const cls = classification;
+  // 1) マスタ一致 → 同テンプレ由来の提出書類があればそれ、無ければテンプレから生成
+  if (cls?.matched && cls.category_no && cls.doc_name) {
+    const { data: tmpl } = await supabase
+      .from('required_doc_templates').select('*')
+      .eq('category_no', cls.category_no).eq('doc_name', cls.doc_name).eq('is_active', true).maybeSingle();
+    if (tmpl) {
+      const { data: existing } = await supabase
+        .from('submission_documents').select('*')
+        .eq('project_id', projectId).eq('template_id', tmpl.id).maybeSingle();
+      if (existing) return existing;
+      const { data: created, error } = await supabase.from('submission_documents').insert([{
+        project_id: projectId, template_id: tmpl.id,
+        category_no: tmpl.category_no, category: tmpl.category, subcategory: tmpl.subcategory,
+        doc_name: tmpl.doc_name, trade: tmpl.trade, form_no: tmpl.form_no,
+        status: 'not_started', created_by: email,
+      }]).select('*').single();
+      if (error) throw error;
+      return created;
+    }
+  }
+  // 2) 同名の既存提出書類（手動追加分など）に一致
+  if (cls?.doc_name) {
+    const { data: byName } = await supabase
+      .from('submission_documents').select('*')
+      .eq('project_id', projectId).eq('doc_name', cls.doc_name).maybeSingle();
+    if (byName) return byName;
+  }
+  // 3) どれにも該当しない → 分類カテゴリ（不明なら1）に新規の提出書類を作成
+  const no = cls?.category_no || 1;
+  const catName = (CONSTRUCTION_CATEGORY_NAMES.find((c) => c.no === no) || {}).name || '契約・設計図書';
+  const { data: created, error } = await supabase.from('submission_documents').insert([{
+    project_id: projectId, template_id: null,
+    category_no: no, category: catName, subcategory: null,
+    doc_name: cls?.doc_name || '分類未確定の資料', trade: cls?.trade || '共通', form_no: null,
+    status: 'not_started', created_by: email,
+    note: cls ? 'AI自動振り分け' : 'AI判定なし（要確認）',
+  }]).select('*').single();
+  if (error) throw error;
+  return created;
+}
+
+// 工事情報の抽出対象を絞る（契約・設計図書系を優先。PDF/画像のみ・合計上限内で最大3件）
+function selectConstructionDocsForExtract(files) {
+  const KW = ['契約', '設計', '特記', '仕様', '内訳', '概要', '工事'];
+  const cand = (files || []).filter((f) => geminiAnalyzable(f.mimetype, f.size));
+  const scored = cand.map((f) => {
+    const nm = f.originalname || '';
+    let s = 0; for (const k of KW) if (nm.includes(k)) s += 2;
+    return { f, s };
+  }).sort((a, b) => b.s - a.s || (a.f.size || 0) - (b.f.size || 0));
+  const picked = []; let total = 0;
+  for (const { f } of scored) {
+    if (picked.length >= 3) break;
+    if (total + (f.size || 0) > CONS_AI_EXTRACT_TOTAL) continue;
+    picked.push(f); total += (f.size || 0);
+  }
+  if (!picked.length && cand.length) picked.push([...cand].sort((a, b) => (a.size || 0) - (b.size || 0))[0]);
+  return picked;
+}
+
+// 契約・設計図書から工事の基本情報を構造化抽出
+async function extractConstructionInfo(files) {
+  if (!GEMINI_API_KEY) { const e = new Error('GEMINI_API_KEY が未設定です。'); e.status = 503; throw e; }
+  const prompt = [
+    'これは日本の公共建築工事（発注者: 九州防衛局）の契約・設計図書など（契約書・設計図書・特記仕様書・内訳書 等）です。',
+    '記載内容を読み取り、工事管理の登録に必要な項目を JSON で返してください。',
+    '- project_name: 工事名（正式名称）',
+    '- project_code: 工事番号 / 契約番号',
+    '- client_org: 発注者（例: 九州防衛局）',
+    '- construction_type: 工種大別。「建築」「土木」「電気」「機械」「その他」のいずれか',
+    '- work_category: 工事区分。「新設」「改修」「その他」のいずれか',
+    '- location: 工事場所（基地・駐屯地名・住所）',
+    '- contract_amount: 契約金額（円。半角数字のみ。税込）',
+    '- contract_date: 契約日（YYYY-MM-DD）',
+    '- start_date: 着工日（YYYY-MM-DD）',
+    '- end_date: 工期末（YYYY-MM-DD）',
+    '- completion_inspection_date: 完成検査(予定)日（YYYY-MM-DD）',
+    '- summary: 工事概要を1〜2文（任意）',
+    '日付が和暦（令和・平成等）の場合は西暦へ変換。時刻が併記されていても日付のみ抽出。読み取れない項目は空文字にし推測で埋めないこと。',
+  ].join('\n');
+  const parts = [{ text: prompt }];
+  for (const f of files) parts.push({ inlineData: { mimeType: f.mimetype || 'application/pdf', data: f.buffer.toString('base64') } });
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+  const body = {
+    contents: [{ parts }],
+    generationConfig: {
+      temperature: 0,
+      responseMimeType: 'application/json',
+      responseSchema: {
+        type: 'OBJECT',
+        properties: {
+          project_name: { type: 'STRING' }, project_code: { type: 'STRING' }, client_org: { type: 'STRING' },
+          construction_type: { type: 'STRING' }, work_category: { type: 'STRING' }, location: { type: 'STRING' },
+          contract_amount: { type: 'STRING' }, contract_date: { type: 'STRING' }, start_date: { type: 'STRING' },
+          end_date: { type: 'STRING' }, completion_inspection_date: { type: 'STRING' }, summary: { type: 'STRING' },
+        },
+      },
+    },
+  };
+  const resp = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  if (!resp.ok) {
+    const t = await resp.text();
+    const e = new Error(`Gemini API エラー (${resp.status}): ${t.slice(0, 300)}`); e.status = 502; throw e;
+  }
+  const json = await resp.json();
+  const text = json?.candidates?.[0]?.content?.parts?.[0]?.text;
+  if (!text) throw new Error('Gemini から有効な応答が得られませんでした');
+  let p; try { p = JSON.parse(text); } catch { throw new Error('Gemini 応答の解析に失敗しました'); }
+  const ctype = ['建築', '土木', '電気', '機械', 'その他'].includes((p.construction_type || '').trim()) ? p.construction_type.trim() : null;
+  const wcat = ['新設', '改修', 'その他'].includes((p.work_category || '').trim()) ? p.work_category.trim() : null;
+  return {
+    project_name: (p.project_name || '').trim(),
+    project_code: (p.project_code || '').trim(),
+    client_org: (p.client_org || '').trim(),
+    construction_type: ctype,
+    work_category: wcat,
+    location: (p.location || '').trim(),
+    contract_amount: digitsOrNull(p.contract_amount),
+    contract_date: cleanIsoDate(p.contract_date),
+    start_date: cleanIsoDate(p.start_date),
+    end_date: cleanIsoDate(p.end_date),
+    completion_inspection_date: cleanIsoDate(p.completion_inspection_date),
+    summary: (p.summary || '').trim(),
+  };
+}
+
+// 入札の添付資料を工事へ引き継ぐ（AI抽出で工事情報を補完＋各資料を分類して提出書類へ添付）。
+// best-effort: 個々の失敗はスキップし、工事登録自体は必ず成立させる。チェックリスト生成は呼び出し側で行う。
+async function carryOverBidDocuments({ project, bidId, email }) {
+  const result = { carried: 0, classified: 0, extracted: false, project };
+  const { data: bidDocs } = await supabase
+    .from('bid_documents').select('*').eq('bid_id', bidId).order('created_at', { ascending: true });
+  if (!bidDocs || !bidDocs.length) return result;
+
+  // 実バイト列を取得（個別失敗はスキップ）
+  const loaded = [];
+  for (const d of bidDocs) {
+    try {
+      const buffer = await loadStoredFileBuffer(d.storage_path, BID_BUCKET);
+      if (buffer) loaded.push({ doc: d, buffer, originalname: d.file_name, mimetype: guessMimeByName(d.file_name), size: buffer.length });
+    } catch (e) { console.error('carry load:', d.file_name, e.message); }
+  }
+  if (!loaded.length) return result;
+
+  // 1) 工事情報の自動抽出 → 空欄のみ反映（手動指定済みは尊重）
+  let updatedProject = project;
+  if (GEMINI_API_KEY) {
+    try {
+      const picked = selectConstructionDocsForExtract(loaded);
+      if (picked.length) {
+        const info = await extractConstructionInfo(picked);
+        const patch = {};
+        const setIf = (k, v) => { if (v != null && v !== '' && (project[k] == null || project[k] === '')) patch[k] = v; };
+        setIf('project_code', info.project_code);
+        setIf('client_org', info.client_org);
+        setIf('construction_type', info.construction_type);
+        setIf('work_category', info.work_category);
+        setIf('location', info.location);
+        setIf('contract_amount', info.contract_amount);
+        setIf('contract_date', info.contract_date);
+        setIf('start_date', info.start_date);
+        setIf('end_date', info.end_date);
+        setIf('completion_inspection_date', info.completion_inspection_date);
+        if (Object.keys(patch).length) {
+          patch.updated_at = new Date().toISOString();
+          const { data: up } = await supabase.from('construction_projects').update(patch).eq('id', project.id).select('*').single();
+          if (up) { updatedProject = up; result.extracted = true; }
+        }
+      }
+    } catch (e) { console.error('carry extract:', e.message); }
+  }
+  result.project = updatedProject;
+
+  // 2) 各資料を分類 → 提出書類へ添付
+  const templates = GEMINI_API_KEY ? await getActiveDocTemplates() : [];
+  for (const item of loaded) {
+    try {
+      let classification = null;
+      if (GEMINI_API_KEY && geminiAnalyzable(item.mimetype, item.size)) {
+        try { classification = await classifyConstructionDoc({ fileName: item.originalname, buffer: item.buffer, mimeType: item.mimetype, templates }); }
+        catch (e) { console.error('carry classify:', e.message); }
+      }
+      const doc = await routeFileToDocument({ projectId: project.id, classification, email });
+      const ref = await storeConstructionFile({
+        projectName: updatedProject.project_name || project.project_name,
+        categoryNo: doc.category_no, categoryName: doc.category,
+        fileName: item.originalname, buffer: item.buffer, mimeType: item.mimetype,
+      });
+      await supabase.from('submission_files').insert([{
+        document_id: doc.id, project_id: project.id, file_ref: ref,
+        file_name: item.originalname, mime_type: item.mimetype, size_bytes: item.size,
+        uploaded_by: email, source: 'bid', ai_classified: !!classification,
+        ai_confidence: classification?.confidence ?? null,
+        ai_note: classification ? (classification.reason || null) : `入札資料: ${item.doc.doc_type || 'その他'}`,
+      }]);
+      result.carried += 1;
+      if (classification) result.classified += 1;
+    } catch (e) { console.error('carry attach:', item.originalname, e.message); }
+  }
+  return result;
+}
+
+// ✅ 工事管理 - ファイルをアップロード→Geminiが内容を読み取り、提出書類へ自動振り分けして添付
+app.post('/api/construction/projects/:id/documents/auto-file', requireAuth, requireConstructionAccess, upload.single('file'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!req.file) return res.status(400).json({ error: 'file フィールドが必要です' });
+    const { data: proj } = await supabase
+      .from('construction_projects').select('id, project_name').eq('id', id).eq('is_active', true).maybeSingle();
+    if (!proj) return res.status(404).json({ error: '工事が見つかりません' });
+
+    const fileName = decodeUploadName(req.file.originalname);
+    let classification = null;
+    if (GEMINI_API_KEY && geminiAnalyzable(req.file.mimetype, req.file.size)) {
+      try {
+        const templates = await getActiveDocTemplates();
+        classification = await classifyConstructionDoc({ fileName, buffer: req.file.buffer, mimeType: req.file.mimetype, templates });
+      } catch (e) { console.error('auto-file classify:', e.message); }
+    }
+    const doc = await routeFileToDocument({ projectId: Number(id), classification, email: req.user.email });
+    const ref = await storeConstructionFile({
+      projectName: proj.project_name || `project-${id}`,
+      categoryNo: doc.category_no, categoryName: doc.category,
+      fileName, buffer: req.file.buffer, mimeType: req.file.mimetype,
+    });
+    const { data: fileRow, error } = await supabase.from('submission_files').insert([{
+      document_id: doc.id, project_id: Number(id), file_ref: ref,
+      file_name: fileName, mime_type: req.file.mimetype, size_bytes: req.file.size,
+      uploaded_by: req.user.email, source: 'auto', ai_classified: !!classification,
+      ai_confidence: classification?.confidence ?? null, ai_note: classification?.reason || null,
+    }]).select('*').single();
+    if (error) throw error;
+    const url = await constructionFileSignedUrl(fileRow.file_ref);
+    res.json({
+      file: { id: fileRow.id, file_name: fileRow.file_name, mime_type: fileRow.mime_type, size_bytes: fileRow.size_bytes, url, source: 'auto', ai_classified: !!classification, ai_confidence: classification?.confidence ?? null },
+      document: { id: doc.id, category_no: doc.category_no, category: doc.category, doc_name: doc.doc_name },
+      classification,
+    });
+  } catch (error) {
+    console.error('Error (construction auto-file):', error.message);
+    res.status(error.status || 500).json({ error: error.message });
+  }
+});
+
+// ✅ 工事管理 - 書類から工事情報を AI 抽出（新規登録のプレフィル用。DBには保存しない）
+app.post('/api/construction/extract-info', requireAuth, requireConstructionAccess, upload.array('files', 20), async (req, res) => {
+  try {
+    const files = req.files || [];
+    if (!files.length) return res.status(400).json({ error: 'files（書類）が必要です' });
+    for (const f of files) f.originalname = decodeUploadName(f.originalname);
+    const picked = selectConstructionDocsForExtract(files);
+    if (!picked.length) return res.status(400).json({ error: 'AIで読み取れる書類（PDF/画像）が見つかりませんでした。手入力で登録してください。' });
+    const fields = await extractConstructionInfo(picked);
+    res.json({ fields, used_files: picked.map((f) => f.originalname) });
+  } catch (error) {
+    console.error('Error (construction extract-info):', error.message);
+    res.status(error.status || 500).json({ error: error.message });
   }
 });
 
