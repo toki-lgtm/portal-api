@@ -4573,15 +4573,27 @@ app.get('/api/construction/projects/:id', requireAuth, requireConstructionAccess
       .from('construction_projects').select('*').eq('id', id).eq('is_active', true).maybeSingle();
     if (error) throw error;
     if (!project) return res.status(404).json({ error: '工事が見つかりません' });
-    const [{ data: docs }, nameMap] = await Promise.all([
+    const [{ data: docs }, { data: files }, nameMap] = await Promise.all([
       supabase.from('submission_documents').select('*')
         .eq('project_id', id)
         .order('category_no', { ascending: true })
         .order('id', { ascending: true }),
+      supabase.from('submission_files').select('*')
+        .eq('project_id', id).order('created_at', { ascending: true }),
       loadStaffNameMap(),
     ]);
+    // 添付ファイルを書類ごとにまとめ、署名付きの一時URLを付与
+    const filesByDoc = {};
+    for (const f of files || []) {
+      const url = await constructionFileSignedUrl(f.file_ref);
+      (filesByDoc[f.document_id] = filesByDoc[f.document_id] || []).push({
+        id: f.id, file_name: f.file_name, mime_type: f.mime_type, size_bytes: f.size_bytes, url,
+      });
+    }
     const documents = (docs || []).map((d) => ({
-      ...d, assignee_name: d.assignee_id ? nameMap[d.assignee_id] || null : null,
+      ...d,
+      assignee_name: d.assignee_id ? nameMap[d.assignee_id] || null : null,
+      files: filesByDoc[d.id] || [],
     }));
     res.json({
       ...project,
@@ -4779,6 +4791,140 @@ app.get('/api/construction/templates', requireAuth, requireConstructionAccess, a
     res.json(data || []);
   } catch (error) {
     console.error('Error (construction templates):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ── 工事管理: 提出書類の添付ファイル（共有ドライブ保存。方針は certs と同じ）──
+const CONSTRUCTION_BUCKET = 'construction-files';
+let constructionBucketEnsured = false;
+async function ensureConstructionBucket() {
+  if (constructionBucketEnsured) return;
+  try { await supabase.storage.createBucket(CONSTRUCTION_BUCKET, { public: false }); } catch { /* 既存ならOK */ }
+  constructionBucketEnsured = true;
+}
+// Drive/OSのフォルダ名に使えない文字を除去
+function sanitizeDriveSeg(s) {
+  return String(s || '').replace(/[\\/:*?"<>|]/g, '_').replace(/\s+/g, ' ').trim().slice(0, 100) || '_';
+}
+function categoryFolderName(no, name) {
+  return `${String(no).padStart(2, '0')}_${name}`;
+}
+// ファイルを保存し参照文字列を返す（drive:<id> もしくは Supabaseパス）。
+//   保存先: （DRIVE_FOLDER_ID）/工事管理/<工事名>/<NN_大分類名>/
+async function storeConstructionFile({ projectName, categoryNo, categoryName, fileName, buffer, mimeType }) {
+  if (driveConfigured()) {
+    const folderId = await ensureFolderPath([
+      '工事管理',
+      sanitizeDriveSeg(projectName),
+      sanitizeDriveSeg(categoryFolderName(categoryNo, categoryName)),
+    ]);
+    const fileId = await driveUpload({ name: fileName, buffer, mimeType, folderId });
+    return `drive:${fileId}`;
+  }
+  await ensureConstructionBucket();
+  const path = `${Date.now()}-${uuidv4()}-${sanitizeDriveSeg(fileName)}`;
+  const { error } = await supabase.storage.from(CONSTRUCTION_BUCKET).upload(path, buffer, { contentType: mimeType });
+  if (error) throw error;
+  return path;
+}
+// 一時表示/DL用URL。drive: 参照は短命JWT付きの API プロキシ、その他は Supabase 署名URL。
+async function constructionFileSignedUrl(ref, expiresIn = 3600) {
+  if (!ref) return null;
+  if (String(ref).startsWith('drive:')) {
+    const fileId = String(ref).slice('drive:'.length);
+    const token = jwt.sign({ fileId, kind: 'construction' }, JWT_SECRET, { expiresIn });
+    const base = process.env.PUBLIC_API_URL || 'https://portal-api-hhlx.onrender.com';
+    return `${base}/api/construction-file?t=${encodeURIComponent(token)}`;
+  }
+  const { data } = await supabase.storage.from(CONSTRUCTION_BUCKET).createSignedUrl(ref, expiresIn);
+  return data?.signedUrl || null;
+}
+// 署名トークンで保護された Drive ファイルプロキシ（認証ヘッダ無しで開ける）。
+app.get('/api/construction-file', async (req, res) => {
+  try {
+    const token = req.query.t;
+    if (!token) return res.status(400).send('missing token');
+    let payload;
+    try { payload = jwt.verify(token, JWT_SECRET); } catch { return res.status(401).send('invalid or expired token'); }
+    if (payload.kind !== 'construction' || !payload.fileId) return res.status(400).send('bad token');
+    const { buffer, contentType } = await driveDownload(payload.fileId);
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('Cache-Control', 'private, max-age=600');
+    res.send(buffer);
+  } catch (error) {
+    console.error('Error (construction-file proxy):', error.message);
+    res.status(error.status || 500).send(error.message);
+  }
+});
+
+// ✅ 工事管理 - 書類へファイル添付（共有ドライブへアップロード）
+app.post('/api/construction/documents/:docId/files', requireAuth, requireConstructionAccess, upload.single('file'), async (req, res) => {
+  try {
+    const { docId } = req.params;
+    if (!req.file) return res.status(400).json({ error: 'file フィールドが必要です' });
+    const { data: doc, error: dErr } = await supabase
+      .from('submission_documents').select('id, project_id, category_no, category').eq('id', docId).maybeSingle();
+    if (dErr) throw dErr;
+    if (!doc) return res.status(404).json({ error: '書類が見つかりません' });
+    const { data: proj } = await supabase
+      .from('construction_projects').select('project_name').eq('id', doc.project_id).maybeSingle();
+
+    const fileName = decodeUploadName(req.file.originalname);
+    const ref = await storeConstructionFile({
+      projectName: proj?.project_name || `project-${doc.project_id}`,
+      categoryNo: doc.category_no, categoryName: doc.category,
+      fileName, buffer: req.file.buffer, mimeType: req.file.mimetype,
+    });
+    const { data, error } = await supabase.from('submission_files').insert([{
+      document_id: doc.id, project_id: doc.project_id, file_ref: ref,
+      file_name: fileName, mime_type: req.file.mimetype, size_bytes: req.file.size,
+      uploaded_by: req.user.email,
+    }]).select('*').single();
+    if (error) throw error;
+    const url = await constructionFileSignedUrl(data.file_ref);
+    res.json({ id: data.id, file_name: data.file_name, mime_type: data.mime_type, size_bytes: data.size_bytes, url });
+  } catch (error) {
+    console.error('Error (construction file upload):', error.message);
+    res.status(error.status || 500).json({ error: error.message });
+  }
+});
+
+// ✅ 工事管理 - 書類の添付ファイル一覧（署名付きURL）
+app.get('/api/construction/documents/:docId/files', requireAuth, requireConstructionAccess, async (req, res) => {
+  try {
+    const { docId } = req.params;
+    const { data, error } = await supabase
+      .from('submission_files').select('*').eq('document_id', docId).order('created_at', { ascending: true });
+    if (error) throw error;
+    const withUrls = await Promise.all((data || []).map(async (f) => ({
+      id: f.id, file_name: f.file_name, mime_type: f.mime_type, size_bytes: f.size_bytes,
+      url: await constructionFileSignedUrl(f.file_ref),
+    })));
+    res.json(withUrls);
+  } catch (error) {
+    console.error('Error (construction files list):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 工事管理 - 添付ファイルの削除（Drive はゴミ箱へ）
+app.delete('/api/construction/files/:fileId', requireAuth, requireConstructionAccess, async (req, res) => {
+  try {
+    const { fileId } = req.params;
+    const { data: f, error: fErr } = await supabase
+      .from('submission_files').select('*').eq('id', fileId).maybeSingle();
+    if (fErr) throw fErr;
+    if (!f) return res.status(404).json({ error: 'ファイルが見つかりません' });
+    if (String(f.file_ref).startsWith('drive:')) {
+      try { await driveTrash(String(f.file_ref).slice('drive:'.length)); } catch (e) { console.error('drive trash:', e.message); }
+    } else {
+      try { await supabase.storage.from(CONSTRUCTION_BUCKET).remove([f.file_ref]); } catch { /* noop */ }
+    }
+    await supabase.from('submission_files').delete().eq('id', fileId);
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error (construction file delete):', error.message);
     res.status(500).json({ error: error.message });
   }
 });
