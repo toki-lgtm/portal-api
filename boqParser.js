@@ -369,6 +369,23 @@ export function parseBoqFromXlsx(buffer, sourceFile) {
     }))
     .sort((a, b) => b.amount - a.amount);
 
+  // ── 各ノードに構成比率を付与（別紙明細まで）──
+  //   ratio_total  : 対 直接工事費（共通費の枝は対象外＝null）
+  //   ratio_parent : 対 親ノード（その内訳での割合。最上位は対 直接工事費と同義）
+  const amtByPath = new Map(nodes.map((n) => [n.path, n.amount]));
+  const kindByPath = new Map(nodes.map((n) => [n.path, n.kind]));
+  for (const n of nodes) {
+    const parts = String(n.path).split('.');
+    const underDirect = kindByPath.get(parts[0]) === '種目';   // 直接工事費の枝か
+    n.ratio_total = (underDirect && directTotal > 0 && n.amount != null) ? n.amount / directTotal : null;
+    if (parts.length > 1) {
+      const pAmt = amtByPath.get(parts.slice(0, -1).join('.'));
+      n.ratio_parent = (pAmt > 0 && n.amount != null) ? n.amount / pAmt : null;
+    } else {
+      n.ratio_parent = n.ratio_total;                          // 最上位ノード
+    }
+  }
+
   // チェックリスト絞り込み用：出現した正規化工種の集合
   const presentTrades = Array.from(new Set(summary.map((s) => s.canonical).filter(Boolean)));
 

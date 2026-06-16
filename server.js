@@ -4823,6 +4823,8 @@ async function persistBoq(projectId, parsed, sourceFile) {
     item_name: x.item_name || null, spec: x.spec || null, quantity: x.quantity ?? null,
     unit: x.unit || null, unit_price: x.unit_price ?? null,
     amount: x.amount != null ? Math.round(x.amount) : null, beppi_no: x.beppi_no || null,
+    ratio_total: x.ratio_total != null ? Number(x.ratio_total.toFixed(6)) : null,
+    ratio_parent: x.ratio_parent != null ? Number(x.ratio_parent.toFixed(6)) : null,
     sort_order: x.sort_order ?? 0,
   }));
   for (let i = 0; i < boqRows.length; i += 200) {
