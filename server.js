@@ -4546,11 +4546,13 @@ app.get('/api/construction/stats', requireAuth, requireConstructionAccess, async
     const soon = consAddDays(today, 14);
     const [{ data: projects }, { data: docs }] = await Promise.all([
       supabase.from('construction_projects').select('id,status').eq('is_active', true),
-      supabase.from('submission_documents').select('status,due_date'),
+      supabase.from('submission_documents').select('project_id,status,due_date'),
     ]);
+    const activeIds = new Set((projects || []).map((p) => p.id));
     const activeProjects = (projects || []).filter((p) => p.status !== 'archived').length;
     let dueSoon = 0, overdue = 0, rejected = 0, notStarted = 0;
     for (const d of docs || []) {
+      if (!activeIds.has(d.project_id)) continue; // 削除（論理削除）済み工事の書類は集計しない
       if (d.status === 'rejected') rejected++;
       if (d.status === 'approved' || d.status === 'na') continue;
       if (d.status === 'not_started') notStarted++;
@@ -4563,6 +4565,7 @@ app.get('/api/construction/stats', requireAuth, requireConstructionAccess, async
       total_projects: (projects || []).length,
       active_projects: activeProjects,
       due_soon: dueSoon, overdue, rejected, not_started: notStarted,
+      role: req.consRole?.role || 'member', // 'admin' のときフロントが削除UIを表示
     });
   } catch (error) {
     console.error('Error (construction stats):', error.message);
