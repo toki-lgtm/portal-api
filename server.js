@@ -4816,12 +4816,14 @@ async function persistBoq(projectId, parsed, sourceFile) {
   await supabase.from('construction_boq').delete().eq('project_id', projectId);
   await supabase.from('construction_trade_summary').delete().eq('project_id', projectId);
 
-  const boqRows = parsed.rows.map((x) => ({
+  const boqRows = parsed.nodes.map((x) => ({
     project_id: projectId, source_file: sourceFile || null, sheet_name: x.sheet_name || null,
-    level: x.level ?? 1, trade: x.trade || null, raw_category: x.raw_category || null,
+    kind: x.kind || '細目', level: x.level ?? 2, path: x.path || null, seq: x.seq ?? 0,
+    group_label: x.group_label || null, trade: x.trade || null, raw_category: x.raw_category || null,
     item_name: x.item_name || null, spec: x.spec || null, quantity: x.quantity ?? null,
     unit: x.unit || null, unit_price: x.unit_price ?? null,
-    amount: x.amount != null ? Math.round(x.amount) : null, sort_order: x.sort_order ?? 0,
+    amount: x.amount != null ? Math.round(x.amount) : null, beppi_no: x.beppi_no || null,
+    sort_order: x.sort_order ?? 0,
   }));
   for (let i = 0; i < boqRows.length; i += 200) {
     const { error } = await supabase.from('construction_boq').insert(boqRows.slice(i, i + 200));
@@ -4829,7 +4831,8 @@ async function persistBoq(projectId, parsed, sourceFile) {
   }
 
   const sumRows = parsed.summary.map((t) => ({
-    project_id: projectId, trade: t.trade, amount: Math.round(t.amount || 0),
+    project_id: projectId, trade: t.trade, canonical: t.canonical || null,
+    amount: Math.round(t.amount || 0),
     ratio: t.ratio != null ? Number(t.ratio.toFixed(4)) : null,
     item_count: t.item_count || 0, present: true,
   }));
@@ -4874,8 +4877,8 @@ app.post('/api/construction/projects/:id/import-boq', requireAuth, requireConstr
     }
 
     const parsed = parseBoqFromXlsx(req.file.buffer, originalName);
-    if (parsed.mode === 'empty' || !parsed.rows.length) {
-      return res.status(422).json({ error: '数量書の明細を読み取れませんでした。様式（名称・数量・金額の列）をご確認ください', mode: parsed.mode });
+    if (parsed.mode === 'empty' || !parsed.nodes.length) {
+      return res.status(422).json({ error: '数量書の明細を読み取れませんでした。様式（種目・科目・細目の各シート）をご確認ください', mode: parsed.mode });
     }
 
     await persistBoq(id, parsed, originalName);
@@ -4887,6 +4890,7 @@ app.post('/api/construction/projects/:id/import-boq', requireAuth, requireConstr
       mode: parsed.mode,
       total: parsed.total,
       line_count: parsed.lineCount,
+      counts: parsed.counts,
       present_trades: parsed.presentTrades,
       summary: parsed.summary.map((t) => ({ trade: t.trade, amount: t.amount, ratio: t.ratio, item_count: t.item_count, canonical: t.canonical })),
       na_candidates,  // 承認画面で確認 → apply-checklist-filter で確定
