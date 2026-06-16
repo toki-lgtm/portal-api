@@ -10,6 +10,7 @@ import nodemailer from 'nodemailer';
 import { PDFDocument } from 'pdf-lib';
 import JSZip from 'jszip';
 import { parseEstimateFromXlsx } from './bidEstimate.js';
+import { parseBoqFromXlsx, CANONICAL_TRADES } from './boqParser.js';
 import { driveUpload, driveDownload, driveTrash, driveConfigured, ensureFolderPath } from './googleDrive.js';
 
 dotenv.config();
@@ -4799,6 +4800,139 @@ app.post('/api/construction/projects/:id/generate-checklist', requireAuth, requi
     res.json({ ok: true, generated_documents: generated });
   } catch (error) {
     console.error('Error (construction generate-checklist):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================================
+// 工事管理 - 数量書（内訳書 .xlsx）取込と工種別構成比率  ← migration 026
+//   1) import-boq         : xlsxを解析→明細・工種別集計・構成比率をDB保存し、NA候補を返す
+//   2) GET boq            : 保存済みの明細＋工種別サマリを取得
+//   3) apply-checklist-filter: 承認された不要書類を status='na'（対象外）へ
+// ============================================================
+
+// 解析結果を construction_boq / construction_trade_summary / projects へ保存（再取込は洗替え）
+async function persistBoq(projectId, parsed, sourceFile) {
+  await supabase.from('construction_boq').delete().eq('project_id', projectId);
+  await supabase.from('construction_trade_summary').delete().eq('project_id', projectId);
+
+  const boqRows = parsed.rows.map((x) => ({
+    project_id: projectId, source_file: sourceFile || null, sheet_name: x.sheet_name || null,
+    level: x.level ?? 1, trade: x.trade || null, raw_category: x.raw_category || null,
+    item_name: x.item_name || null, spec: x.spec || null, quantity: x.quantity ?? null,
+    unit: x.unit || null, unit_price: x.unit_price ?? null,
+    amount: x.amount != null ? Math.round(x.amount) : null, sort_order: x.sort_order ?? 0,
+  }));
+  for (let i = 0; i < boqRows.length; i += 200) {
+    const { error } = await supabase.from('construction_boq').insert(boqRows.slice(i, i + 200));
+    if (error) throw error;
+  }
+
+  const sumRows = parsed.summary.map((t) => ({
+    project_id: projectId, trade: t.trade, amount: Math.round(t.amount || 0),
+    ratio: t.ratio != null ? Number(t.ratio.toFixed(4)) : null,
+    item_count: t.item_count || 0, present: true,
+  }));
+  if (sumRows.length) {
+    const { error } = await supabase.from('construction_trade_summary').insert(sumRows);
+    if (error) throw error;
+  }
+
+  await supabase.from('construction_projects')
+    .update({ boq_total: Math.round(parsed.total || 0), boq_imported_at: new Date().toISOString(), updated_at: new Date().toISOString() })
+    .eq('id', projectId);
+}
+
+// 数量書に出現しなかった工種の「工種別書類」をNA候補として算出（共通・着手済みは除外）
+async function computeNaCandidates(projectId, presentTrades) {
+  const present = new Set(presentTrades || []);
+  const { data: docs } = await supabase
+    .from('submission_documents').select('id, doc_name, category, category_no, trade, status')
+    .eq('project_id', projectId)
+    .in('status', ['not_started', 'drafting']);
+  return (docs || []).filter((d) => {
+    const tr = (d.trade || '共通').trim();
+    if (tr === '共通' || !CANONICAL_TRADES.includes(tr)) return false; // 共通・工種非依存は対象外
+    return !present.has(tr);                                            // 数量書に無い工種のみ
+  });
+}
+
+// ✅ 工事管理 - 数量書(xlsx)を取込：明細・構成比率を保存し、不要書類のNA候補を返す
+app.post('/api/construction/projects/:id/import-boq', requireAuth, requireConstructionAccess, upload.single('file'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!req.file) return res.status(400).json({ error: 'file フィールド（数量書 .xlsx）が必要です' });
+    const { data: project, error } = await supabase
+      .from('construction_projects').select('id, project_name').eq('id', id).eq('is_active', true).maybeSingle();
+    if (error) throw error;
+    if (!project) return res.status(404).json({ error: '工事が見つかりません' });
+
+    const originalName = decodeUploadName(req.file.originalname);
+    const ext = (originalName.split('.').pop() || '').toLowerCase();
+    if (!['xlsx', 'xlsm'].includes(ext)) {
+      return res.status(400).json({ error: '数量書は Excel(.xlsx) 形式でアップロードしてください' });
+    }
+
+    const parsed = parseBoqFromXlsx(req.file.buffer, originalName);
+    if (parsed.mode === 'empty' || !parsed.rows.length) {
+      return res.status(422).json({ error: '数量書の明細を読み取れませんでした。様式（名称・数量・金額の列）をご確認ください', mode: parsed.mode });
+    }
+
+    await persistBoq(id, parsed, originalName);
+    const na_candidates = await computeNaCandidates(id, parsed.presentTrades);
+
+    res.json({
+      ok: true,
+      file_name: originalName,
+      mode: parsed.mode,
+      total: parsed.total,
+      line_count: parsed.lineCount,
+      present_trades: parsed.presentTrades,
+      summary: parsed.summary.map((t) => ({ trade: t.trade, amount: t.amount, ratio: t.ratio, item_count: t.item_count, canonical: t.canonical })),
+      na_candidates,  // 承認画面で確認 → apply-checklist-filter で確定
+    });
+  } catch (error) {
+    console.error('Error (construction import-boq):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 工事管理 - 保存済みの数量書（明細＋工種別構成比率）を取得
+app.get('/api/construction/projects/:id/boq', requireAuth, requireConstructionAccess, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const [{ data: rows }, { data: summary }, { data: project }] = await Promise.all([
+      supabase.from('construction_boq').select('*').eq('project_id', id).order('sort_order', { ascending: true }),
+      supabase.from('construction_trade_summary').select('*').eq('project_id', id).order('amount', { ascending: false }),
+      supabase.from('construction_projects').select('boq_total, boq_imported_at').eq('id', id).maybeSingle(),
+    ]);
+    res.json({
+      rows: rows || [],
+      summary: summary || [],
+      total: project?.boq_total ?? null,
+      imported_at: project?.boq_imported_at ?? null,
+    });
+  } catch (error) {
+    console.error('Error (construction boq get):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 工事管理 - 承認された不要書類を「対象外(na)」へ（チェックリスト絞り込みの確定）
+app.post('/api/construction/projects/:id/apply-checklist-filter', requireAuth, requireConstructionAccess, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const ids = Array.isArray(req.body?.document_ids) ? req.body.document_ids.filter((v) => v != null) : [];
+    if (!ids.length) return res.json({ ok: true, updated: 0 });
+    const { data, error } = await supabase
+      .from('submission_documents')
+      .update({ status: 'na', updated_at: new Date().toISOString() })
+      .eq('project_id', id).in('id', ids).in('status', ['not_started', 'drafting'])
+      .select('id');
+    if (error) throw error;
+    res.json({ ok: true, updated: (data || []).length });
+  } catch (error) {
+    console.error('Error (construction apply-checklist-filter):', error.message);
     res.status(500).json({ error: error.message });
   }
 });
