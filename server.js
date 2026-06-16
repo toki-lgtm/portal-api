@@ -4595,10 +4595,19 @@ app.get('/api/construction/projects/:id', requireAuth, requireConstructionAccess
       assignee_name: d.assignee_id ? nameMap[d.assignee_id] || null : null,
       files: filesByDoc[d.id] || [],
     }));
+    // 入札連携: 元の入札案件サマリを付与
+    let bid = null;
+    if (project.bid_project_id) {
+      const { data: b } = await supabase
+        .from('bid_projects').select('id, project_name, status, client_name, awarded_price')
+        .eq('id', project.bid_project_id).maybeSingle();
+      bid = b || null;
+    }
     res.json({
       ...project,
       site_agent_name: project.site_agent_id ? nameMap[project.site_agent_id] || null : null,
       chief_engineer_name: project.chief_engineer_id ? nameMap[project.chief_engineer_id] || null : null,
+      bid,
       documents,
     });
   } catch (error) {
@@ -4627,6 +4636,42 @@ app.post('/api/construction/projects', requireAuth, requireConstructionAccess, a
     res.json({ ...data, generated_documents: generated });
   } catch (error) {
     console.error('Error (construction create):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 工事管理 - 入札案件から工事へ昇格（受注案件の情報を引き継ぐ）
+app.post('/api/construction/projects/from-bid/:bidId', requireAuth, requireConstructionAccess, async (req, res) => {
+  try {
+    const { bidId } = req.params;
+    const { data: bid, error } = await supabase
+      .from('bid_projects').select('*').eq('id', bidId).eq('is_active', true).maybeSingle();
+    if (error) throw error;
+    if (!bid) return res.status(404).json({ error: '入札案件が見つかりません' });
+    if (!['won', 'contracted'].includes(bid.status)) {
+      return res.status(400).json({ error: '受注（落札／契約）した案件のみ工事へ昇格できます' });
+    }
+    // 二重昇格の防止
+    const { data: existing } = await supabase
+      .from('construction_projects').select('id').eq('bid_project_id', bidId).eq('is_active', true).maybeSingle();
+    if (existing) return res.status(409).json({ error: 'この入札案件は既に工事へ昇格済みです', project_id: existing.id });
+
+    const payload = {
+      bid_project_id: bid.id,
+      project_name: bid.project_name,
+      location: bid.location || null,
+      client_org: bid.client_name || '九州防衛局',
+      contract_amount: bid.awarded_price ?? bid.our_estimate ?? null,
+      status: 'preparing',
+      created_by: req.user.email,
+    };
+    const { data, error: insErr } = await supabase
+      .from('construction_projects').insert([payload]).select('*').single();
+    if (insErr) throw insErr;
+    const generated = await generateChecklist(data, req.user.email);
+    res.json({ ...data, generated_documents: generated });
+  } catch (error) {
+    console.error('Error (construction from-bid):', error.message);
     res.status(500).json({ error: error.message });
   }
 });
