@@ -366,7 +366,8 @@ app.get('/api/apps', requireAuth, async (req, res) => {
       { id: 9, key: 'feedback', name: 'バグ報告・改善 一覧', icon: '🐞', internal: true, view: 'feedback', description: '寄せられた不具合・改善要望の確認とトリアージ' },
       { id: 10, key: 'documents', name: '文書回覧', icon: '🗂️', internal: true, view: 'documents', description: '回覧書類の電子化・既読/対応管理' },
       { id: 11, key: 'workscope', name: 'WorkScope 導入', icon: '🖥️', internal: true, view: 'workscope', description: '業務記録ツールの導入（インストーラーのダウンロード）' },
-      { id: 12, key: 'construction', name: '工事管理', icon: '🏗️', internal: true, view: 'construction', description: '工事の提出書類・検査書類の進捗を管理（九州防衛局 建築工事）' }
+      { id: 12, key: 'construction', name: '工事管理', icon: '🏗️', internal: true, view: 'construction', description: '工事の提出書類・検査書類の進捗を管理（九州防衛局 建築工事）' },
+      { id: 13, key: 'regulations', name: '法令集', icon: '📚', internal: true, view: 'regulations', description: '建設・不動産・林業・労務・会社経営の法令を条文単位で検索・閲覧' },
     ];
 
     // 権限フィルタ: グローバル管理者は全件。それ以外は app_permissions に行があるアプリのみ。
@@ -1616,7 +1617,7 @@ app.put('/api/user/settings', requireAuth, async (req, res) => {
 // ============================================================
 
 // 既知のアプリキー（/api/apps と権限UIで共有）
-const APP_KEYS = ['safety-patrol', 'employee-list', 'announcements', 'bids', 'documents', 'feedback', 'workscope'];
+const APP_KEYS = ['safety-patrol', 'employee-list', 'announcements', 'bids', 'documents', 'feedback', 'workscope', 'construction', 'regulations'];
 
 // staffId のアプリ別権限を { app_key: 'member'|'admin' } のマップで返す
 async function resolveAppPermissions(staffId) {
@@ -4913,6 +4914,10 @@ app.post('/api/construction/projects/:id/import-boq', requireAuth, requireConstr
     if (changeId != null && isNaN(changeId)) {
       return res.status(400).json({ error: 'change_id は数値で指定してください' });
     }
+    // boq_mode: change_id 指定時のみ有効（'full'=全体版 / 'delta'=変更分のみ）。既定 'full'
+    const rawBoqMode = req.body?.boq_mode ?? req.query?.boq_mode ?? 'full';
+    const boqMode = ['full', 'delta'].includes(rawBoqMode) ? rawBoqMode : 'full';
+
     // 変更版指定の場合、該当設計変更の存在確認
     if (changeId != null) {
       const { data: chk } = await supabase
@@ -4926,6 +4931,19 @@ app.post('/api/construction/projects/:id/import-boq', requireAuth, requireConstr
     }
 
     await persistBoq(id, parsed, originalName, changeId);
+
+    // 変更版取込後は design_changes に boq_mode / boq_total / boq_imported_at を記録
+    if (changeId != null) {
+      await supabase.from('construction_design_changes')
+        .update({
+          boq_mode: boqMode,
+          boq_total: Math.round(parsed.total || 0),
+          boq_imported_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', changeId);
+    }
+
     // NA候補は当初版のみ算出（変更版取込時はスキップ）
     const na_candidates = changeId == null ? await computeNaCandidates(id, parsed.presentTrades) : [];
 
@@ -4933,6 +4951,7 @@ app.post('/api/construction/projects/:id/import-boq', requireAuth, requireConstr
       ok: true,
       file_name: originalName,
       mode: parsed.mode,
+      boq_mode: changeId != null ? boqMode : null,  // 変更版のみ付与
       total: parsed.total,
       line_count: parsed.lineCount,
       counts: parsed.counts,
@@ -5026,6 +5045,110 @@ app.get('/api/construction/projects/:id/boq-compare', requireAuth, requireConstr
     });
   } catch (error) {
     console.error('Error (construction boq-compare):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 工事管理 - 設計変更の「変更後」集計を boq_mode を考慮して解決して返す
+// ?change_id=N: 対象設計変更ID（必須）
+// full 版: 変更版サマリをそのまま「変更後」として使用。変更版に無い当初工種は after=0（撤去）。
+// delta 版: 当初額 + 変更版(増減)額 で「変更後」を算出。変更版に無い工種は当初のまま維持。
+app.get('/api/construction/projects/:id/boq-resolved', requireAuth, requireConstructionAccess, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const rawChangeId = req.query?.change_id ?? null;
+    if (rawChangeId == null || rawChangeId === '') {
+      return res.status(400).json({ error: 'change_id クエリパラメータが必要です' });
+    }
+    const changeId = Number(rawChangeId);
+    if (isNaN(changeId)) return res.status(400).json({ error: 'change_id は数値で指定してください' });
+
+    // 設計変更ヘッダ取得（boq_mode / change_no を参照）
+    const { data: changeRow, error: cErr } = await supabase
+      .from('construction_design_changes')
+      .select('id, change_no, boq_mode, boq_total, boq_imported_at')
+      .eq('id', changeId).eq('project_id', id).eq('is_active', true).maybeSingle();
+    if (cErr) throw cErr;
+    if (!changeRow) return res.status(404).json({ error: '指定された設計変更が見つかりません' });
+
+    const boqMode = changeRow.boq_mode || 'full';
+
+    // 当初版と変更版のサマリ・明細を並行取得
+    const [
+      { data: baseSummary },
+      { data: changeSummary },
+      { data: changeRows },
+    ] = await Promise.all([
+      supabase.from('construction_trade_summary').select('trade, amount').eq('project_id', id).is('change_id', null),
+      supabase.from('construction_trade_summary').select('trade, amount').eq('project_id', id).eq('change_id', changeId),
+      supabase.from('construction_boq').select('*').eq('project_id', id).eq('change_id', changeId).order('sort_order', { ascending: true }),
+    ]);
+
+    // 工種マップ化
+    const baseMap = {};
+    for (const r of baseSummary || []) baseMap[r.trade] = r.amount || 0;
+    const changeMap = {};
+    for (const r of changeSummary || []) changeMap[r.trade] = r.amount || 0;
+    const deltaTradeSet = new Set(Object.keys(changeMap)); // delta 版で存在する工種
+
+    // 変更後を解決する全工種リスト
+    let allTrades;
+    if (boqMode === 'full') {
+      // full: 変更版に存在する工種 + 当初版の工種（変更版に無い当初工種は after=0）
+      allTrades = Array.from(new Set([...Object.keys(baseMap), ...Object.keys(changeMap)]));
+    } else {
+      // delta: 当初版の工種 + delta に出現した追加工種 の統合
+      allTrades = Array.from(new Set([...Object.keys(baseMap), ...Object.keys(changeMap)]));
+    }
+
+    // 工種別の変更後額を算出
+    const base_total = (baseSummary || []).reduce((s, r) => s + (r.amount || 0), 0);
+
+    const trades = allTrades.map((trade) => {
+      const base_amount = baseMap[trade] ?? 0;
+      const delta_amount = changeMap[trade] ?? 0;
+
+      let after_amount;
+      let changed;
+      if (boqMode === 'full') {
+        // full: 変更版にある額がそのまま変更後。変更版に無い工種は0（撤去）
+        after_amount = changeMap.hasOwnProperty(trade) ? (changeMap[trade] || 0) : 0;
+        changed = base_amount !== after_amount;
+      } else {
+        // delta: 当初額 + 増減額
+        after_amount = base_amount + delta_amount;
+        changed = deltaTradeSet.has(trade);
+      }
+
+      return { trade, base_amount, after_amount, diff: after_amount - base_amount, ratio: null, changed };
+    });
+
+    // 変更後合計
+    const change_total = trades.reduce((s, t) => s + t.after_amount, 0);
+
+    // ratio を付与（0除算ガード）
+    for (const t of trades) {
+      t.ratio = change_total > 0 ? Number((t.after_amount / change_total).toFixed(6)) : 0;
+    }
+
+    // after_amount 降順でソート
+    trades.sort((a, b) => b.after_amount - a.after_amount);
+
+    // rows: 変更版の BOQ 明細にそのまま is_delta フラグを付与
+    const rows = (changeRows || []).map((r) => ({ ...r, is_delta: boqMode === 'delta' }));
+
+    res.json({
+      change_id: changeId,
+      change_no: changeRow.change_no,
+      boq_mode: boqMode,
+      base_total,
+      change_total,
+      diff: change_total - base_total,
+      trades,
+      rows,
+    });
+  } catch (error) {
+    console.error('Error (construction boq-resolved):', error.message);
     res.status(500).json({ error: error.message });
   }
 });
@@ -7330,6 +7453,571 @@ app.delete('/api/circulars/:id', requireAuth, requireDocAdmin, async (req, res) 
     res.json({ ok: true });
   } catch (error) {
     console.error('Error (circular delete):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================================
+// ===== 法令集 API =====  ← migration 030
+//   e-Gov法令APIから取込んだ条文データの検索・閲覧・ブックマーク。
+//   - 閲覧・検索・ブックマーク : requireRegulationsAccess（member 以上）
+//   - 同期スタブ              : requireRegulationsAdmin（admin のみ）
+//   権限は staff_app_permissions['regulations'] で管理。
+//   出典: 出典：e-Gov法令検索（https://laws.e-gov.go.jp/）
+// ============================================================
+
+// 法令集のロール解決（app_key='regulations'）。construction と同じ方式。
+async function resolveRegulationsRole(email) {
+  const perms = await resolvePermissions(email); // { role, staffId } グローバル
+  if (perms.role === 'admin') return { role: 'admin', access: true, staffId: perms.staffId, globalAdmin: true };
+  let level = null;
+  if (perms.staffId) {
+    const { data } = await supabase
+      .from('staff_app_permissions')
+      .select('access_level')
+      .eq('staff_id', perms.staffId)
+      .eq('app_key', 'regulations')
+      .maybeSingle();
+    level = data?.access_level || null;
+  }
+  const role = level === 'admin' ? 'admin' : level ? 'member' : 'none';
+  return { role, access: role !== 'none', staffId: perms.staffId, globalAdmin: false };
+}
+
+// 法令集の閲覧権限（member 以上）。要 requireAuth 後段。
+async function requireRegulationsAccess(req, res, next) {
+  try {
+    const r = await resolveRegulationsRole(req.user.email);
+    if (!r.access) return res.status(403).json({ error: '法令集へのアクセス権がありません' });
+    req.regRole = r;
+    next();
+  } catch (e) { res.status(500).json({ error: e.message }); }
+}
+
+// 法令集の管理権限（admin のみ）。要 requireAuth 後段。
+async function requireRegulationsAdmin(req, res, next) {
+  try {
+    const r = await resolveRegulationsRole(req.user.email);
+    if (r.role !== 'admin') return res.status(403).json({ error: 'この操作は法令集の管理者のみ可能です' });
+    req.regRole = r;
+    next();
+  } catch (e) { res.status(500).json({ error: e.message }); }
+}
+
+// 分類コードと日本語ラベルの固定マスタ（e-Gov 事項別分類コードに基づく社内絞り込み用）
+const REGULATIONS_CATEGORY_MAP = [
+  { code: '47', label: '建設業' },
+  { code: '22', label: '建築・住宅' },
+  { code: '23', label: '土地' },
+  { code: '09', label: '林業' },
+  { code: '03', label: '労働基準' },
+  { code: '04', label: '職業安定・雇用対策' },
+  { code: '05', label: '労働安全衛生' },
+  { code: '13', label: '民法・商法' },
+  { code: '14', label: '会社法' },
+  { code: '17', label: '税務' },
+];
+
+// snippet: 条文 content の中からキーワード周辺 ±60文字を抽出するJS側ユーティリティ
+function extractSnippet(text, keyword, radius) {
+  if (!text || !keyword) return text ? text.slice(0, 120) : '';
+  const r = radius != null ? radius : 60;
+  const idx = text.toLowerCase().indexOf(String(keyword).toLowerCase());
+  if (idx < 0) return text.slice(0, 120);
+  const start = Math.max(0, idx - r);
+  const end   = Math.min(text.length, idx + keyword.length + r);
+  return (start > 0 ? '…' : '') + text.slice(start, end) + (end < text.length ? '…' : '');
+}
+
+// 条文リストから編章節の階層ツリーを構築するJS側ユーティリティ
+// articles: regulations_article[] を sort_order 昇順で渡す
+// 返値: [ { level:'part'|'chapter'|'section'|'article', num, title, articles:[...] } ]
+function buildTocTree(articles) {
+  const toc = [];
+  let curPart = null, curChapter = null, curSection = null;
+
+  for (const a of articles) {
+    // 編
+    const partKey = a.part_num ? `${a.part_num}|${a.part_title || ''}` : null;
+    if (partKey && (!curPart || curPart.key !== partKey)) {
+      curPart = { key: partKey, level: 'part', num: a.part_num, title: a.part_title || null, chapters: [] };
+      toc.push(curPart);
+      curChapter = null;
+      curSection = null;
+    }
+    // 章
+    const chapKey = a.chapter_num ? `${a.chapter_num}|${a.chapter_title || ''}` : null;
+    if (chapKey && (!curChapter || curChapter.key !== chapKey)) {
+      curChapter = { key: chapKey, level: 'chapter', num: a.chapter_num, title: a.chapter_title || null, sections: [] };
+      (curPart ? curPart.chapters : toc).push(curChapter);
+      curSection = null;
+    }
+    // 節
+    const secKey = a.section_num ? `${a.section_num}|${a.section_title || ''}` : null;
+    if (secKey && (!curSection || curSection.key !== secKey)) {
+      curSection = { key: secKey, level: 'section', num: a.section_num, title: a.section_title || null, articles: [] };
+      (curChapter ? curChapter.sections : curPart ? curPart.chapters : toc).push(curSection);
+    }
+    // 条（目次用に最小情報のみ）
+    const artEntry = { level: 'article', id: a.id, num: a.article_num, caption: a.article_caption || null };
+    if (curSection) {
+      curSection.articles.push(artEntry);
+    } else if (curChapter) {
+      curChapter.sections.push(artEntry);
+    } else if (curPart) {
+      curPart.chapters.push(artEntry);
+    } else {
+      toc.push(artEntry);
+    }
+  }
+  return toc;
+}
+
+// ✅ 法令集 - フィルタ用メタ情報（ドメイン一覧・分類・法令種別）
+//    GET /api/regulations/meta
+app.get('/api/regulations/meta', requireAuth, requireRegulationsAccess, async (req, res) => {
+  try {
+    // distinct の category_labels は GIN 配列なので JS 側で集約する
+    const { data: laws, error } = await supabase
+      .from('regulations_law')
+      .select('category_labels')
+      .eq('is_current', true);
+    if (error) throw error;
+
+    // ユニークなカテゴリラベルを集約
+    const labelSet = new Set();
+    for (const row of laws || []) {
+      for (const lbl of (row.category_labels || [])) {
+        if (lbl) labelSet.add(lbl);
+      }
+    }
+    const domains = [...labelSet].sort();
+
+    const typeLabels = {
+      Constitution: '憲法',
+      Act: '法律',
+      CabinetOrder: '政令',
+      ImperialOrder: '勅令',
+      MinisterialOrdinance: '省令',
+      Rule: '規則',
+    };
+
+    res.json({
+      domains,
+      categories: REGULATIONS_CATEGORY_MAP,
+      typeLabels,
+      attribution: '出典：e-Gov法令検索（https://laws.e-gov.go.jp/）',
+    });
+  } catch (error) {
+    console.error('Error (regulations meta):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 法令集 - 法令一覧
+//    GET /api/regulations/laws?q=&category=&type=&core=&parentOnly=
+//    返却: id, law_id, law_num, title, law_type, law_type_label, category_cd,
+//           category_labels, relation_type, parent_law_id, is_core, is_current,
+//           enforcement_date, article_count
+app.get('/api/regulations/laws', requireAuth, requireRegulationsAccess, async (req, res) => {
+  try {
+    const { q, category, type: lawType, core, parentOnly } = req.query;
+
+    let query = supabase
+      .from('regulations_law')
+      .select('id, law_id, law_num, title, law_type, law_type_label, category_cd, category_labels, relation_type, parent_law_id, is_core, is_current, enforcement_date, article_count')
+      .eq('is_current', true);
+
+    // 法令種別フィルタ
+    if (lawType) query = query.eq('law_type', lawType);
+    // コア法令のみ
+    if (core === 'true' || core === '1') query = query.eq('is_core', true);
+    // 本法のみ（施行令・施行規則を除く）
+    if (parentOnly === 'true' || parentOnly === '1') query = query.eq('relation_type', 'self');
+    // 法令名の部分一致（pg_trgm GIN 索引が効く）
+    if (q) query = query.ilike('title', `%${q}%`);
+    // 分類コードフィルタ（GIN 配列に含むか）
+    if (category) query = query.contains('category_cd', [category]);
+
+    query = query.order('title', { ascending: true });
+
+    const { data, error } = await query;
+    if (error) throw error;
+    res.json(data || []);
+  } catch (error) {
+    console.error('Error (regulations laws list):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 法令集 - 法令詳細（子法令・目次・改正履歴を含む）
+//    GET /api/regulations/laws/:id
+app.get('/api/regulations/laws/:id', requireAuth, requireRegulationsAccess, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // 法令本体
+    const { data: law, error: lErr } = await supabase
+      .from('regulations_law')
+      .select('*')
+      .eq('id', id)
+      .maybeSingle();
+    if (lErr) throw lErr;
+    if (!law) return res.status(404).json({ error: '法令が見つかりません' });
+
+    // 子法令（施行令・施行規則など）
+    const { data: children, error: cErr } = await supabase
+      .from('regulations_law')
+      .select('id, law_id, title, law_type, law_type_label, relation_type, article_count, is_current')
+      .eq('parent_law_id', id)
+      .eq('is_current', true)
+      .order('relation_type', { ascending: true });
+    if (cErr) throw cErr;
+
+    // 目次（条文の階層情報を使って構築）
+    const { data: articles, error: aErr } = await supabase
+      .from('regulations_article')
+      .select('id, article_num, article_caption, part_num, part_title, chapter_num, chapter_title, section_num, section_title, division, sort_order')
+      .eq('law_id', id)
+      .order('sort_order', { ascending: true });
+    if (aErr) throw aErr;
+    const toc = buildTocTree(articles || []);
+
+    // 改正履歴
+    const { data: revisions, error: rErr } = await supabase
+      .from('regulations_revision')
+      .select('*')
+      .eq('law_id', id)
+      .order('enforcement_date', { ascending: false });
+    if (rErr) throw rErr;
+
+    res.json({ ...law, children: children || [], toc, revisions: revisions || [] });
+  } catch (error) {
+    console.error('Error (regulations law detail):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 法令集 - 条文一覧（sort_order 昇順、全カラム）
+//    GET /api/regulations/laws/:id/articles
+app.get('/api/regulations/laws/:id/articles', requireAuth, requireRegulationsAccess, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { data, error } = await supabase
+      .from('regulations_article')
+      .select('*')
+      .eq('law_id', id)
+      .order('sort_order', { ascending: true });
+    if (error) throw error;
+    res.json(data || []);
+  } catch (error) {
+    console.error('Error (regulations articles list):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 法令集 - 単一条文詳細（参照リンクを含む）
+//    GET /api/regulations/articles/:id
+app.get('/api/regulations/articles/:id', requireAuth, requireRegulationsAccess, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // 条文本体
+    const { data: article, error: aErr } = await supabase
+      .from('regulations_article')
+      .select('*')
+      .eq('id', id)
+      .maybeSingle();
+    if (aErr) throw aErr;
+    if (!article) return res.status(404).json({ error: '条文が見つかりません' });
+
+    // この条文を参照元とする参照リンク（from_article_id = :id）
+    const { data: refs, error: rErr } = await supabase
+      .from('regulations_reference')
+      .select('id, to_law_id, to_law_title, to_article_num, ref_text, ref_type')
+      .eq('from_article_id', id);
+    if (rErr) throw rErr;
+
+    res.json({ ...article, references: refs || [] });
+  } catch (error) {
+    console.error('Error (regulations article detail):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 法令集 - 条文横断全文検索（pg_trgm GIN 索引が効く .ilike）
+//    GET /api/regulations/search?q=&lawId=&limit=
+//    返却: article_id, law_id, law_title, article_num, article_caption, snippet, division
+app.get('/api/regulations/search', requireAuth, requireRegulationsAccess, async (req, res) => {
+  try {
+    const { q, lawId, limit: limitRaw } = req.query;
+    if (!q || !String(q).trim()) return res.status(400).json({ error: 'クエリ q は必須です' });
+
+    const limit = Math.min(Number(limitRaw) || 50, 200);
+    const needle = String(q).trim();
+
+    // content または article_caption に部分一致する条文を取得
+    let query = supabase
+      .from('regulations_article')
+      .select('id, law_id, article_num, article_caption, content, division')
+      .or(`content.ilike.%${needle}%,article_caption.ilike.%${needle}%`)
+      .limit(limit);
+    if (lawId) query = query.eq('law_id', lawId);
+
+    const { data: articles, error: aErr } = await query;
+    if (aErr) throw aErr;
+
+    if (!articles || articles.length === 0) return res.json([]);
+
+    // 法令タイトルを一括取得（一意の law_id セット）
+    const lawIds = [...new Set(articles.map((a) => a.law_id))];
+    const { data: laws, error: lErr } = await supabase
+      .from('regulations_law')
+      .select('id, title')
+      .in('id', lawIds);
+    if (lErr) throw lErr;
+    const lawTitleMap = {};
+    for (const l of laws || []) lawTitleMap[l.id] = l.title;
+
+    // JS 側で snippet を生成（マッチ周辺 ±60 文字）
+    const result = articles.map((a) => ({
+      article_id: a.id,
+      law_id: a.law_id,
+      law_title: lawTitleMap[a.law_id] || null,
+      article_num: a.article_num,
+      article_caption: a.article_caption || null,
+      snippet: extractSnippet(a.content, needle, 60),
+      division: a.division,
+    }));
+
+    res.json(result);
+  } catch (error) {
+    console.error('Error (regulations search):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 法令集 - 改正履歴一覧（enforcement_date 降順）
+//    GET /api/regulations/laws/:id/revisions
+app.get('/api/regulations/laws/:id/revisions', requireAuth, requireRegulationsAccess, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { data, error } = await supabase
+      .from('regulations_revision')
+      .select('*')
+      .eq('law_id', id)
+      .order('enforcement_date', { ascending: false });
+    if (error) throw error;
+    res.json(data || []);
+  } catch (error) {
+    console.error('Error (regulations revisions):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================================
+// 法令集 - ブックマーク（自分のもののみ操作可）
+// ============================================================
+
+// ✅ 法令集 - ブックマーク一覧（law title / article caption を join して返す）
+//    GET /api/regulations/bookmarks
+app.get('/api/regulations/bookmarks', requireAuth, requireRegulationsAccess, async (req, res) => {
+  try {
+    const email = String(req.user.email || '').toLowerCase();
+
+    const { data, error } = await supabase
+      .from('regulations_bookmark')
+      .select('id, law_id, article_id, memo, color, created_at, updated_at')
+      .eq('user_email', email)
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+
+    const bms = data || [];
+    if (bms.length === 0) return res.json([]);
+
+    // 法令タイトルを一括 join
+    const lawIds = [...new Set(bms.map((b) => b.law_id))];
+    const { data: laws } = await supabase
+      .from('regulations_law')
+      .select('id, title')
+      .in('id', lawIds);
+    const lawMap = {};
+    for (const l of laws || []) lawMap[l.id] = l.title;
+
+    // 条文見出しを一括 join（article_id が null のブックマークは法令単位）
+    const artIds = bms.map((b) => b.article_id).filter(Boolean);
+    const artMap = {};
+    if (artIds.length > 0) {
+      const { data: arts } = await supabase
+        .from('regulations_article')
+        .select('id, article_num, article_caption')
+        .in('id', artIds);
+      for (const a of arts || []) artMap[a.id] = { num: a.article_num, caption: a.article_caption };
+    }
+
+    const result = bms.map((b) => ({
+      ...b,
+      law_title: lawMap[b.law_id] || null,
+      article_num: b.article_id ? (artMap[b.article_id]?.num || null) : null,
+      article_caption: b.article_id ? (artMap[b.article_id]?.caption || null) : null,
+    }));
+    res.json(result);
+  } catch (error) {
+    console.error('Error (regulations bookmarks list):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 法令集 - ブックマーク作成・更新（upsert）
+//    POST /api/regulations/bookmarks  { law_id, article_id?, memo?, color? }
+//    UNIQUE(user_email, law_id, article_id) で upsert。
+app.post('/api/regulations/bookmarks', requireAuth, requireRegulationsAccess, async (req, res) => {
+  try {
+    const email = String(req.user.email || '').toLowerCase();
+    const b = req.body || {};
+
+    if (!b.law_id) return res.status(400).json({ error: 'law_id は必須です' });
+
+    // staff_id を email から解決（未登録なら null）
+    const regRole = req.regRole; // requireRegulationsAccess で設定済み
+    const staffId = regRole?.staffId || null;
+
+    const lawId = Number(b.law_id);
+    const articleId = b.article_id != null ? Number(b.article_id) : null;
+    const row = {
+      user_email: email,
+      law_id: lawId,
+      article_id: articleId,
+      memo: b.memo || null,
+      color: b.color || null,
+      staff_id: staffId,
+      updated_at: new Date().toISOString(),
+    };
+
+    // PostgreSQL の UNIQUE は NULL を重複とみなさないため（法令単位=article_id NULL）、
+    // onConflict ではなく明示的に存在確認 → 更新／挿入する。
+    let existsQuery = supabase
+      .from('regulations_bookmark')
+      .select('id')
+      .eq('user_email', email)
+      .eq('law_id', lawId);
+    existsQuery = articleId != null
+      ? existsQuery.eq('article_id', articleId)
+      : existsQuery.is('article_id', null);
+    const { data: existing, error: findErr } = await existsQuery.maybeSingle();
+    if (findErr) throw findErr;
+
+    let data, error;
+    if (existing) {
+      ({ data, error } = await supabase
+        .from('regulations_bookmark')
+        .update({ memo: row.memo, color: row.color, updated_at: row.updated_at })
+        .eq('id', existing.id)
+        .select('*')
+        .single());
+    } else {
+      ({ data, error } = await supabase
+        .from('regulations_bookmark')
+        .insert(row)
+        .select('*')
+        .single());
+    }
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (regulations bookmark upsert):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 法令集 - ブックマーク更新（memo / color のみ）
+//    PUT /api/regulations/bookmarks/:id  { memo?, color? }
+app.put('/api/regulations/bookmarks/:id', requireAuth, requireRegulationsAccess, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const email = String(req.user.email || '').toLowerCase();
+    const b = req.body || {};
+
+    // 自分のブックマークか確認
+    const { data: existing, error: exErr } = await supabase
+      .from('regulations_bookmark')
+      .select('id')
+      .eq('id', id)
+      .eq('user_email', email)
+      .maybeSingle();
+    if (exErr) throw exErr;
+    if (!existing) return res.status(404).json({ error: 'ブックマークが見つかりません' });
+
+    const payload = { updated_at: new Date().toISOString() };
+    if ('memo' in b) payload.memo = b.memo || null;
+    if ('color' in b) payload.color = b.color || null;
+
+    const { data, error } = await supabase
+      .from('regulations_bookmark')
+      .update(payload)
+      .eq('id', id)
+      .eq('user_email', email)
+      .select('*')
+      .single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (regulations bookmark update):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 法令集 - ブックマーク削除（自分のもののみ）
+//    DELETE /api/regulations/bookmarks/:id
+app.delete('/api/regulations/bookmarks/:id', requireAuth, requireRegulationsAccess, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const email = String(req.user.email || '').toLowerCase();
+
+    const { data, error } = await supabase
+      .from('regulations_bookmark')
+      .delete()
+      .eq('id', id)
+      .eq('user_email', email)
+      .select('id');
+    if (error) throw error;
+    if (!data || data.length === 0) return res.status(404).json({ error: 'ブックマークが見つかりません' });
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error (regulations bookmark delete):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 法令集 - 同期スタブ（admin のみ。実際の同期は cron で実行）
+//    POST /api/regulations/sync
+//    本番では regulations/sync.js --core を cron（Render の Cron Job 等）で定期実行する。
+//    このエンドポイントは「同期は cron で行われる」旨を返すスタブ。
+//    オプションで spawn による即時起動を試みるが、失敗しても 500 にしない。
+app.post('/api/regulations/sync', requireAuth, requireRegulationsAdmin, async (req, res) => {
+  try {
+    // spawn での即時起動を試みる（detach して API は即座に返す）
+    let spawned = false;
+    try {
+      const { spawn } = await import('child_process');
+      const child = spawn('node', ['regulations/sync.js', '--core'], {
+        detached: true,
+        stdio: 'ignore',
+      });
+      child.unref();
+      spawned = true;
+    } catch (spawnErr) {
+      console.warn('regulations sync spawn 失敗（無視）:', spawnErr.message);
+    }
+    res.json({
+      ok: true,
+      message: spawned
+        ? '同期プロセスをバックグラウンドで起動しました（regulations/sync.js --core）'
+        : '同期は Render の Cron Job（regulations/sync.js --core）で定期実行されます',
+      note: 'e-Gov法令APIからのデータ取得は時間がかかるため、このエンドポイントでは即時完了を保証しません',
+    });
+  } catch (error) {
+    console.error('Error (regulations sync):', error.message);
     res.status(500).json({ error: error.message });
   }
 });
