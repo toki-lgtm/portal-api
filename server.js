@@ -4207,7 +4207,37 @@ app.post('/api/bids/extract', requireAuth, requireBidAccess, upload.array('files
   }
 });
 
-// ✅ 入札 - 資料アップロード（multer → Supabase Storage）
+// ── 入札資料: 保存ヘルパー（共有ドライブ優先＝標準ストレージ方針。cert/circular/工事管理と同方式）──
+//   Drive: "drive:<fileId>"（（DRIVE_FOLDER_ID）/入札案件/<案件名>/）。未設定時のみ Supabase バケットへフォールバック。
+async function storeBidFile({ projectName, fileName, buffer, mimeType, fallbackPath }) {
+  if (driveConfigured()) {
+    const folderId = await ensureFolderPath(['入札案件', sanitizeDriveSeg(projectName || '未設定')]);
+    const fileId = await driveUpload({ name: fileName, buffer, mimeType, folderId });
+    return `drive:${fileId}`;
+  }
+  const { error } = await supabase.storage.from(BID_BUCKET).upload(fallbackPath, buffer, { contentType: mimeType });
+  if (error) throw error;
+  return fallbackPath;
+}
+// 署名トークンで保護された入札資料の Drive プロキシ配信
+app.get('/api/bid-file', async (req, res) => {
+  try {
+    const token = req.query.t;
+    if (!token) return res.status(400).send('missing token');
+    let payload;
+    try { payload = jwt.verify(token, JWT_SECRET); } catch { return res.status(401).send('invalid or expired token'); }
+    if (payload.kind !== 'bid' || !payload.fileId) return res.status(400).send('bad token');
+    const { buffer, contentType } = await driveDownload(payload.fileId);
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('Cache-Control', 'private, max-age=120');
+    res.send(buffer);
+  } catch (error) {
+    console.error('Error (bid-file proxy):', error.message);
+    res.status(error.status || 500).send(error.message);
+  }
+});
+
+// ✅ 入札 - 資料アップロード（共有ドライブ保存）
 app.post('/api/bids/:id/documents', requireAuth, requireBidAccess, upload.single('file'), async (req, res) => {
   try {
     const { id } = req.params;
@@ -4215,19 +4245,22 @@ app.post('/api/bids/:id/documents', requireAuth, requireBidAccess, upload.single
 
     const originalName = decodeUploadName(req.file.originalname); // 日本語ファイル名の文字化け補正
     const ext = (originalName.split('.').pop() || 'bin').toLowerCase();
-    const path = `${id}/${Date.now()}-${uuidv4()}.${ext}`;
-
-    const { error: upErr } = await supabase.storage
-      .from(BID_BUCKET)
-      .upload(path, req.file.buffer, { contentType: req.file.mimetype });
-    if (upErr) throw upErr;
+    const { data: bidRow } = await supabase
+      .from('bid_projects').select('project_name').eq('id', id).maybeSingle();
+    const storagePath = await storeBidFile({
+      projectName: bidRow?.project_name,
+      fileName: originalName,
+      buffer: req.file.buffer,
+      mimeType: req.file.mimetype,
+      fallbackPath: `${id}/${Date.now()}-${uuidv4()}.${ext}`,
+    });
 
     const { data, error } = await supabase
       .from('bid_documents')
       .insert([{
         bid_id: id,
         file_name: originalName,
-        storage_path: path,
+        storage_path: storagePath,
         doc_type: req.body.doc_type || null,
         size_bytes: req.file.size,
         uploaded_by: req.user.email,
@@ -4239,7 +4272,7 @@ app.post('/api/bids/:id/documents', requireAuth, requireBidAccess, upload.single
     res.json(data);
   } catch (error) {
     console.error('Error (bid doc upload):', error.message);
-    res.status(500).json({ error: error.message });
+    res.status(error.status || 500).json({ error: error.message });
   }
 });
 
@@ -4255,6 +4288,13 @@ app.get('/api/bids/:id/documents/:docId/url', requireAuth, requireBidAccess, asy
     if (error) throw error;
     if (!doc) return res.status(404).json({ error: '資料が見つかりません' });
 
+    // Drive 保存（drive:<id>）は短命JWTプロキシURL、従来Supabase保存分は署名URL（後方互換）
+    if (String(doc.storage_path).startsWith('drive:')) {
+      const fileId = String(doc.storage_path).slice('drive:'.length);
+      const token = jwt.sign({ fileId, kind: 'bid' }, JWT_SECRET, { expiresIn: 120 });
+      const base = process.env.PUBLIC_API_URL || 'https://portal-api-hhlx.onrender.com';
+      return res.json({ url: `${base}/api/bid-file?t=${encodeURIComponent(token)}`, file_name: doc.file_name });
+    }
     const { data, error: sErr } = await supabase.storage
       .from(BID_BUCKET)
       .createSignedUrl(doc.storage_path, 120);
@@ -4277,7 +4317,11 @@ app.delete('/api/bids/:id/documents/:docId', requireAuth, requireBidAdmin, async
       .eq('id', docId)
       .maybeSingle();
     if (doc?.storage_path) {
-      await supabase.storage.from(BID_BUCKET).remove([doc.storage_path]);
+      if (String(doc.storage_path).startsWith('drive:')) {
+        try { await driveTrash(String(doc.storage_path).slice('drive:'.length)); } catch (e) { console.error('drive trash:', e.message); }
+      } else {
+        await supabase.storage.from(BID_BUCKET).remove([doc.storage_path]);
+      }
     }
     const { error } = await supabase.from('bid_documents').delete().eq('id', docId);
     if (error) throw error;
@@ -4296,7 +4340,7 @@ app.post('/api/bids/:id/import-estimate', requireAuth, requireBidAccess, upload.
     if (!req.file) return res.status(400).json({ error: 'file フィールドが必要です' });
 
     const { data: bid, error: bidErr } = await supabase
-      .from('bid_projects').select('id').eq('id', id).eq('is_active', true).maybeSingle();
+      .from('bid_projects').select('id, project_name').eq('id', id).eq('is_active', true).maybeSingle();
     if (bidErr) throw bidErr;
     if (!bid) return res.status(404).json({ error: '案件が見つかりません' });
 
@@ -4314,15 +4358,18 @@ app.post('/api/bids/:id/import-estimate', requireAuth, requireBidAccess, upload.
       console.error('Excel parse error:', e.message);
     }
 
-    // 資料として Storage 保存＋メタ登録
-    const path = `${id}/${Date.now()}-${uuidv4()}.${ext}`;
-    const { error: upErr } = await supabase.storage
-      .from(BID_BUCKET).upload(path, req.file.buffer, { contentType: req.file.mimetype });
-    if (upErr) throw upErr;
+    // 資料として保存＋メタ登録（共有ドライブ優先）
+    const storagePath = await storeBidFile({
+      projectName: bid.project_name,
+      fileName: originalName,
+      buffer: req.file.buffer,
+      mimeType: req.file.mimetype,
+      fallbackPath: `${id}/${Date.now()}-${uuidv4()}.${ext}`,
+    });
     await supabase.from('bid_documents').insert([{
       bid_id: id,
       file_name: originalName,
-      storage_path: path,
+      storage_path: storagePath,
       doc_type: '積算',
       size_bytes: req.file.size,
       uploaded_by: req.user.email,
