@@ -16,6 +16,8 @@
 
 // 事項別分類コード → 日本語分野名（e-Gov の事項別分類）
 export const CATEGORY_LABELS = {
+  '13': '消防・防災',
+  '17': 'エネルギー',
   '19': '商業',
   '20': '労働',
   '22': '土地',
@@ -66,6 +68,16 @@ export const CORE_LAWS = [
   { domain: '建設・土木', title: '砂防法', category: ['22'], withEnforcement: true },
   { domain: '建設・土木', title: '測量法', category: ['22'], withEnforcement: true },
   { domain: '建設・土木', title: '土壌汚染対策法', category: ['22'], withEnforcement: true },
+
+  // ── 建築・防災・省エネ ──────────────────────────────────
+  // 建築確認・設計実務で建築基準法と一体運用される関係法令群。
+  // いずれも本法＋施行令＋施行規則が e-Gov に揃う（正式名称で解決）。
+  { domain: '建築・防災・省エネ', title: '消防法', category: ['13', '47'], withEnforcement: true },
+  // ※ 建築物省エネ法は正式名称に「等」が入る（令和4年改正で改称）。
+  { domain: '建築・防災・省エネ', title: '建築物のエネルギー消費性能の向上等に関する法律', category: ['47', '17'], withEnforcement: true },
+  { domain: '建築・防災・省エネ', title: 'エネルギーの使用の合理化及び非化石エネルギーへの転換等に関する法律', category: ['17'], withEnforcement: true },
+  // バリアフリー法。建築物移動等円滑化基準は建築確認の審査対象。
+  { domain: '建築・防災・省エネ', title: '高齢者、障害者等の移動等の円滑化の促進に関する法律', category: ['47', '32'], withEnforcement: true },
 
   // ── 不動産 ──────────────────────────────────────────────
   { domain: '不動産', title: '宅地建物取引業法', category: ['22', '47'], withEnforcement: true },

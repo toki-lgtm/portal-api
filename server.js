@@ -367,7 +367,8 @@ app.get('/api/apps', requireAuth, async (req, res) => {
       { id: 10, key: 'documents', name: '文書回覧', icon: '🗂️', internal: true, view: 'documents', description: '回覧書類の電子化・既読/対応管理' },
       { id: 11, key: 'workscope', name: 'WorkScope 導入', icon: '🖥️', internal: true, view: 'workscope', description: '業務記録ツールの導入（インストーラーのダウンロード）' },
       { id: 12, key: 'construction', name: '工事管理', icon: '🏗️', internal: true, view: 'construction', description: '工事の提出書類・検査書類の進捗を管理（九州防衛局 建築工事）' },
-      { id: 13, key: 'regulations', name: '法令集', icon: '📚', internal: true, view: 'regulations', description: '建設・不動産・林業・労務・会社経営の法令を条文単位で検索・閲覧' },
+      // 【凍結 2026-06-17】法令集はメニューから除外（機能・API・データは残置、復活時はこの行を戻す）
+      // { id: 13, key: 'regulations', name: '法令集', icon: '📚', internal: true, view: 'regulations', description: '建設・不動産・林業・労務・会社経営の法令を条文単位で検索・閲覧' },
     ];
 
     // 権限フィルタ: グローバル管理者は全件。それ以外は app_permissions に行があるアプリのみ。
