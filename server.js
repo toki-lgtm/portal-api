@@ -4616,7 +4616,7 @@ app.get('/api/construction/projects', requireAuth, requireConstructionAccess, as
   }
 });
 
-// ✅ 工事管理 - 工事詳細（提出書類を含む）
+// ✅ 工事管理 - 工事詳細（提出書類・設計変更一覧を含む）
 app.get('/api/construction/projects/:id', requireAuth, requireConstructionAccess, async (req, res) => {
   try {
     const { id } = req.params;
@@ -4624,13 +4624,18 @@ app.get('/api/construction/projects/:id', requireAuth, requireConstructionAccess
       .from('construction_projects').select('*').eq('id', id).eq('is_active', true).maybeSingle();
     if (error) throw error;
     if (!project) return res.status(404).json({ error: '工事が見つかりません' });
-    const [{ data: docs }, { data: files }, nameMap] = await Promise.all([
+    const [{ data: docs }, { data: files }, { data: changes }, { data: changeFiles }, nameMap] = await Promise.all([
       supabase.from('submission_documents').select('*')
         .eq('project_id', id)
         .order('category_no', { ascending: true })
         .order('id', { ascending: true }),
       supabase.from('submission_files').select('*')
         .eq('project_id', id).order('created_at', { ascending: true }),
+      supabase.from('construction_design_changes').select('*')
+        .eq('project_id', id).eq('is_active', true)
+        .order('change_no', { ascending: true }),
+      supabase.from('construction_design_change_files').select('change_id')
+        .eq('project_id', id),
       loadStaffNameMap(),
     ]);
     // 添付ファイルを書類ごとにまとめ、署名付きの一時URLを付与
@@ -4647,6 +4652,15 @@ app.get('/api/construction/projects/:id', requireAuth, requireConstructionAccess
       assignee_name: d.assignee_id ? nameMap[d.assignee_id] || null : null,
       files: filesByDoc[d.id] || [],
     }));
+    // 設計変更一覧（ファイル件数を付与）
+    const fileCountByChange = {};
+    for (const cf of changeFiles || []) {
+      fileCountByChange[cf.change_id] = (fileCountByChange[cf.change_id] || 0) + 1;
+    }
+    const design_changes = (changes || []).map((c) => ({
+      ...c,
+      file_count: fileCountByChange[c.id] || 0,
+    }));
     // 入札連携: 元の入札案件サマリを付与
     let bid = null;
     if (project.bid_project_id) {
@@ -4661,6 +4675,7 @@ app.get('/api/construction/projects/:id', requireAuth, requireConstructionAccess
       chief_engineer_name: project.chief_engineer_id ? nameMap[project.chief_engineer_id] || null : null,
       bid,
       documents,
+      design_changes,
     });
   } catch (error) {
     console.error('Error (construction detail):', error.message);
@@ -4812,9 +4827,16 @@ app.post('/api/construction/projects/:id/generate-checklist', requireAuth, requi
 // ============================================================
 
 // 解析結果を construction_boq / construction_trade_summary / projects へ保存（再取込は洗替え）
-async function persistBoq(projectId, parsed, sourceFile) {
-  await supabase.from('construction_boq').delete().eq('project_id', projectId);
-  await supabase.from('construction_trade_summary').delete().eq('project_id', projectId);
+// changeId: null=当初版（従来通り）, 数値=その設計変更の変更後版
+async function persistBoq(projectId, parsed, sourceFile, changeId = null) {
+  // 当初版は change_id IS NULL のレコードのみ削除（変更版は維持）。変更版は change_id 指定で削除。
+  if (changeId == null) {
+    await supabase.from('construction_boq').delete().eq('project_id', projectId).is('change_id', null);
+    await supabase.from('construction_trade_summary').delete().eq('project_id', projectId).is('change_id', null);
+  } else {
+    await supabase.from('construction_boq').delete().eq('project_id', projectId).eq('change_id', changeId);
+    await supabase.from('construction_trade_summary').delete().eq('project_id', projectId).eq('change_id', changeId);
+  }
 
   const boqRows = parsed.nodes.map((x) => ({
     project_id: projectId, source_file: sourceFile || null, sheet_name: x.sheet_name || null,
@@ -4826,6 +4848,7 @@ async function persistBoq(projectId, parsed, sourceFile) {
     ratio_total: x.ratio_total != null ? Number(x.ratio_total.toFixed(6)) : null,
     ratio_parent: x.ratio_parent != null ? Number(x.ratio_parent.toFixed(6)) : null,
     sort_order: x.sort_order ?? 0,
+    change_id: changeId ?? null,
   }));
   for (let i = 0; i < boqRows.length; i += 200) {
     const { error } = await supabase.from('construction_boq').insert(boqRows.slice(i, i + 200));
@@ -4837,15 +4860,19 @@ async function persistBoq(projectId, parsed, sourceFile) {
     amount: Math.round(t.amount || 0),
     ratio: t.ratio != null ? Number(t.ratio.toFixed(4)) : null,
     item_count: t.item_count || 0, present: true,
+    change_id: changeId ?? null,
   }));
   if (sumRows.length) {
     const { error } = await supabase.from('construction_trade_summary').insert(sumRows);
     if (error) throw error;
   }
 
-  await supabase.from('construction_projects')
-    .update({ boq_total: Math.round(parsed.total || 0), boq_imported_at: new Date().toISOString(), updated_at: new Date().toISOString() })
-    .eq('id', projectId);
+  // 当初版の場合のみ projects の boq_total / boq_imported_at を更新
+  if (changeId == null) {
+    await supabase.from('construction_projects')
+      .update({ boq_total: Math.round(parsed.total || 0), boq_imported_at: new Date().toISOString(), updated_at: new Date().toISOString() })
+      .eq('id', projectId);
+  }
 }
 
 // 数量書に出現しなかった工種の「工種別書類」をNA候補として算出（共通・着手済みは除外）
@@ -4863,6 +4890,8 @@ async function computeNaCandidates(projectId, presentTrades) {
 }
 
 // ✅ 工事管理 - 数量書(xlsx)を取込：明細・構成比率を保存し、不要書類のNA候補を返す
+// change_id（任意）を body か query で受け取り、指定時は変更版として保存する。
+// change_id 未指定=当初版（従来通り。NA候補の算出も当初版のみ行う）。
 app.post('/api/construction/projects/:id/import-boq', requireAuth, requireConstructionAccess, upload.single('file'), async (req, res) => {
   try {
     const { id } = req.params;
@@ -4878,13 +4907,27 @@ app.post('/api/construction/projects/:id/import-boq', requireAuth, requireConstr
       return res.status(400).json({ error: '数量書は Excel(.xlsx) 形式でアップロードしてください' });
     }
 
+    // change_id: body フィールドまたは query パラメータから取得（任意）
+    const rawChangeId = req.body?.change_id ?? req.query?.change_id ?? null;
+    const changeId = rawChangeId != null && rawChangeId !== '' ? Number(rawChangeId) : null;
+    if (changeId != null && isNaN(changeId)) {
+      return res.status(400).json({ error: 'change_id は数値で指定してください' });
+    }
+    // 変更版指定の場合、該当設計変更の存在確認
+    if (changeId != null) {
+      const { data: chk } = await supabase
+        .from('construction_design_changes').select('id').eq('id', changeId).eq('project_id', id).eq('is_active', true).maybeSingle();
+      if (!chk) return res.status(404).json({ error: '指定された設計変更が見つかりません' });
+    }
+
     const parsed = parseBoqFromXlsx(req.file.buffer, originalName);
     if (parsed.mode === 'empty' || !parsed.nodes.length) {
       return res.status(422).json({ error: '数量書の明細を読み取れませんでした。様式（種目・科目・細目の各シート）をご確認ください', mode: parsed.mode });
     }
 
-    await persistBoq(id, parsed, originalName);
-    const na_candidates = await computeNaCandidates(id, parsed.presentTrades);
+    await persistBoq(id, parsed, originalName, changeId);
+    // NA候補は当初版のみ算出（変更版取込時はスキップ）
+    const na_candidates = changeId == null ? await computeNaCandidates(id, parsed.presentTrades) : [];
 
     res.json({
       ok: true,
@@ -4895,7 +4938,8 @@ app.post('/api/construction/projects/:id/import-boq', requireAuth, requireConstr
       counts: parsed.counts,
       present_trades: parsed.presentTrades,
       summary: parsed.summary.map((t) => ({ trade: t.trade, amount: t.amount, ratio: t.ratio, item_count: t.item_count, canonical: t.canonical })),
-      na_candidates,  // 承認画面で確認 → apply-checklist-filter で確定
+      na_candidates,  // 承認画面で確認 → apply-checklist-filter で確定（当初版のみ）
+      change_id: changeId,
     });
   } catch (error) {
     console.error('Error (construction import-boq):', error.message);
@@ -4904,12 +4948,25 @@ app.post('/api/construction/projects/:id/import-boq', requireAuth, requireConstr
 });
 
 // ✅ 工事管理 - 保存済みの数量書（明細＋工種別構成比率）を取得
+// change_id クエリ未指定=当初版(NULL)、指定=その変更版
 app.get('/api/construction/projects/:id/boq', requireAuth, requireConstructionAccess, async (req, res) => {
   try {
     const { id } = req.params;
+    const rawChangeId = req.query?.change_id ?? null;
+    const changeId = rawChangeId != null && rawChangeId !== '' ? Number(rawChangeId) : null;
+
+    let boqQuery = supabase.from('construction_boq').select('*').eq('project_id', id).order('sort_order', { ascending: true });
+    let sumQuery = supabase.from('construction_trade_summary').select('*').eq('project_id', id).order('amount', { ascending: false });
+    if (changeId == null) {
+      boqQuery = boqQuery.is('change_id', null);
+      sumQuery = sumQuery.is('change_id', null);
+    } else {
+      boqQuery = boqQuery.eq('change_id', changeId);
+      sumQuery = sumQuery.eq('change_id', changeId);
+    }
     const [{ data: rows }, { data: summary }, { data: project }] = await Promise.all([
-      supabase.from('construction_boq').select('*').eq('project_id', id).order('sort_order', { ascending: true }),
-      supabase.from('construction_trade_summary').select('*').eq('project_id', id).order('amount', { ascending: false }),
+      boqQuery,
+      sumQuery,
       supabase.from('construction_projects').select('boq_total, boq_imported_at').eq('id', id).maybeSingle(),
     ]);
     res.json({
@@ -4917,9 +4974,58 @@ app.get('/api/construction/projects/:id/boq', requireAuth, requireConstructionAc
       summary: summary || [],
       total: project?.boq_total ?? null,
       imported_at: project?.boq_imported_at ?? null,
+      change_id: changeId,
     });
   } catch (error) {
     console.error('Error (construction boq get):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 工事管理 - 当初版 vs 変更版の工種別金額比較
+app.get('/api/construction/projects/:id/boq-compare', requireAuth, requireConstructionAccess, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const rawChangeId = req.query?.change_id ?? null;
+    if (rawChangeId == null || rawChangeId === '') {
+      return res.status(400).json({ error: 'change_id クエリパラメータが必要です' });
+    }
+    const changeId = Number(rawChangeId);
+    if (isNaN(changeId)) return res.status(400).json({ error: 'change_id は数値で指定してください' });
+
+    // 当初版と変更版のサマリを並行取得
+    const [{ data: baseSummary }, { data: changeSummary }] = await Promise.all([
+      supabase.from('construction_trade_summary').select('trade, amount').eq('project_id', id).is('change_id', null),
+      supabase.from('construction_trade_summary').select('trade, amount').eq('project_id', id).eq('change_id', changeId),
+    ]);
+
+    // 工種をキーにマップ化
+    const baseMap = {};
+    for (const r of baseSummary || []) baseMap[r.trade] = r.amount || 0;
+    const changeMap = {};
+    for (const r of changeSummary || []) changeMap[r.trade] = r.amount || 0;
+
+    // 全工種（当初 + 変更双方に出現するものを網羅）
+    const allTrades = Array.from(new Set([...Object.keys(baseMap), ...Object.keys(changeMap)])).sort();
+
+    const rows = allTrades.map((trade) => {
+      const base_amount = baseMap[trade] ?? null;
+      const change_amount = changeMap[trade] ?? null;
+      const diff = (change_amount ?? 0) - (base_amount ?? 0);
+      return { trade, base_amount, change_amount, diff };
+    });
+
+    const base_total = (baseSummary || []).reduce((s, r) => s + (r.amount || 0), 0);
+    const change_total = (changeSummary || []).reduce((s, r) => s + (r.amount || 0), 0);
+
+    res.json({
+      base_total,
+      change_total,
+      diff: change_total - base_total,
+      rows,
+    });
+  } catch (error) {
+    console.error('Error (construction boq-compare):', error.message);
     res.status(500).json({ error: error.message });
   }
 });
@@ -5178,6 +5284,369 @@ app.delete('/api/construction/files/:fileId', requireAuth, requireConstructionAc
     res.json({ ok: true });
   } catch (error) {
     console.error('Error (construction file delete):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================================
+// 工事管理 - 設計変更（変更契約）管理  ← migration 029
+//   - GET /api/construction/projects/:id/design-changes       : 変更一覧
+//   - POST /api/construction/projects/:id/design-changes      : 変更新規作成（member）
+//   - PATCH /api/construction/design-changes/:changeId        : 変更編集（member）
+//   - POST /api/construction/design-changes/:changeId/apply   : 工事基本情報へ反映（member）
+//   - DELETE /api/construction/design-changes/:changeId       : 論理削除（admin。未適用のみ）
+//   - POST /api/construction/design-changes/:changeId/files   : 変更関連書類アップロード（member）
+//   - GET /api/construction/design-changes/:changeId/files    : 変更関連書類一覧（member）
+//   - DELETE /api/construction/design-change-files/:fileId    : 変更関連書類削除（member）
+// ============================================================
+
+const DESIGN_CHANGE_STATUSES = ['negotiating', 'instructed', 'estimating', 'contracted', 'cancelled'];
+const DESIGN_CHANGE_REASON_CATEGORIES = ['数量増減', '設計変更指示', '追加工事', '工法変更', '条件変更', 'その他'];
+const DESIGN_CHANGE_DOC_TYPES = ['変更指示書', '変更見積書', '変更契約書', '変更設計図', '変更数量書', 'その他'];
+
+// 編集可能フィールド
+const DESIGN_CHANGE_FIELDS = [
+  'title', 'reason_category', 'reason', 'status',
+  'amount_after', 'end_date_after', 'completion_inspection_date_after',
+  'instruction_date', 'agreement_date', 'note',
+];
+function pickDesignChangeFields(body) {
+  const out = {};
+  for (const k of DESIGN_CHANGE_FIELDS) {
+    if (!(k in body)) continue;
+    let v = body[k];
+    if (v === '' || v === undefined) v = null;
+    out[k] = v;
+  }
+  return out;
+}
+
+// ✅ 設計変更 - 一覧（is_active=true, change_no 昇順）
+app.get('/api/construction/projects/:id/design-changes', requireAuth, requireConstructionAccess, async (req, res) => {
+  try {
+    const { id } = req.params;
+    // 工事の存在確認
+    const { data: project, error: pErr } = await supabase
+      .from('construction_projects').select('id').eq('id', id).eq('is_active', true).maybeSingle();
+    if (pErr) throw pErr;
+    if (!project) return res.status(404).json({ error: '工事が見つかりません' });
+
+    const { data: changes, error } = await supabase
+      .from('construction_design_changes').select('*')
+      .eq('project_id', id).eq('is_active', true)
+      .order('change_no', { ascending: true });
+    if (error) throw error;
+
+    // ファイル件数を付与
+    const { data: fileCounts } = await supabase
+      .from('construction_design_change_files').select('change_id').eq('project_id', id);
+    const countMap = {};
+    for (const f of fileCounts || []) countMap[f.change_id] = (countMap[f.change_id] || 0) + 1;
+
+    res.json((changes || []).map((c) => ({ ...c, file_count: countMap[c.id] || 0 })));
+  } catch (error) {
+    console.error('Error (design-changes list):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 設計変更 - 新規作成（member）
+app.post('/api/construction/projects/:id/design-changes', requireAuth, requireConstructionAccess, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { data: project, error: pErr } = await supabase
+      .from('construction_projects')
+      .select('id, contract_amount, end_date, completion_inspection_date')
+      .eq('id', id).eq('is_active', true).maybeSingle();
+    if (pErr) throw pErr;
+    if (!project) return res.status(404).json({ error: '工事が見つかりません' });
+
+    const b = req.body || {};
+
+    // バリデーション
+    if (b.reason_category && !DESIGN_CHANGE_REASON_CATEGORIES.includes(b.reason_category)) {
+      return res.status(400).json({ error: '不正な reason_category です' });
+    }
+    if (b.status && !DESIGN_CHANGE_STATUSES.includes(b.status)) {
+      return res.status(400).json({ error: '不正なステータスです' });
+    }
+
+    // change_no: 未指定なら max(既存)+1
+    let changeNo = b.change_no != null ? Number(b.change_no) : null;
+    if (changeNo == null) {
+      const { data: maxRow } = await supabase
+        .from('construction_design_changes').select('change_no')
+        .eq('project_id', id).eq('is_active', true)
+        .order('change_no', { ascending: false }).limit(1).maybeSingle();
+      changeNo = (maxRow?.change_no || 0) + 1;
+    }
+
+    // *_before は現在の工事値をスナップショット
+    const row = {
+      project_id: Number(id),
+      change_no: changeNo,
+      title: b.title || null,
+      reason_category: b.reason_category || null,
+      reason: b.reason || null,
+      status: b.status || 'negotiating',
+      amount_before: project.contract_amount ?? null,
+      amount_after: b.amount_after != null && b.amount_after !== '' ? Number(b.amount_after) : null,
+      end_date_before: project.end_date ?? null,
+      end_date_after: b.end_date_after || null,
+      completion_inspection_date_before: project.completion_inspection_date ?? null,
+      completion_inspection_date_after: b.completion_inspection_date_after || null,
+      instruction_date: b.instruction_date || null,
+      agreement_date: b.agreement_date || null,
+      note: b.note || null,
+      created_by: req.user.email,
+    };
+
+    const { data, error } = await supabase
+      .from('construction_design_changes').insert([row]).select('*').single();
+    if (error) throw error;
+    res.json({ ...data, file_count: 0 });
+  } catch (error) {
+    console.error('Error (design-change create):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 設計変更 - 編集（member）
+app.patch('/api/construction/design-changes/:changeId', requireAuth, requireConstructionAccess, async (req, res) => {
+  try {
+    const { changeId } = req.params;
+    const payload = pickDesignChangeFields(req.body);
+
+    if (payload.reason_category && !DESIGN_CHANGE_REASON_CATEGORIES.includes(payload.reason_category)) {
+      return res.status(400).json({ error: '不正な reason_category です' });
+    }
+    if (payload.status && !DESIGN_CHANGE_STATUSES.includes(payload.status)) {
+      return res.status(400).json({ error: '不正なステータスです' });
+    }
+    if (payload.amount_after != null && payload.amount_after !== '') {
+      payload.amount_after = Number(payload.amount_after);
+    }
+
+    const { data: existing, error: exErr } = await supabase
+      .from('construction_design_changes').select('id').eq('id', changeId).eq('is_active', true).maybeSingle();
+    if (exErr) throw exErr;
+    if (!existing) return res.status(404).json({ error: '設計変更が見つかりません' });
+
+    payload.updated_at = new Date().toISOString();
+    const { data, error } = await supabase
+      .from('construction_design_changes').update(payload).eq('id', changeId).select('*').single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (design-change update):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 設計変更 - 工事基本情報へ反映（member）
+// 反映前に project.original_* がNULLなら現在値を退避（当初値の初回保存）。
+// amount_after / end_date_after / completion_inspection_date_after が非NULLなら project へ上書き。
+// applied=true に更新し、change_count を applied 件数で再計算。冪等（二重適用防止）。
+app.post('/api/construction/design-changes/:changeId/apply', requireAuth, requireConstructionAccess, async (req, res) => {
+  try {
+    const { changeId } = req.params;
+    const { data: change, error: cErr } = await supabase
+      .from('construction_design_changes').select('*').eq('id', changeId).eq('is_active', true).maybeSingle();
+    if (cErr) throw cErr;
+    if (!change) return res.status(404).json({ error: '設計変更が見つかりません' });
+
+    // 二重適用防止（冪等）
+    if (change.applied) {
+      return res.json({ ok: true, already_applied: true, change });
+    }
+
+    const { data: project, error: pErr } = await supabase
+      .from('construction_projects')
+      .select('id, contract_amount, end_date, completion_inspection_date, original_contract_amount, original_end_date, original_completion_inspection_date')
+      .eq('id', change.project_id).eq('is_active', true).maybeSingle();
+    if (pErr) throw pErr;
+    if (!project) return res.status(404).json({ error: '工事が見つかりません' });
+
+    // 当初値の退避（original_* が NULL なら現在値を保存）
+    const projectUpdate = {};
+    if (project.original_contract_amount == null) {
+      projectUpdate.original_contract_amount = project.contract_amount ?? null;
+    }
+    if (project.original_end_date == null) {
+      projectUpdate.original_end_date = project.end_date ?? null;
+    }
+    if (project.original_completion_inspection_date == null) {
+      projectUpdate.original_completion_inspection_date = project.completion_inspection_date ?? null;
+    }
+
+    // 変更後値を工事基本情報へ反映
+    if (change.amount_after != null) projectUpdate.contract_amount = change.amount_after;
+    if (change.end_date_after != null) projectUpdate.end_date = change.end_date_after;
+    if (change.completion_inspection_date_after != null) {
+      projectUpdate.completion_inspection_date = change.completion_inspection_date_after;
+    }
+
+    // applied 件数で change_count を再計算（この変更も含む）
+    const { count: appliedCount } = await supabase
+      .from('construction_design_changes')
+      .select('id', { count: 'exact', head: true })
+      .eq('project_id', change.project_id).eq('is_active', true).eq('applied', true);
+    projectUpdate.change_count = (appliedCount || 0) + 1; // この変更を含む
+    projectUpdate.latest_change_at = new Date().toISOString();
+    projectUpdate.updated_at = new Date().toISOString();
+
+    // 当該変更を applied=true, status='contracted'（未設定なら）へ更新
+    const changeUpdate = {
+      applied: true,
+      applied_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+    if (!change.status || change.status !== 'contracted') {
+      changeUpdate.status = 'contracted';
+    }
+
+    // プロジェクトと変更を並行更新
+    const [{ error: puErr }, { data: updatedChange, error: cuErr }] = await Promise.all([
+      supabase.from('construction_projects').update(projectUpdate).eq('id', change.project_id),
+      supabase.from('construction_design_changes').update(changeUpdate).eq('id', changeId).select('*').single(),
+    ]);
+    if (puErr) throw puErr;
+    if (cuErr) throw cuErr;
+
+    res.json({ ok: true, already_applied: false, change: updatedChange });
+  } catch (error) {
+    console.error('Error (design-change apply):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 設計変更 - 論理削除（admin。applied=true のものは削除不可）
+app.delete('/api/construction/design-changes/:changeId', requireAuth, requireConstructionAdmin, async (req, res) => {
+  try {
+    const { changeId } = req.params;
+    const { data: change, error: cErr } = await supabase
+      .from('construction_design_changes').select('id, applied').eq('id', changeId).eq('is_active', true).maybeSingle();
+    if (cErr) throw cErr;
+    if (!change) return res.status(404).json({ error: '設計変更が見つかりません' });
+    if (change.applied) {
+      return res.status(409).json({ error: '工事基本情報に反映済みの設計変更は削除できません。先に取り消し操作が必要です' });
+    }
+    const { error } = await supabase
+      .from('construction_design_changes')
+      .update({ is_active: false, updated_at: new Date().toISOString() })
+      .eq('id', changeId);
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error (design-change delete):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ── 設計変更関連書類のストレージヘルパー ──────────────────────────────────────
+// 保存先: （DRIVE_FOLDER_ID）/工事管理/<工事名>/設計変更/第N回/
+async function storeDesignChangeFile({ projectName, changeNo, fileName, buffer, mimeType }) {
+  if (driveConfigured()) {
+    const folderId = await ensureFolderPath([
+      '工事管理',
+      sanitizeDriveSeg(projectName),
+      '設計変更',
+      sanitizeDriveSeg(`第${changeNo}回`),
+    ]);
+    const fileId = await driveUpload({ name: fileName, buffer, mimeType, folderId });
+    return `drive:${fileId}`;
+  }
+  await ensureConstructionBucket();
+  const path = `design-changes/${Date.now()}-${uuidv4()}-${sanitizeDriveSeg(fileName)}`;
+  const { error } = await supabase.storage.from(CONSTRUCTION_BUCKET).upload(path, buffer, { contentType: mimeType });
+  if (error) throw error;
+  return path;
+}
+
+// ✅ 設計変更 - 関連書類のアップロード（member）
+app.post('/api/construction/design-changes/:changeId/files', requireAuth, requireConstructionAccess, upload.single('file'), async (req, res) => {
+  try {
+    const { changeId } = req.params;
+    if (!req.file) return res.status(400).json({ error: 'file フィールドが必要です' });
+
+    const { data: change, error: cErr } = await supabase
+      .from('construction_design_changes').select('id, project_id, change_no').eq('id', changeId).eq('is_active', true).maybeSingle();
+    if (cErr) throw cErr;
+    if (!change) return res.status(404).json({ error: '設計変更が見つかりません' });
+
+    const docType = req.body?.doc_type || 'その他';
+    if (!DESIGN_CHANGE_DOC_TYPES.includes(docType)) {
+      return res.status(400).json({ error: '不正な doc_type です' });
+    }
+
+    const { data: proj } = await supabase
+      .from('construction_projects').select('project_name').eq('id', change.project_id).maybeSingle();
+    const fileName = decodeUploadName(req.file.originalname);
+
+    const ref = await storeDesignChangeFile({
+      projectName: proj?.project_name || `project-${change.project_id}`,
+      changeNo: change.change_no,
+      fileName, buffer: req.file.buffer, mimeType: req.file.mimetype,
+    });
+
+    const { data, error } = await supabase.from('construction_design_change_files').insert([{
+      change_id: Number(changeId),
+      project_id: change.project_id,
+      doc_type: docType,
+      file_ref: ref,
+      file_name: fileName,
+      mime_type: req.file.mimetype,
+      size_bytes: req.file.size,
+      uploaded_by: req.user.email,
+    }]).select('*').single();
+    if (error) throw error;
+
+    const url = await constructionFileSignedUrl(data.file_ref);
+    res.json({ id: data.id, doc_type: data.doc_type, file_name: data.file_name, mime_type: data.mime_type, size_bytes: data.size_bytes, url });
+  } catch (error) {
+    console.error('Error (design-change file upload):', error.message);
+    res.status(error.status || 500).json({ error: error.message });
+  }
+});
+
+// ✅ 設計変更 - 関連書類一覧（member）
+app.get('/api/construction/design-changes/:changeId/files', requireAuth, requireConstructionAccess, async (req, res) => {
+  try {
+    const { changeId } = req.params;
+    const { data, error } = await supabase
+      .from('construction_design_change_files').select('*').eq('change_id', changeId).order('created_at', { ascending: true });
+    if (error) throw error;
+
+    const withUrls = await Promise.all((data || []).map(async (f) => ({
+      id: f.id, doc_type: f.doc_type, file_name: f.file_name, mime_type: f.mime_type,
+      size_bytes: f.size_bytes, url: await constructionFileSignedUrl(f.file_ref),
+      uploaded_by: f.uploaded_by, created_at: f.created_at,
+    })));
+    res.json(withUrls);
+  } catch (error) {
+    console.error('Error (design-change files list):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 設計変更 - 関連書類の削除（member。Driveはゴミ箱へ）
+app.delete('/api/construction/design-change-files/:fileId', requireAuth, requireConstructionAccess, async (req, res) => {
+  try {
+    const { fileId } = req.params;
+    const { data: f, error: fErr } = await supabase
+      .from('construction_design_change_files').select('*').eq('id', fileId).maybeSingle();
+    if (fErr) throw fErr;
+    if (!f) return res.status(404).json({ error: 'ファイルが見つかりません' });
+
+    if (String(f.file_ref).startsWith('drive:')) {
+      try { await driveTrash(String(f.file_ref).slice('drive:'.length)); } catch (e) { console.error('drive trash:', e.message); }
+    } else {
+      try { await supabase.storage.from(CONSTRUCTION_BUCKET).remove([f.file_ref]); } catch { /* noop */ }
+    }
+    await supabase.from('construction_design_change_files').delete().eq('id', fileId);
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error (design-change file delete):', error.message);
     res.status(500).json({ error: error.message });
   }
 });
@@ -5558,6 +6027,148 @@ app.post('/api/construction/extract-info', requireAuth, requireConstructionAcces
     res.json({ fields, used_files: picked.map((f) => f.originalname) });
   } catch (error) {
     console.error('Error (construction extract-info):', error.message);
+    res.status(error.status || 500).json({ error: error.message });
+  }
+});
+
+// ============================================================
+// 工事管理 - 設計変更書類からの AI 抽出（Gemini）
+//   - extractDesignChangeInfo : 変更指示書・変更契約書・変更見積書・変更設計図などを読み取り
+//                               設計変更フォームへのプレフィル用 draft を返す
+//   - POST /api/construction/projects/:id/design-changes/extract : multipart, フィールド名 files
+//     → { draft, confidence, summary } を返す。保存はしない（プレビュー専用）。
+// ============================================================
+
+// 設計変更関連書類のスコアリング（変更・契約・指示書キーワードを優先。合計上限内で最大5件）
+function selectDesignChangeDocsForExtract(files) {
+  const KW = ['変更', '指示', '契約', '見積', '設計', '数量'];
+  const cand = (files || []).filter((f) => geminiAnalyzable(f.mimetype, f.size));
+  const scored = cand.map((f) => {
+    const nm = f.originalname || '';
+    let s = 0; for (const k of KW) if (nm.includes(k)) s += 2;
+    return { f, s };
+  }).sort((a, b) => b.s - a.s || (a.f.size || 0) - (b.f.size || 0));
+  const picked = []; let total = 0;
+  for (const { f } of scored) {
+    if (picked.length >= 5) break;
+    if (total + (f.size || 0) > CONS_AI_EXTRACT_TOTAL) continue;
+    picked.push(f); total += (f.size || 0);
+  }
+  if (!picked.length && cand.length) picked.push([...cand].sort((a, b) => (a.size || 0) - (b.size || 0))[0]);
+  return picked;
+}
+
+// 設計変更書類から設計変更フォーム用の情報を構造化抽出
+async function extractDesignChangeInfo(files, project) {
+  if (!GEMINI_API_KEY) { const e = new Error('GEMINI_API_KEY が未設定です。'); e.status = 503; throw e; }
+  const projectCtx = [
+    project?.contract_amount != null ? `現在の契約金額: ${project.contract_amount}円` : null,
+    project?.end_date ? `現在の工期末: ${project.end_date}` : null,
+    project?.completion_inspection_date ? `現在の完成検査日: ${project.completion_inspection_date}` : null,
+  ].filter(Boolean).join(' / ');
+  const prompt = [
+    'これは日本の公共建築工事（発注者: 九州防衛局）の設計変更に関する書類です（変更指示書・変更契約書・変更見積書・変更設計図・変更数量書 等）。',
+    '複数の書類がある場合は総合的に読み取り、設計変更フォームの入力に必要な項目を JSON で返してください。',
+    projectCtx ? `【工事現状参考情報】${projectCtx}` : '',
+    '',
+    '- title: 変更の概要・件名（書類から読み取った正式名称または内容を簡潔に。例: 「第1回設計変更（数量増減）」）',
+    '- reason_category: 変更理由の区分。次の6種から最も当てはまるものを1つだけ選ぶ → 数量増減 / 設計変更指示 / 追加工事 / 工法変更 / 条件変更 / その他。判断できない場合は「その他」',
+    '- reason: 変更内容・理由の要約。書類から読み取った具体的な内容を1〜3文で記述。読み取れなければ空文字',
+    '- amount_after: 変更後の契約金額（円。半角数字のみ。税込。読み取れなければ null）',
+    '- end_date_after: 変更後の工期末（YYYY-MM-DD。和暦は西暦へ変換。読み取れなければ null）',
+    '- completion_inspection_date_after: 変更後の完成検査(予定)日（YYYY-MM-DD。読み取れなければ null）',
+    '- instruction_date: 変更指示日（YYYY-MM-DD。変更指示書の発行日。読み取れなければ null）',
+    '- agreement_date: 変更契約日（YYYY-MM-DD。変更契約書の締結日。読み取れなければ null）',
+    '- status: 書類の種別から変更の進捗状態を推定する。変更指示書のみ→"instructed"、見積書のみまたは見積回答中→"estimating"、変更契約書あり→"contracted"、それ以外または不明→"negotiating"',
+    '- confidence: 読み取り全体の確信度 0.0〜1.0（数値）',
+    '- summary: 読み取り根拠の短い説明（どの書類のどの箇所から何を読み取ったか。50字程度）',
+    '日付が和暦（令和・平成等）の場合は西暦へ変換。金額が複数書類で矛盾する場合は最終的な確定値（変更契約書優先）を採用。推測で埋めず、読み取れない項目は null または空文字にすること。',
+  ].filter((l) => l !== '').join('\n');
+
+  const parts = [{ text: prompt }];
+  for (const f of files) parts.push({ inlineData: { mimeType: f.mimetype || 'application/pdf', data: f.buffer.toString('base64') } });
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+  const body = {
+    contents: [{ parts }],
+    generationConfig: {
+      temperature: 0,
+      responseMimeType: 'application/json',
+      responseSchema: {
+        type: 'OBJECT',
+        properties: {
+          title: { type: 'STRING' },
+          reason_category: { type: 'STRING' },
+          reason: { type: 'STRING' },
+          amount_after: { type: 'STRING' },
+          end_date_after: { type: 'STRING' },
+          completion_inspection_date_after: { type: 'STRING' },
+          instruction_date: { type: 'STRING' },
+          agreement_date: { type: 'STRING' },
+          status: { type: 'STRING' },
+          confidence: { type: 'NUMBER' },
+          summary: { type: 'STRING' },
+        },
+      },
+    },
+  };
+
+  const resp = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  if (!resp.ok) {
+    const t = await resp.text();
+    const e = new Error(`Gemini API エラー (${resp.status}): ${t.slice(0, 300)}`); e.status = 502; throw e;
+  }
+  const json = await resp.json();
+  const text = json?.candidates?.[0]?.content?.parts?.[0]?.text;
+  if (!text) throw new Error('Gemini から有効な応答が得られませんでした');
+  let p; try { p = JSON.parse(text); } catch { throw new Error('Gemini 応答の解析に失敗しました'); }
+
+  // reason_category の正規化
+  const validReasonCats = ['数量増減', '設計変更指示', '追加工事', '工法変更', '条件変更', 'その他'];
+  const reasonCat = validReasonCats.includes((p.reason_category || '').trim()) ? p.reason_category.trim() : 'その他';
+
+  // status の正規化
+  const validStatuses = ['negotiating', 'instructed', 'estimating', 'contracted', 'cancelled'];
+  const status = validStatuses.includes((p.status || '').trim()) ? p.status.trim() : 'negotiating';
+
+  const draft = {
+    title: (p.title || '').trim() || null,
+    reason_category: reasonCat,
+    reason: (p.reason || '').trim() || null,
+    amount_after: digitsOrNull(p.amount_after),
+    end_date_after: cleanIsoDate(p.end_date_after),
+    completion_inspection_date_after: cleanIsoDate(p.completion_inspection_date_after),
+    instruction_date: cleanIsoDate(p.instruction_date),
+    agreement_date: cleanIsoDate(p.agreement_date),
+    status,
+  };
+  const confidence = typeof p.confidence === 'number' ? Math.max(0, Math.min(1, p.confidence)) : null;
+  const summary = (p.summary || '').trim();
+  return { draft, confidence, summary };
+}
+
+// ✅ 設計変更書類から設計変更フォームへのプレフィル情報を AI 抽出（保存しない・プレビュー専用）
+app.post('/api/construction/projects/:id/design-changes/extract', requireAuth, requireConstructionAccess, upload.array('files', 20), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const files = req.files || [];
+    if (!files.length) return res.status(400).json({ error: 'files（書類）が必要です' });
+    for (const f of files) f.originalname = decodeUploadName(f.originalname);
+
+    const { data: project, error: pErr } = await supabase
+      .from('construction_projects')
+      .select('id, contract_amount, end_date, completion_inspection_date')
+      .eq('id', id).eq('is_active', true).maybeSingle();
+    if (pErr) throw pErr;
+    if (!project) return res.status(404).json({ error: '工事が見つかりません' });
+
+    const picked = selectDesignChangeDocsForExtract(files);
+    if (!picked.length) return res.status(400).json({ error: 'AIで読み取れる書類（PDF/画像）が見つかりませんでした。手入力で登録してください。' });
+
+    const result = await extractDesignChangeInfo(picked, project);
+    res.json({ draft: result.draft, confidence: result.confidence, summary: result.summary, used_files: picked.map((f) => f.originalname) });
+  } catch (error) {
+    console.error('Error (design-changes extract):', error.message);
     res.status(error.status || 500).json({ error: error.message });
   }
 });
