@@ -364,7 +364,8 @@ app.get('/api/apps', requireAuth, async (req, res) => {
       { id: 8, key: 'bids', name: '入札案件管理', icon: '📋', internal: true, view: 'bids', description: '入札案件の進捗・期限・金額・資料を管理' },
       { id: 9, key: 'feedback', name: 'バグ報告・改善 一覧', icon: '🐞', internal: true, view: 'feedback', description: '寄せられた不具合・改善要望の確認とトリアージ' },
       { id: 10, key: 'documents', name: '文書回覧', icon: '🗂️', internal: true, view: 'documents', description: '回覧書類の電子化・既読/対応管理' },
-      { id: 11, key: 'workscope', name: 'WorkScope 導入', icon: '🖥️', internal: true, view: 'workscope', description: '業務記録ツールの導入（インストーラーのダウンロード）' }
+      { id: 11, key: 'workscope', name: 'WorkScope 導入', icon: '🖥️', internal: true, view: 'workscope', description: '業務記録ツールの導入（インストーラーのダウンロード）' },
+      { id: 12, key: 'construction', name: '工事管理', icon: '🏗️', internal: true, view: 'construction', description: '工事の提出書類・検査書類の進捗を管理（九州防衛局 建築工事）' }
     ];
 
     // 権限フィルタ: グローバル管理者は全件。それ以外は app_permissions に行があるアプリのみ。
@@ -4347,6 +4348,437 @@ app.post('/api/bids/:id/import-estimate', requireAuth, requireBidAccess, upload.
     });
   } catch (error) {
     console.error('Error (bid import-estimate):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================================
+// 工事管理（提出書類・検査書類）  ← migration 023
+//   - 利用可(member): 全工事の閲覧 / 書類の編集・提出・ステータス更新 / 工事の新規作成
+//   - 管理者(admin) : 上記に加え 工事の削除
+//   権限は staff_app_permissions['construction']（社員一覧画面のアプリ別権限から設定）。
+//   ファイル本体は共有ドライブ等に置き、submission_documents.file_ref で参照する。
+// ============================================================
+
+const CONSTRUCTION_PROJECT_STATUSES = ['preparing', 'in_progress', 'inspecting', 'completed', 'archived'];
+const SUBMISSION_STATUSES = ['not_started', 'drafting', 'internal_review', 'submitted', 'approved', 'rejected', 'na'];
+
+// 工事管理のロール解決（app_key='construction'）。bids と同じ方式。
+async function resolveConstructionRole(email) {
+  const perms = await resolvePermissions(email); // { role, staffId }
+  if (perms.role === 'admin') return { role: 'admin', access: true, staffId: perms.staffId, globalAdmin: true };
+  let level = null;
+  if (perms.staffId) {
+    const { data } = await supabase
+      .from('staff_app_permissions')
+      .select('access_level')
+      .eq('staff_id', perms.staffId)
+      .eq('app_key', 'construction')
+      .maybeSingle();
+    level = data?.access_level || null;
+  }
+  const role = level === 'admin' ? 'admin' : level ? 'member' : 'none';
+  return { role, access: role !== 'none', staffId: perms.staffId, globalAdmin: false };
+}
+
+async function requireConstructionAccess(req, res, next) {
+  try {
+    const r = await resolveConstructionRole(req.user.email);
+    if (!r.access) return res.status(403).json({ error: '工事管理へのアクセス権がありません' });
+    req.consRole = r;
+    next();
+  } catch (e) { res.status(500).json({ error: e.message }); }
+}
+
+async function requireConstructionAdmin(req, res, next) {
+  try {
+    const r = await resolveConstructionRole(req.user.email);
+    if (r.role !== 'admin') return res.status(403).json({ error: 'この操作は工事管理の管理者のみ可能です' });
+    req.consRole = r;
+    next();
+  } catch (e) { res.status(500).json({ error: e.message }); }
+}
+
+// 締切コード → 実日付(YYYY-MM-DD)。算出不能（随時/毎月/工場製作日 等）は null を返す。
+function consAddDays(dateStr, n) {
+  if (!dateStr) return null;
+  const d = new Date(dateStr + 'T00:00:00');
+  if (isNaN(d.getTime())) return null;
+  d.setDate(d.getDate() + n);
+  return d.toISOString().slice(0, 10);
+}
+function consAddBusinessDays(dateStr, n) {
+  if (!dateStr) return null;
+  const d = new Date(dateStr + 'T00:00:00');
+  if (isNaN(d.getTime())) return null;
+  let added = 0;
+  while (added < n) {
+    d.setDate(d.getDate() + 1);
+    const wd = d.getDay();
+    if (wd !== 0 && wd !== 6) added++;
+  }
+  return d.toISOString().slice(0, 10);
+}
+function computeDueDate(code, project) {
+  if (!code) return null;
+  const c = project.contract_date || null;
+  const s = project.start_date || null;
+  const insp = project.completion_inspection_date || null;
+  switch (code) {
+    case 'BEFORE_CONTRACT': return c;
+    case 'CONTRACT+14d': return consAddDays(c, 14);
+    case 'CORINS+10biz': return consAddBusinessDays(c, 10);
+    case 'BEFORE_START': return s;
+    case 'START-7d': return consAddDays(s, -7);
+    case 'START-14d': return consAddDays(s, -14);
+    case 'INSP-14d': return consAddDays(insp, -14);
+    case 'ON_COMPLETION_INSP': return insp;
+    case 'AFTER_COMPLETION': return insp;
+    // FACTORY-14d / MONTHLY-25 / ASAP / ANYTIME / ON_EVENT / AFTER_ASAP は単一期日を持たない
+    default: return null;
+  }
+}
+
+// 必要書類マスタから工事の提出書類チェックリストを生成（既存と重複するテンプレは追加しない）。
+async function generateChecklist(project, email) {
+  const { data: tmpls, error } = await supabase
+    .from('required_doc_templates').select('*').eq('is_active', true).order('sort_order', { ascending: true });
+  if (error) throw error;
+  const wc = project.work_category || '新設';
+
+  // 既に生成済みのテンプレIDを除外
+  const { data: existing } = await supabase
+    .from('submission_documents').select('template_id').eq('project_id', project.id);
+  const have = new Set((existing || []).map((r) => r.template_id).filter((v) => v != null));
+
+  const rows = (tmpls || [])
+    .filter((t) => !t.work_category || t.work_category === '共通' || t.work_category === wc)
+    .filter((t) => !have.has(t.id))
+    .map((t) => ({
+      project_id: project.id,
+      template_id: t.id,
+      category_no: t.category_no,
+      category: t.category,
+      subcategory: t.subcategory,
+      doc_name: t.doc_name,
+      trade: t.trade,
+      form_no: t.form_no,
+      status: 'not_started',
+      due_date: computeDueDate(t.deadline_code, project),
+      created_by: email,
+    }));
+  if (!rows.length) return 0;
+  for (let i = 0; i < rows.length; i += 100) {
+    const { error: e } = await supabase.from('submission_documents').insert(rows.slice(i, i + 100));
+    if (e) throw e;
+  }
+  return rows.length;
+}
+
+// 工事案件の更新可能フィールド
+const CONS_FIELDS = [
+  'bid_project_id', 'project_name', 'project_code', 'client_org', 'construction_type', 'work_category',
+  'location', 'contract_amount', 'contract_date', 'start_date', 'end_date', 'completion_inspection_date',
+  'site_agent_id', 'chief_engineer_id', 'drive_folder_url', 'status',
+];
+function pickConsFields(body) {
+  const out = {};
+  for (const k of CONS_FIELDS) {
+    if (!(k in body)) continue;
+    let v = body[k];
+    if (v === '' || v === undefined) v = null;
+    out[k] = v;
+  }
+  return out;
+}
+
+// ✅ 工事管理 - ダッシュボードKPI（工事数 / 締切間近 / 期限超過 / 差戻し / 未着手）
+app.get('/api/construction/stats', requireAuth, requireConstructionAccess, async (req, res) => {
+  try {
+    const today = new Date().toISOString().slice(0, 10);
+    const soon = consAddDays(today, 14);
+    const [{ data: projects }, { data: docs }] = await Promise.all([
+      supabase.from('construction_projects').select('id,status').eq('is_active', true),
+      supabase.from('submission_documents').select('status,due_date'),
+    ]);
+    const activeProjects = (projects || []).filter((p) => p.status !== 'archived').length;
+    let dueSoon = 0, overdue = 0, rejected = 0, notStarted = 0;
+    for (const d of docs || []) {
+      if (d.status === 'rejected') rejected++;
+      if (d.status === 'approved' || d.status === 'na') continue;
+      if (d.status === 'not_started') notStarted++;
+      if (d.due_date) {
+        if (d.due_date < today) overdue++;
+        else if (d.due_date <= soon) dueSoon++;
+      }
+    }
+    res.json({
+      total_projects: (projects || []).length,
+      active_projects: activeProjects,
+      due_soon: dueSoon, overdue, rejected, not_started: notStarted,
+    });
+  } catch (error) {
+    console.error('Error (construction stats):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 工事管理 - 工事一覧（書類進捗サマリ付き）
+app.get('/api/construction/projects', requireAuth, requireConstructionAccess, async (req, res) => {
+  try {
+    const { status, q } = req.query;
+    let query = supabase.from('construction_projects').select('*').eq('is_active', true);
+    if (status && CONSTRUCTION_PROJECT_STATUSES.includes(status)) query = query.eq('status', status);
+    query = query.order('created_at', { ascending: false });
+    const { data, error } = await query;
+    if (error) throw error;
+    let rows = data || [];
+    if (q) {
+      const needle = String(q).toLowerCase();
+      rows = rows.filter((p) =>
+        (p.project_name || '').toLowerCase().includes(needle) ||
+        (p.location || '').toLowerCase().includes(needle));
+    }
+    const ids = rows.map((r) => r.id);
+    const progress = {};
+    if (ids.length) {
+      const { data: docs } = await supabase
+        .from('submission_documents').select('project_id,status').in('project_id', ids);
+      for (const d of docs || []) {
+        const p = progress[d.project_id] || (progress[d.project_id] = { total: 0, done: 0 });
+        p.total++;
+        if (d.status === 'submitted' || d.status === 'approved' || d.status === 'na') p.done++;
+      }
+    }
+    const nameMap = await loadStaffNameMap();
+    rows = rows.map((p) => ({
+      ...p,
+      site_agent_name: p.site_agent_id ? nameMap[p.site_agent_id] || null : null,
+      chief_engineer_name: p.chief_engineer_id ? nameMap[p.chief_engineer_id] || null : null,
+      doc_total: progress[p.id]?.total || 0,
+      doc_done: progress[p.id]?.done || 0,
+    }));
+    res.json(rows);
+  } catch (error) {
+    console.error('Error (construction list):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 工事管理 - 工事詳細（提出書類を含む）
+app.get('/api/construction/projects/:id', requireAuth, requireConstructionAccess, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { data: project, error } = await supabase
+      .from('construction_projects').select('*').eq('id', id).eq('is_active', true).maybeSingle();
+    if (error) throw error;
+    if (!project) return res.status(404).json({ error: '工事が見つかりません' });
+    const [{ data: docs }, nameMap] = await Promise.all([
+      supabase.from('submission_documents').select('*')
+        .eq('project_id', id)
+        .order('category_no', { ascending: true })
+        .order('id', { ascending: true }),
+      loadStaffNameMap(),
+    ]);
+    const documents = (docs || []).map((d) => ({
+      ...d, assignee_name: d.assignee_id ? nameMap[d.assignee_id] || null : null,
+    }));
+    res.json({
+      ...project,
+      site_agent_name: project.site_agent_id ? nameMap[project.site_agent_id] || null : null,
+      chief_engineer_name: project.chief_engineer_id ? nameMap[project.chief_engineer_id] || null : null,
+      documents,
+    });
+  } catch (error) {
+    console.error('Error (construction detail):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 工事管理 - 工事の新規登録（既定で必要書類チェックリストを自動生成）
+app.post('/api/construction/projects', requireAuth, requireConstructionAccess, async (req, res) => {
+  try {
+    const payload = pickConsFields(req.body);
+    if (!payload.project_name) return res.status(400).json({ error: '工事名は必須です' });
+    if (payload.status && !CONSTRUCTION_PROJECT_STATUSES.includes(payload.status)) {
+      return res.status(400).json({ error: '不正なステータスです' });
+    }
+    payload.created_by = req.user.email;
+    const { data, error } = await supabase
+      .from('construction_projects').insert([payload]).select('*').single();
+    if (error) throw error;
+
+    let generated = 0;
+    if (req.body?.generate_checklist !== false) {
+      generated = await generateChecklist(data, req.user.email);
+    }
+    res.json({ ...data, generated_documents: generated });
+  } catch (error) {
+    console.error('Error (construction create):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 工事管理 - 工事の更新（利用可=member 以上）
+app.put('/api/construction/projects/:id', requireAuth, requireConstructionAccess, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const payload = pickConsFields(req.body);
+    if ('project_name' in payload && !payload.project_name) {
+      return res.status(400).json({ error: '工事名は必須です' });
+    }
+    if (payload.status && !CONSTRUCTION_PROJECT_STATUSES.includes(payload.status)) {
+      return res.status(400).json({ error: '不正なステータスです' });
+    }
+    const { data: existing, error: exErr } = await supabase
+      .from('construction_projects').select('id').eq('id', id).eq('is_active', true).maybeSingle();
+    if (exErr) throw exErr;
+    if (!existing) return res.status(404).json({ error: '工事が見つかりません' });
+
+    payload.updated_at = new Date().toISOString();
+    const { data, error } = await supabase
+      .from('construction_projects').update(payload).eq('id', id).select('*').single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (construction update):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 工事管理 - 工事の論理削除（管理者のみ）
+app.delete('/api/construction/projects/:id', requireAuth, requireConstructionAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { data, error } = await supabase
+      .from('construction_projects')
+      .update({ is_active: false, updated_at: new Date().toISOString() })
+      .eq('id', id).select('id');
+    if (error) throw error;
+    if (!data || data.length === 0) return res.status(404).json({ error: '工事が見つかりません' });
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error (construction delete):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 工事管理 - 不足している必要書類を追加生成（テンプレ更新後の補完用）
+app.post('/api/construction/projects/:id/generate-checklist', requireAuth, requireConstructionAccess, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { data: project, error } = await supabase
+      .from('construction_projects').select('*').eq('id', id).eq('is_active', true).maybeSingle();
+    if (error) throw error;
+    if (!project) return res.status(404).json({ error: '工事が見つかりません' });
+    const generated = await generateChecklist(project, req.user.email);
+    res.json({ ok: true, generated_documents: generated });
+  } catch (error) {
+    console.error('Error (construction generate-checklist):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 提出書類の更新可能フィールド
+const SUB_DOC_FIELDS = [
+  'status', 'due_date', 'submitted_at', 'approved_at', 'assignee_id', 'file_ref', 'note',
+  'doc_name', 'category_no', 'category', 'subcategory', 'trade', 'form_no',
+];
+function pickSubDocFields(body) {
+  const out = {};
+  for (const k of SUB_DOC_FIELDS) {
+    if (!(k in body)) continue;
+    let v = body[k];
+    if (v === '' || v === undefined) v = null;
+    out[k] = v;
+  }
+  return out;
+}
+
+// ✅ 工事管理 - 提出書類の更新（ステータス・締切・担当・ファイル参照 等）
+app.patch('/api/construction/documents/:docId', requireAuth, requireConstructionAccess, async (req, res) => {
+  try {
+    const { docId } = req.params;
+    const payload = pickSubDocFields(req.body);
+    if (payload.status && !SUBMISSION_STATUSES.includes(payload.status)) {
+      return res.status(400).json({ error: '不正なステータスです' });
+    }
+    // 提出/承認のステータスに合わせて日付を自動補完（明示指定があれば優先）
+    const today = new Date().toISOString().slice(0, 10);
+    if (payload.status === 'submitted' && !('submitted_at' in req.body)) payload.submitted_at = today;
+    if (payload.status === 'approved' && !('approved_at' in req.body)) payload.approved_at = today;
+    payload.updated_at = new Date().toISOString();
+
+    const { data, error } = await supabase
+      .from('submission_documents').update(payload).eq('id', docId).select('*').single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (submission update):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 工事管理 - 提出書類を手動追加（テンプレ外の書類）
+app.post('/api/construction/projects/:id/documents', requireAuth, requireConstructionAccess, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const b = req.body || {};
+    if (!b.doc_name) return res.status(400).json({ error: '書類名は必須です' });
+    if (!b.category_no || !b.category) return res.status(400).json({ error: '大分類は必須です' });
+    if (b.status && !SUBMISSION_STATUSES.includes(b.status)) {
+      return res.status(400).json({ error: '不正なステータスです' });
+    }
+    const row = {
+      project_id: Number(id),
+      template_id: null,
+      category_no: Number(b.category_no),
+      category: b.category,
+      subcategory: b.subcategory || null,
+      doc_name: b.doc_name,
+      trade: b.trade || '共通',
+      form_no: b.form_no || null,
+      status: b.status || 'not_started',
+      due_date: b.due_date || null,
+      assignee_id: b.assignee_id || null,
+      note: b.note || null,
+      created_by: req.user.email,
+    };
+    const { data, error } = await supabase
+      .from('submission_documents').insert([row]).select('*').single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (submission add):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 工事管理 - 提出書類の削除
+app.delete('/api/construction/documents/:docId', requireAuth, requireConstructionAccess, async (req, res) => {
+  try {
+    const { docId } = req.params;
+    const { data, error } = await supabase
+      .from('submission_documents').delete().eq('id', docId).select('id');
+    if (error) throw error;
+    if (!data || data.length === 0) return res.status(404).json({ error: '書類が見つかりません' });
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error (submission delete):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 工事管理 - 必要書類マスタ一覧（チェックリスト構築の参照用）
+app.get('/api/construction/templates', requireAuth, requireConstructionAccess, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('required_doc_templates').select('*').eq('is_active', true)
+      .order('sort_order', { ascending: true });
+    if (error) throw error;
+    res.json(data || []);
+  } catch (error) {
+    console.error('Error (construction templates):', error.message);
     res.status(500).json({ error: error.message });
   }
 });
