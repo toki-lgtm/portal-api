@@ -8295,6 +8295,27 @@ app.get('/api/cards/categories', requireAuth, requireCardAccess, async (req, res
   }
 });
 
+// ✅ 名刺 - マイカテゴリ候補一覧（自分が使った個人ラベルの distinct）
+//    GET /api/cards/my-categories
+//    レスポンス: { categories: ["重要", "要フォロー", ...] }（name 昇順）
+//    ※ /api/cards/:id より前に定義すること（:id にマッチさせないため）
+app.get('/api/cards/my-categories', requireAuth, requireCardAccess, async (req, res) => {
+  try {
+    const email = String(req.user.email || '').toLowerCase();
+    const { data, error } = await supabase
+      .from('card_personal_labels')
+      .select('label')
+      .eq('user_email', email);
+    if (error) throw error;
+    const names = [...new Set((data || []).map((r) => r.label).filter(Boolean))]
+      .sort((a, b) => a.localeCompare(b, 'ja'));
+    res.json({ categories: names });
+  } catch (error) {
+    console.error('Error (cards my-categories):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // ✅ 名刺 - 画像スキャン（OCR のみ。DB 保存しない）
 //    POST /api/cards/scan
 //    multipart/form-data: file（名刺画像）
@@ -8339,9 +8360,20 @@ app.get('/api/cards', requireAuth, requireCardAccess, async (req, res) => {
     const { data, error } = await query;
     if (error) throw error;
 
+    // 自分のマイカテゴリ（個人ラベル）をまとめて取得し card_id => label のマップに
+    const myLabels = {};
+    {
+      const { data: labelRows } = await supabase
+        .from('card_personal_labels')
+        .select('card_id, label')
+        .eq('user_email', email);
+      for (const r of (labelRows || [])) myLabels[r.card_id] = r.label;
+    }
+
     const rows = await Promise.all((data || []).map(async (r) => ({
       ...r,
       image_url: r.image_ref ? await cardSignedUrl(r.image_ref) : null,
+      my_category: myLabels[r.id] || null,   // 本人だけに返す個人ラベル
     })));
     res.json(rows);
   } catch (error) {
@@ -8370,9 +8402,75 @@ app.get('/api/cards/:id', requireAuth, requireCardAccess, async (req, res) => {
       return res.status(403).json({ error: 'この名刺を閲覧する権限がありません' });
     }
 
-    res.json({ ...data, image_url: data.image_ref ? await cardSignedUrl(data.image_ref) : null });
+    // 自分のマイカテゴリ（個人ラベル）を付与（本人のみ）
+    const { data: myLabel } = await supabase
+      .from('card_personal_labels')
+      .select('label')
+      .eq('user_email', email)
+      .eq('card_id', data.id)
+      .maybeSingle();
+
+    res.json({
+      ...data,
+      image_url: data.image_ref ? await cardSignedUrl(data.image_ref) : null,
+      my_category: myLabel?.label || null,
+    });
   } catch (error) {
     console.error('Error (cards get):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 名刺 - マイカテゴリ（個人ラベル）の設定・解除
+//    PUT /api/cards/:id/my-category   body: { category: string }
+//    閲覧できる名刺なら誰でも自分用ラベルを付けられる（所有者でなくてもよい）。
+//    category が空文字なら解除。
+app.put('/api/cards/:id/my-category', requireAuth, requireCardAccess, async (req, res) => {
+  try {
+    const email = String(req.user.email || '').toLowerCase();
+    const cardId = req.params.id;
+
+    // 閲覧権限チェック（共有 or 自分の or admin のみラベル付与可）
+    const { data: card, error: cardErr } = await supabase
+      .from('business_cards')
+      .select('id, owner_email, visibility')
+      .eq('id', cardId)
+      .eq('is_active', true)
+      .maybeSingle();
+    if (cardErr) throw cardErr;
+    if (!card) return res.status(404).json({ error: '名刺が見つかりません' });
+
+    const isOwner = card.owner_email === email;
+    const isShared = card.visibility === 'shared';
+    const isAdmin = req.cardRole.role === 'admin';
+    if (!isOwner && !isShared && !isAdmin) {
+      return res.status(403).json({ error: 'この名刺にラベルを付ける権限がありません' });
+    }
+
+    const label = (req.body?.category || '').trim();
+
+    if (!label) {
+      // 解除
+      const { error } = await supabase
+        .from('card_personal_labels')
+        .delete()
+        .eq('user_email', email)
+        .eq('card_id', cardId);
+      if (error) throw error;
+      return res.json({ my_category: null });
+    }
+
+    // 設定（upsert）
+    const { error } = await supabase
+      .from('card_personal_labels')
+      .upsert(
+        { user_email: email, card_id: cardId, label, updated_at: new Date().toISOString() },
+        { onConflict: 'user_email,card_id' },
+      );
+    if (error) throw error;
+    res.json({ my_category: label });
+  } catch (error) {
+    console.error('Error (cards set my-category):', error.message);
     res.status(500).json({ error: error.message });
   }
 });
