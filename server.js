@@ -386,8 +386,64 @@ app.get('/api/apps', requireAuth, async (req, res) => {
       if (perms.role === 'admin') return true;
       return !!appPerms[a.key];
     });
-    res.json(apps);
+
+    // このアカウントの使用頻度を各アプリに付与（フロントが頻度順の並び替えに使用）。
+    // app_usage 未作成（migration 032 未適用）でも例外で落とさず、使用回数 0 として返す。
+    const email = String(req.user.email || '').toLowerCase();
+    const usage = {};
+    try {
+      const { data: usageRows } = await supabase
+        .from('app_usage')
+        .select('app_key, use_count, last_used_at')
+        .eq('user_email', email);
+      for (const r of usageRows || []) {
+        usage[r.app_key] = { use_count: r.use_count || 0, last_used_at: r.last_used_at || null };
+      }
+    } catch (e) {
+      console.error('Warning (app_usage fetch):', e.message);
+    }
+    const appsWithUsage = apps.map((a) => ({
+      ...a,
+      use_count: usage[a.key]?.use_count || 0,
+      last_used_at: usage[a.key]?.last_used_at || null,
+    }));
+    res.json(appsWithUsage);
   } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ アプリを開いたことを記録（使用頻度カウント）。要認証。
+//    body: { key } … /api/apps が返す app_key。
+//    (user_email, app_key) で upsert し use_count を加算、last_used_at を更新する。
+//    並び替えの補助情報なので、失敗しても致命的ではない（フロントは結果を待たず発火する）。
+app.post('/api/apps/usage', requireAuth, async (req, res) => {
+  try {
+    const email = String(req.user.email || '').toLowerCase();
+    const key = String(req.body?.key || '').trim();
+    if (!key) return res.status(400).json({ error: 'key is required' });
+
+    // 既存行があれば use_count を +1、なければ 1 で新規。
+    const { data: existing, error: selErr } = await supabase
+      .from('app_usage')
+      .select('use_count')
+      .eq('user_email', email)
+      .eq('app_key', key)
+      .maybeSingle();
+    if (selErr) throw selErr;
+
+    const nextCount = (existing?.use_count || 0) + 1;
+    const { error: upErr } = await supabase
+      .from('app_usage')
+      .upsert(
+        { user_email: email, app_key: key, use_count: nextCount, last_used_at: new Date().toISOString() },
+        { onConflict: 'user_email,app_key' }
+      );
+    if (upErr) throw upErr;
+
+    res.json({ ok: true, key, use_count: nextCount });
+  } catch (error) {
+    console.error('Error (app usage POST):', error.message);
     res.status(500).json({ error: error.message });
   }
 });
