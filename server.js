@@ -367,6 +367,7 @@ app.get('/api/apps', requireAuth, async (req, res) => {
       { id: 10, key: 'documents', name: '文書回覧', icon: '🗂️', internal: true, view: 'documents', description: '回覧書類の電子化・既読/対応管理' },
       { id: 11, key: 'workscope', name: 'WorkScope 導入', icon: '🖥️', internal: true, view: 'workscope', description: '業務記録ツールの導入（インストーラーのダウンロード）' },
       { id: 12, key: 'construction', name: '工事管理', icon: '🏗️', internal: true, view: 'construction', description: '工事の提出書類・検査書類の進捗を管理（九州防衛局 建築工事）' },
+      { id: 14, key: 'cards', name: '名刺管理', icon: '📇', internal: true, view: 'cards', description: '受け取った名刺をOCRで登録・全社で検索' },
       // 【凍結 2026-06-17】法令集はメニューから除外（機能・API・データは残置、復活時はこの行を戻す）
       // { id: 13, key: 'regulations', name: '法令集', icon: '📚', internal: true, view: 'regulations', description: '建設・不動産・林業・労務・会社経営の法令を条文単位で検索・閲覧' },
     ];
@@ -1674,7 +1675,7 @@ app.put('/api/user/settings', requireAuth, async (req, res) => {
 // ============================================================
 
 // 既知のアプリキー（/api/apps と権限UIで共有）
-const APP_KEYS = ['safety-patrol', 'employee-list', 'announcements', 'bids', 'documents', 'feedback', 'workscope', 'construction', 'regulations'];
+const APP_KEYS = ['safety-patrol', 'employee-list', 'announcements', 'bids', 'documents', 'feedback', 'workscope', 'construction', 'regulations', 'cards'];
 
 // staffId のアプリ別権限を { app_key: 'member'|'admin' } のマップで返す
 async function resolveAppPermissions(staffId) {
@@ -8075,6 +8076,431 @@ app.post('/api/regulations/sync', requireAuth, requireRegulationsAdmin, async (r
     });
   } catch (error) {
     console.error('Error (regulations sync):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================================
+// 名刺管理 API（all: requireAuth + requireCardAccess）
+// ============================================================
+
+// ── 権限ミドルウェア（入札と同型。app_key='cards'）──────────────
+async function resolveCardRole(email) {
+  const perms = await resolvePermissions(email); // { role, staffId }
+  if (perms.role === 'admin') return { role: 'admin', access: true, staffId: perms.staffId, globalAdmin: true };
+  let level = null;
+  if (perms.staffId) {
+    const { data } = await supabase
+      .from('staff_app_permissions')
+      .select('access_level')
+      .eq('staff_id', perms.staffId)
+      .eq('app_key', 'cards')
+      .maybeSingle();
+    level = data?.access_level || null;
+  }
+  const role = level === 'admin' ? 'admin' : level ? 'member' : 'none';
+  return { role, access: role !== 'none', staffId: perms.staffId, globalAdmin: false };
+}
+
+// 名刺管理のアクセス権（行があれば許可）
+async function requireCardAccess(req, res, next) {
+  try {
+    const r = await resolveCardRole(req.user.email);
+    if (!r.access) return res.status(403).json({ error: '名刺管理へのアクセス権がありません' });
+    req.cardRole = r;
+    next();
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+}
+
+// 名刺管理の管理者のみ許可（他人の名刺の編集・削除）。要 requireAuth 後段。
+async function requireCardAdmin(req, res, next) {
+  try {
+    const r = await resolveCardRole(req.user.email);
+    if (r.role !== 'admin') return res.status(403).json({ error: 'この操作は名刺管理の管理者のみ可能です' });
+    req.cardRole = r;
+    next();
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+}
+
+// ── Gemini 名刺 OCR 関数（extractCertificate と同型）────────────
+// 名刺画像を Gemini で解析し、各フィールドを構造化して返す。
+async function extractBusinessCard(buffer, mimeType) {
+  if (!GEMINI_API_KEY) {
+    const e = new Error('GEMINI_API_KEY が未設定です。Render の環境変数に設定してください。');
+    e.status = 503;
+    throw e;
+  }
+  const prompt = [
+    'これは日本のビジネス名刺の画像です。',
+    '記載内容を読み取り、次の項目をJSONで返してください。',
+    '- full_name: 氏名（姓名の間の空白は除いて返す。読めなければ空文字）',
+    '- company: 会社名（読めなければ空文字）',
+    '- department: 部署名（読めなければ空文字）',
+    '- title: 役職名（読めなければ空文字）',
+    '- phone: 電話番号（直通・代表。複数ある場合は最初の1つ。読めなければ空文字）',
+    '- mobile: 携帯電話番号（読めなければ空文字）',
+    '- email: メールアドレス（読めなければ空文字）',
+    '- fax: FAX番号（読めなければ空文字）',
+    '- postal_code: 郵便番号（ハイフン付きで返す。例: 123-4567。読めなければ空文字）',
+    '- address: 住所（郵便番号は含めない。読めなければ空文字）',
+    '- website: ウェブサイトURL（読めなければ空文字）',
+    '- qualifications: 資格・肩書き（名刺に記載があれば。複数はカンマ区切り。なければ空文字）',
+    '- note: その他の特記事項（なければ空文字）',
+    '読み取れない項目は空文字にしてください。推測で埋めないでください。',
+  ].join('\n');
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+  const body = {
+    contents: [{
+      parts: [
+        { text: prompt },
+        { inlineData: { mimeType: mimeType || 'image/jpeg', data: buffer.toString('base64') } },
+      ],
+    }],
+    generationConfig: {
+      temperature: 0,
+      responseMimeType: 'application/json',
+      responseSchema: {
+        type: 'OBJECT',
+        properties: {
+          full_name:      { type: 'STRING' },
+          company:        { type: 'STRING' },
+          department:     { type: 'STRING' },
+          title:          { type: 'STRING' },
+          phone:          { type: 'STRING' },
+          mobile:         { type: 'STRING' },
+          email:          { type: 'STRING' },
+          fax:            { type: 'STRING' },
+          postal_code:    { type: 'STRING' },
+          address:        { type: 'STRING' },
+          website:        { type: 'STRING' },
+          qualifications: { type: 'STRING' },
+          note:           { type: 'STRING' },
+        },
+        required: ['full_name', 'company'],
+      },
+    },
+  };
+
+  const resp = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!resp.ok) {
+    const t = await resp.text();
+    const e = new Error(`Gemini API エラー (${resp.status}): ${t.slice(0, 300)}`);
+    e.status = 502;
+    throw e;
+  }
+  const json = await resp.json();
+  const text = json?.candidates?.[0]?.content?.parts?.[0]?.text;
+  if (!text) throw new Error('Gemini から有効な応答が得られませんでした');
+  let parsed;
+  try { parsed = JSON.parse(text); } catch { throw new Error('Gemini 応答の解析に失敗しました'); }
+
+  return {
+    full_name:      (parsed.full_name      || '').trim(),
+    company:        (parsed.company        || '').trim(),
+    department:     (parsed.department     || '').trim(),
+    title:          (parsed.title          || '').trim(),
+    phone:          (parsed.phone          || '').trim(),
+    mobile:         (parsed.mobile         || '').trim(),
+    email:          (parsed.email          || '').trim(),
+    fax:            (parsed.fax            || '').trim(),
+    postal_code:    (parsed.postal_code    || '').trim(),
+    address:        (parsed.address        || '').trim(),
+    website:        (parsed.website        || '').trim(),
+    qualifications: (parsed.qualifications || '').trim(),
+    note:           (parsed.note           || '').trim(),
+  };
+}
+
+// ── Drive / Storage 保存ヘルパー（storeBidFile と同型）──────────
+//   Drive: （DRIVE_FOLDER_ID）/名刺/<氏名 or '未分類'>/
+//   未設定時は Supabase Storage バケット 'card-images' へフォールバック。
+const CARD_BUCKET = 'card-images';
+
+async function storeCardFile({ ownerName, fileName, buffer, mimeType }) {
+  if (driveConfigured()) {
+    const personSeg = sanitizeDriveSeg(ownerName || '未分類');
+    const folderId = await ensureFolderPath(['名刺', personSeg]);
+    const fileId = await driveUpload({ name: fileName, buffer, mimeType, folderId });
+    return `drive:${fileId}`;
+  }
+  const path = `${Date.now()}-${uuidv4()}-${sanitizeDriveSeg(fileName)}`;
+  const { error } = await supabase.storage.from(CARD_BUCKET).upload(path, buffer, { contentType: mimeType });
+  if (error) throw error;
+  return path;
+}
+
+// 名刺画像の一時表示URL（既定1時間）。
+//   'drive:' 参照 → 短命JWT付き API プロキシURL（/api/card-file）。
+//   それ以外      → Supabase 署名付きURL。
+async function cardSignedUrl(ref, expiresIn = 3600) {
+  if (!ref) return null;
+  if (String(ref).startsWith('drive:')) {
+    const fileId = String(ref).slice('drive:'.length);
+    const token = jwt.sign({ fileId, kind: 'card' }, JWT_SECRET, { expiresIn });
+    const base = process.env.PUBLIC_API_URL || 'https://portal-api-hhlx.onrender.com';
+    return `${base}/api/card-file?t=${encodeURIComponent(token)}`;
+  }
+  const { data } = await supabase.storage.from(CARD_BUCKET).createSignedUrl(ref, expiresIn);
+  return data?.signedUrl || null;
+}
+
+// ── 名刺画像プロキシ（短命JWT認証）────────────────────────────
+// 認証は requireAuth ではなく cardSignedUrl が発行する短命JWT（?t=）で行う（署名付きURL相当）。
+app.get('/api/card-file', async (req, res) => {
+  try {
+    const token = req.query.t;
+    if (!token) return res.status(400).send('missing token');
+    let payload;
+    try {
+      payload = jwt.verify(token, JWT_SECRET);
+    } catch {
+      return res.status(401).send('invalid or expired token');
+    }
+    if (payload.kind !== 'card' || !payload.fileId) return res.status(400).send('bad token');
+    const { buffer, contentType } = await driveDownload(payload.fileId);
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('Cache-Control', 'private, max-age=600');
+    res.send(buffer);
+  } catch (error) {
+    console.error('Error (card-file proxy):', error.message);
+    res.status(error.status || 500).send(error.message);
+  }
+});
+
+// ✅ 名刺 - 画像スキャン（OCR のみ。DB 保存しない）
+//    POST /api/cards/scan
+//    multipart/form-data: file（名刺画像）
+app.post('/api/cards/scan', requireAuth, requireCardAccess, upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'file（名刺画像）が必要です' });
+    if (req.file.size > 18 * 1024 * 1024) return res.status(400).json({ error: 'ファイルサイズが18MBを超えています' });
+    const extracted = await extractBusinessCard(req.file.buffer, req.file.mimetype);
+    res.json({ extracted });
+  } catch (error) {
+    console.error('Error (cards scan):', error.message);
+    res.status(error.status || 500).json({ error: error.message });
+  }
+});
+
+// ✅ 名刺 - 一覧取得（?q=&scope= で絞り込み）
+//    scope: 'mine'（自分のみ）| 'shared'（共有のみ）| 未指定/'all'（両方）
+//    q: full_name / company / department / qualifications を ilike 部分一致
+app.get('/api/cards', requireAuth, requireCardAccess, async (req, res) => {
+  try {
+    const { q, scope } = req.query;
+    const email = String(req.user.email || '').toLowerCase();
+
+    let query = supabase.from('business_cards').select('*').eq('is_active', true);
+
+    if (scope === 'mine') {
+      query = query.eq('owner_email', email);
+    } else if (scope === 'shared') {
+      query = query.eq('visibility', 'shared');
+    } else {
+      // 自分の名刺 または 共有名刺
+      query = query.or(`owner_email.eq.${email},visibility.eq.shared`);
+    }
+
+    if (q) {
+      const like = `%${q}%`;
+      query = query.or(`full_name.ilike.${like},company.ilike.${like},department.ilike.${like},qualifications.ilike.${like}`);
+    }
+
+    query = query.order('created_at', { ascending: false });
+
+    const { data, error } = await query;
+    if (error) throw error;
+
+    const rows = await Promise.all((data || []).map(async (r) => ({
+      ...r,
+      image_url: r.image_ref ? await cardSignedUrl(r.image_ref) : null,
+    })));
+    res.json(rows);
+  } catch (error) {
+    console.error('Error (cards list):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 名刺 - 1件取得（閲覧権限: 共有 or 自分の or admin）
+app.get('/api/cards/:id', requireAuth, requireCardAccess, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('business_cards')
+      .select('*')
+      .eq('id', req.params.id)
+      .eq('is_active', true)
+      .maybeSingle();
+    if (error) throw error;
+    if (!data) return res.status(404).json({ error: '名刺が見つかりません' });
+
+    const email = String(req.user.email || '').toLowerCase();
+    const isOwner = data.owner_email === email;
+    const isShared = data.visibility === 'shared';
+    const isAdmin = req.cardRole.role === 'admin';
+    if (!isOwner && !isShared && !isAdmin) {
+      return res.status(403).json({ error: 'この名刺を閲覧する権限がありません' });
+    }
+
+    res.json({ ...data, image_url: data.image_ref ? await cardSignedUrl(data.image_ref) : null });
+  } catch (error) {
+    console.error('Error (cards get):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 名刺 - 新規登録（画像アップロード対応）
+app.post('/api/cards', requireAuth, requireCardAccess, upload.single('file'), async (req, res) => {
+  try {
+    const {
+      full_name, company, department, title,
+      phone, mobile, email: cardEmail, fax,
+      postal_code, address, website, qualifications, note,
+      visibility,
+    } = req.body || {};
+
+    const ownerEmail = String(req.user.email || '').toLowerCase();
+    const vis = visibility === 'shared' ? 'shared' : 'private';
+
+    let image_ref = null;
+    if (req.file) {
+      if (req.file.size > 18 * 1024 * 1024) return res.status(400).json({ error: 'ファイルサイズが18MBを超えています' });
+      const ext = (req.file.originalname.split('.').pop() || 'jpg').toLowerCase();
+      const fileName = `${Date.now()}-${uuidv4()}.${ext}`;
+      image_ref = await storeCardFile({
+        ownerName: (full_name || '').trim() || null,
+        fileName,
+        buffer: req.file.buffer,
+        mimeType: req.file.mimetype,
+      });
+    }
+
+    const { data, error } = await supabase
+      .from('business_cards')
+      .insert([{
+        full_name:      (full_name      || null),
+        company:        (company        || null),
+        department:     (department     || null),
+        title:          (title          || null),
+        phone:          (phone          || null),
+        mobile:         (mobile         || null),
+        email:          (cardEmail      || null),
+        fax:            (fax            || null),
+        postal_code:    (postal_code    || null),
+        address:        (address        || null),
+        website:        (website        || null),
+        qualifications: (qualifications || null),
+        note:           (note           || null),
+        image_ref,
+        visibility:     vis,
+        owner_email:    ownerEmail,
+      }])
+      .select('*');
+    if (error) throw error;
+
+    const row = data[0];
+    res.json({ ...row, image_url: row.image_ref ? await cardSignedUrl(row.image_ref) : null });
+  } catch (error) {
+    console.error('Error (cards create):', error.message);
+    res.status(error.status || 500).json({ error: error.message });
+  }
+});
+
+// ✅ 名刺 - 更新（自分の名刺 or admin のみ）
+app.patch('/api/cards/:id', requireAuth, requireCardAccess, upload.single('file'), async (req, res) => {
+  try {
+    const { data: existing, error: fetchErr } = await supabase
+      .from('business_cards')
+      .select('*')
+      .eq('id', req.params.id)
+      .eq('is_active', true)
+      .maybeSingle();
+    if (fetchErr) throw fetchErr;
+    if (!existing) return res.status(404).json({ error: '名刺が見つかりません' });
+
+    const email = String(req.user.email || '').toLowerCase();
+    if (existing.owner_email !== email && req.cardRole.role !== 'admin') {
+      return res.status(403).json({ error: 'この名刺を編集する権限がありません' });
+    }
+
+    const UPDATABLE = ['full_name', 'company', 'department', 'title', 'phone', 'mobile',
+      'email', 'fax', 'postal_code', 'address', 'website', 'qualifications', 'note', 'visibility'];
+    const patch = {};
+    for (const key of UPDATABLE) {
+      if (req.body && key in req.body) {
+        if (key === 'visibility') {
+          patch[key] = req.body[key] === 'shared' ? 'shared' : 'private';
+        } else {
+          patch[key] = req.body[key] || null;
+        }
+      }
+    }
+
+    if (req.file) {
+      if (req.file.size > 18 * 1024 * 1024) return res.status(400).json({ error: 'ファイルサイズが18MBを超えています' });
+      const ext = (req.file.originalname.split('.').pop() || 'jpg').toLowerCase();
+      const fileName = `${Date.now()}-${uuidv4()}.${ext}`;
+      const ownerName = (patch.full_name || existing.full_name || '').trim() || null;
+      patch.image_ref = await storeCardFile({
+        ownerName,
+        fileName,
+        buffer: req.file.buffer,
+        mimeType: req.file.mimetype,
+      });
+    }
+
+    patch.updated_at = new Date().toISOString();
+
+    const { data, error } = await supabase
+      .from('business_cards')
+      .update(patch)
+      .eq('id', req.params.id)
+      .select('*');
+    if (error) throw error;
+
+    const row = data[0];
+    res.json({ ...row, image_url: row.image_ref ? await cardSignedUrl(row.image_ref) : null });
+  } catch (error) {
+    console.error('Error (cards update):', error.message);
+    res.status(error.status || 500).json({ error: error.message });
+  }
+});
+
+// ✅ 名刺 - 論理削除（自分の名刺 or admin のみ）
+app.delete('/api/cards/:id', requireAuth, requireCardAccess, async (req, res) => {
+  try {
+    const { data: existing, error: fetchErr } = await supabase
+      .from('business_cards')
+      .select('id, owner_email')
+      .eq('id', req.params.id)
+      .eq('is_active', true)
+      .maybeSingle();
+    if (fetchErr) throw fetchErr;
+    if (!existing) return res.status(404).json({ error: '名刺が見つかりません' });
+
+    const email = String(req.user.email || '').toLowerCase();
+    if (existing.owner_email !== email && req.cardRole.role !== 'admin') {
+      return res.status(403).json({ error: 'この名刺を削除する権限がありません' });
+    }
+
+    const { error } = await supabase
+      .from('business_cards')
+      .update({ is_active: false, updated_at: new Date().toISOString() })
+      .eq('id', req.params.id);
+    if (error) throw error;
+
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error (cards delete):', error.message);
     res.status(500).json({ error: error.message });
   }
 });
