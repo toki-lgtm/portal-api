@@ -11,7 +11,7 @@ import { PDFDocument } from 'pdf-lib';
 import JSZip from 'jszip';
 import { parseEstimateFromXlsx } from './bidEstimate.js';
 import { parseBoqFromXlsx, CANONICAL_TRADES } from './boqParser.js';
-import { driveUpload, driveDownload, driveTrash, driveConfigured, ensureFolderPath } from './googleDrive.js';
+import { driveUpload, driveDownload, driveThumbnail, driveTrash, driveConfigured, ensureFolderPath } from './googleDrive.js';
 
 dotenv.config();
 
@@ -8241,11 +8241,12 @@ async function storeCardFile({ category, fileName, buffer, mimeType }) {
 // 名刺画像の一時表示URL（既定1時間）。
 //   'drive:' 参照 → 短命JWT付き API プロキシURL（/api/card-file）。
 //   それ以外      → Supabase 署名付きURL。
-async function cardSignedUrl(ref, expiresIn = 3600) {
+async function cardSignedUrl(ref, { expiresIn = 3600, size } = {}) {
   if (!ref) return null;
   if (String(ref).startsWith('drive:')) {
     const fileId = String(ref).slice('drive:'.length);
-    const token = jwt.sign({ fileId, kind: 'card' }, JWT_SECRET, { expiresIn });
+    // size を指定すると軽量サムネイルを返す（一覧・詳細とも小サイズ表示のため既定で使用）
+    const token = jwt.sign({ fileId, kind: 'card', ...(size ? { size } : {}) }, JWT_SECRET, { expiresIn });
     const base = process.env.PUBLIC_API_URL || 'https://portal-api-hhlx.onrender.com';
     return `${base}/api/card-file?t=${encodeURIComponent(token)}`;
   }
@@ -8266,9 +8267,11 @@ app.get('/api/card-file', async (req, res) => {
       return res.status(401).send('invalid or expired token');
     }
     if (payload.kind !== 'card' || !payload.fileId) return res.status(400).send('bad token');
-    const { buffer, contentType } = await driveDownload(payload.fileId);
+    const { buffer, contentType } = payload.size
+      ? await driveThumbnail(payload.fileId, payload.size)
+      : await driveDownload(payload.fileId);
     res.setHeader('Content-Type', contentType);
-    res.setHeader('Cache-Control', 'private, max-age=600');
+    res.setHeader('Cache-Control', 'private, max-age=3600');
     res.send(buffer);
   } catch (error) {
     console.error('Error (card-file proxy):', error.message);
@@ -8372,7 +8375,7 @@ app.get('/api/cards', requireAuth, requireCardAccess, async (req, res) => {
 
     const rows = await Promise.all((data || []).map(async (r) => ({
       ...r,
-      image_url: r.image_ref ? await cardSignedUrl(r.image_ref) : null,
+      image_url: r.image_ref ? await cardSignedUrl(r.image_ref, { size: 600 }) : null,
       my_category: myLabels[r.id] || null,   // 本人だけに返す個人ラベル
     })));
     res.json(rows);
@@ -8412,7 +8415,7 @@ app.get('/api/cards/:id', requireAuth, requireCardAccess, async (req, res) => {
 
     res.json({
       ...data,
-      image_url: data.image_ref ? await cardSignedUrl(data.image_ref) : null,
+      image_url: data.image_ref ? await cardSignedUrl(data.image_ref, { size: 600 }) : null,
       my_category: myLabel?.label || null,
     });
   } catch (error) {
@@ -8535,7 +8538,7 @@ app.post('/api/cards', requireAuth, requireCardAccess, upload.single('file'), as
     }
 
     const row = data[0];
-    res.json({ ...row, image_url: row.image_ref ? await cardSignedUrl(row.image_ref) : null });
+    res.json({ ...row, image_url: row.image_ref ? await cardSignedUrl(row.image_ref, { size: 600 }) : null });
   } catch (error) {
     console.error('Error (cards create):', error.message);
     res.status(error.status || 500).json({ error: error.message });
@@ -8607,7 +8610,7 @@ app.patch('/api/cards/:id', requireAuth, requireCardAccess, upload.single('file'
     }
 
     const row = data[0];
-    res.json({ ...row, image_url: row.image_ref ? await cardSignedUrl(row.image_ref) : null });
+    res.json({ ...row, image_url: row.image_ref ? await cardSignedUrl(row.image_ref, { size: 600 }) : null });
   } catch (error) {
     console.error('Error (cards update):', error.message);
     res.status(error.status || 500).json({ error: error.message });

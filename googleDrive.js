@@ -123,6 +123,28 @@ export async function driveUpload({ name, buffer, mimeType, folderId }) {
   return data.id;
 }
 
+// 既存ファイルの中身（メディア）だけを差し替える。fileId は不変なので
+// DB の drive:<id> 参照はそのまま、画像の向き補正など「中身の作り直し」に使う。
+export async function driveUpdateMedia(fileId, buffer, mimeType) {
+  const token = await getAccessToken();
+  const res = await fetch(
+    `https://www.googleapis.com/upload/drive/v3/files/${encodeURIComponent(fileId)}?uploadType=media&supportsAllDrives=true&fields=id`,
+    {
+      method: 'PATCH',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': mimeType || 'application/octet-stream',
+      },
+      body: buffer,
+    },
+  );
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Drive メディア更新に失敗しました（${res.status}）: ${text}`);
+  }
+  return res.json();
+}
+
 // Drive 検索クエリ内のシングルクォートをエスケープする。
 function escapeQ(s) {
   return String(s).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
@@ -228,6 +250,34 @@ export async function driveDownload(fileId) {
   const contentType = res.headers.get('content-type') || 'application/octet-stream';
   const buffer = Buffer.from(await res.arrayBuffer());
   return { buffer, contentType };
+}
+
+// fileId の「軽量サムネイル」を取得して { buffer, contentType } を返す。
+// Drive が自動生成する thumbnailLink を size px（長辺）でリサイズ取得する。
+// 一覧表示などフル解像度が不要な場面用（2.6MB → 数十KB に軽量化）。
+// サムネイルが無い場合は本体（driveDownload）にフォールバックする。
+export async function driveThumbnail(fileId, size = 600) {
+  const token = await getAccessToken();
+  const mres = await fetch(
+    `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?fields=thumbnailLink&supportsAllDrives=true`,
+    { headers: { Authorization: `Bearer ${token}` } },
+  );
+  if (mres.ok) {
+    const meta = await mres.json();
+    if (meta.thumbnailLink) {
+      const link = meta.thumbnailLink.includes('=s')
+        ? meta.thumbnailLink.replace(/=s\d+(-c)?$/, `=s${size}`)
+        : `${meta.thumbnailLink}=s${size}`;
+      const tres = await fetch(link, { headers: { Authorization: `Bearer ${token}` } });
+      if (tres.ok) {
+        const contentType = tres.headers.get('content-type') || 'image/jpeg';
+        const buffer = Buffer.from(await tres.arrayBuffer());
+        return { buffer, contentType };
+      }
+    }
+  }
+  // サムネ未生成などは本体取得にフォールバック
+  return driveDownload(fileId);
 }
 
 // fileId をゴミ箱へ移動する（trashed=true）。共有ドライブの「投稿者」権限でも実行可能で、
