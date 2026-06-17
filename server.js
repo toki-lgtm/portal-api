@@ -8378,6 +8378,95 @@ app.get('/api/cards/my-categories', requireAuth, requireCardAccess, async (req, 
   }
 });
 
+// 名刺の全社カテゴリ（17分類）。カテゴリ提案の検証に使う。
+const CARD_CATEGORIES = [
+  '建設・土木', '設計・コンサル・測量', '専門工事・下請', '建設資材・商社',
+  '機械・重機・レンタル', '電気・通信・設備', 'IT・システム', '官公庁・行政',
+  '金融・保険', '運輸・物流', '教育・学校', '不動産',
+  '士業（税理士・法務等）', '飲食・宿泊・サービス', '医療・福祉', '水産・漁業', 'その他',
+];
+
+// ✅ 名刺 - 会社名からカテゴリを提案
+//    POST /api/cards/suggest-category   body: { company }
+//    レスポンス: { category, source: 'existing'|'researched'|'none', industry? }
+//    ・既存リストに同じ会社があれば、その最頻カテゴリを継承（リサーチしない）
+//    ・新規会社なら Gemini + Google検索グラウンディングで業種を調べて17カテゴリ判定
+//    ※ 提案は補助機能。失敗しても登録を妨げないよう常に 200 で返す。
+//    ※ /api/cards/:id より前に定義すること（:id にマッチさせないため）。
+app.post('/api/cards/suggest-category', requireAuth, requireCardAccess, async (req, res) => {
+  const norm = (s) => String(s || '').trim().replace(/[\s　]+/g, ' ');
+  try {
+    const company = norm(req.body?.company);
+    if (!company) return res.json({ category: null, source: 'none' });
+
+    // 【1】既存会社チェック: 正規化一致するカードがあれば、その最頻カテゴリを継承
+    const { data: rows, error: qErr } = await supabase
+      .from('business_cards')
+      .select('company, category')
+      .eq('is_active', true);
+    if (qErr) throw qErr;
+
+    const matched = (rows || []).filter((r) => norm(r.company) === company);
+    if (matched.length > 0) {
+      const counts = new Map();
+      for (const r of matched) {
+        const c = (r.category || '').trim();
+        if (c) counts.set(c, (counts.get(c) || 0) + 1);
+      }
+      if (counts.size > 0) {
+        const top = [...counts.entries()].sort((a, b) => b[1] - a[1])[0][0];
+        return res.json({ category: top, source: 'existing' });
+      }
+      // 一致はするが全てカテゴリ空 → 新規扱いでリサーチへ
+    }
+
+    // 【2】新規会社 → Gemini + Google検索グラウンディングで業種を調べてカテゴリ判定
+    if (!GEMINI_API_KEY) return res.json({ category: null, source: 'none' });
+
+    const prompt = `日本の企業/組織「${company}」について、Google検索で実際の業種・事業内容を調べ、次の17カテゴリから最も適切なものを1つだけ選んでください。どれにも明確に当てはまらなければ「その他」を選んでください。
+
+17カテゴリ: ${CARD_CATEGORIES.join('、')}
+
+出力はJSONのみ（前後に説明文やマークダウンを付けない）: {"category":"<17カテゴリのいずれか>","industry":"<業種の一言>"}`;
+
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+    const body = { contents: [{ parts: [{ text: prompt }] }], tools: [{ google_search: {} }] };
+
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!resp.ok) {
+      const errText = await resp.text().catch(() => '');
+      console.error('Error (suggest-category Gemini):', resp.status, errText.slice(0, 300));
+      return res.json({ category: null, source: 'none' });
+    }
+
+    const json = await resp.json();
+    const text = json?.candidates?.[0]?.content?.parts?.map((p) => p?.text || '').join('') || '';
+
+    // ```json フェンスや前後テキストを除去して最初の { ... } を取り出す
+    let parsed = null;
+    try {
+      const cleaned = text.replace(/```json\s*/gi, '').replace(/```/g, '').trim();
+      const start = cleaned.indexOf('{');
+      const end = cleaned.lastIndexOf('}');
+      if (start >= 0 && end > start) parsed = JSON.parse(cleaned.slice(start, end + 1));
+    } catch (e) {
+      parsed = null;
+    }
+
+    if (!parsed || !parsed.category) return res.json({ category: null, source: 'none' });
+
+    const category = CARD_CATEGORIES.includes(parsed.category) ? parsed.category : 'その他';
+    return res.json({ category, source: 'researched', industry: (parsed.industry || '').trim() || undefined });
+  } catch (error) {
+    console.error('Error (cards suggest-category):', error.message);
+    return res.json({ category: null, source: 'none' });
+  }
+});
+
 // ✅ 名刺 - 画像スキャン（OCR のみ。DB 保存しない）
 //    POST /api/cards/scan
 //    multipart/form-data: file（名刺画像）
