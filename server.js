@@ -9,6 +9,7 @@ import multer from 'multer';
 import nodemailer from 'nodemailer';
 import { PDFDocument } from 'pdf-lib';
 import JSZip from 'jszip';
+import sharp from 'sharp';
 import { parseEstimateFromXlsx } from './bidEstimate.js';
 import { parseBoqFromXlsx, CANONICAL_TRADES } from './boqParser.js';
 import { driveUpload, driveDownload, driveThumbnail, driveTrash, driveConfigured, ensureFolderPath } from './googleDrive.js';
@@ -8220,6 +8221,64 @@ async function extractBusinessCard(buffer, mimeType) {
   };
 }
 
+// ── 名刺の向き自動補正（Gemini で正立判定 → sharp で回転）──────────
+// 既存の一括補正と同じ思想: モデルは「正立(0°)」の判定は高信頼だが
+// 90/270 の方向判定は不安定。そこで まず1回判定し、傾いていれば
+// 0/90/180/270 を総当たりして「正立」と判定される向きを選ぶ。
+// 判定不能（縦書きで透過映り込み等）の場合は無回転で返す（無害なフォールバック）。
+async function judgeCardRotation(jpegBuffer) {
+  const prompt = [
+    'この画像は名刺の写真です。',
+    '名刺には横書き名刺と縦書き名刺があり、どちらも「文字がきちんと読める状態」が正立です。',
+    'ローマ字（社名ロゴ/氏名/住所のアルファベット）や数字が横倒し・上下逆なら、その分だけ回転が必要です。',
+    '正立させるために時計回りに何度回転が必要かを 0/90/180/270 で答えてください。',
+    '・そのまま読める→0 ／・頭を左に傾けると読める→90 ／・上下逆→180 ／・頭を右に傾けると読める→270',
+    '出力はJSONのみ: {"rotate_cw":0,"confidence":0.95}',
+  ].join('\n');
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+  const body = {
+    contents: [{ parts: [{ text: prompt }, { inlineData: { mimeType: 'image/jpeg', data: jpegBuffer.toString('base64') } }] }],
+    generationConfig: {
+      temperature: 0, responseMimeType: 'application/json',
+      responseSchema: { type: 'OBJECT', properties: { rotate_cw: { type: 'INTEGER' }, confidence: { type: 'NUMBER' } }, required: ['rotate_cw'] },
+    },
+  };
+  const resp = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  if (!resp.ok) throw new Error(`Gemini ${resp.status}`);
+  const json = await resp.json();
+  const p = JSON.parse(json?.candidates?.[0]?.content?.parts?.[0]?.text || '{}');
+  const valid = [0, 90, 180, 270];
+  return { rotate_cw: valid.includes(Number(p.rotate_cw)) ? Number(p.rotate_cw) : 0, confidence: Number(p.confidence) || 0 };
+}
+
+// 入力画像を正立させて返す。{ buffer, mimeType }。補正不要/失敗時は EXIF 正規化のみ。
+async function orientCardUpright(buffer, mimeType) {
+  if (!GEMINI_API_KEY) return { buffer, mimeType: mimeType || 'image/jpeg' };
+  try {
+    // EXIF の向きを画素へ焼き込んだベース画像（以後の回転基準）
+    const base = await sharp(buffer).rotate().toBuffer();
+    const toSmall = (b, a) => sharp(b).rotate(a).resize({ width: 1100, height: 1100, fit: 'inside' }).jpeg({ quality: 85 }).toBuffer();
+
+    // まず現状を判定。正立(0°)なら即終了（最頻ケース＝Gemini呼び出し1回）
+    const j0 = await judgeCardRotation(await sharp(base).resize({ width: 1100, height: 1100, fit: 'inside' }).jpeg({ quality: 85 }).toBuffer());
+    if (j0.rotate_cw === 0) return { buffer: base, mimeType: 'image/jpeg' };
+
+    // 傾いている → 90/180/270 を総当たりし「正立」と判定される向きを採用
+    const cands = [90, 180, 270];
+    const smalls = await Promise.all(cands.map((a) => toSmall(base, a)));
+    const judged = await Promise.all(smalls.map((s) => judgeCardRotation(s).catch(() => ({ rotate_cw: -1, confidence: 0 }))));
+    let best = null;
+    cands.forEach((a, i) => { if (judged[i].rotate_cw === 0 && (!best || judged[i].confidence > best.conf)) best = { a, conf: judged[i].confidence }; });
+    if (!best) return { buffer: base, mimeType: 'image/jpeg' }; // 正立向きを特定できず→無回転
+
+    const rotated = await sharp(base).rotate(best.a).jpeg({ quality: 92 }).toBuffer();
+    return { buffer: rotated, mimeType: 'image/jpeg', rotated: best.a };
+  } catch (e) {
+    console.error('orientCardUpright 失敗（無補正で続行）:', e.message);
+    return { buffer, mimeType: mimeType || 'image/jpeg' };
+  }
+}
+
 // ── Drive / Storage 保存ヘルパー（storeBidFile と同型）──────────
 //   Drive: （DRIVE_FOLDER_ID）/名刺/<カテゴリ or '未分類'>/
 //   未設定時は Supabase Storage バケット 'card-images' へフォールバック。
@@ -8326,7 +8385,9 @@ app.post('/api/cards/scan', requireAuth, requireCardAccess, upload.single('file'
   try {
     if (!req.file) return res.status(400).json({ error: 'file（名刺画像）が必要です' });
     if (req.file.size > 18 * 1024 * 1024) return res.status(400).json({ error: 'ファイルサイズが18MBを超えています' });
-    const extracted = await extractBusinessCard(req.file.buffer, req.file.mimetype);
+    // 向きを自動補正してから OCR（横倒し名刺の読み取り精度を確保）
+    const oriented = await orientCardUpright(req.file.buffer, req.file.mimetype);
+    const extracted = await extractBusinessCard(oriented.buffer, oriented.mimeType);
     res.json({ extracted });
   } catch (error) {
     console.error('Error (cards scan):', error.message);
@@ -8496,13 +8557,15 @@ app.post('/api/cards', requireAuth, requireCardAccess, upload.single('file'), as
     let image_ref = null;
     if (req.file) {
       if (req.file.size > 18 * 1024 * 1024) return res.status(400).json({ error: 'ファイルサイズが18MBを超えています' });
-      const ext = (req.file.originalname.split('.').pop() || 'jpg').toLowerCase();
+      // 保存前に向きを自動補正（正立画素で保存。回転時は JPEG に正規化）
+      const oriented = await orientCardUpright(req.file.buffer, req.file.mimetype);
+      const ext = oriented.mimeType === 'image/jpeg' ? 'jpg' : (req.file.originalname.split('.').pop() || 'jpg').toLowerCase();
       const fileName = `${Date.now()}-${uuidv4()}.${ext}`;
       image_ref = await storeCardFile({
         category: cat,
         fileName,
-        buffer: req.file.buffer,
-        mimeType: req.file.mimetype,
+        buffer: oriented.buffer,
+        mimeType: oriented.mimeType,
       });
     }
 
@@ -8579,15 +8642,17 @@ app.patch('/api/cards/:id', requireAuth, requireCardAccess, upload.single('file'
 
     if (req.file) {
       if (req.file.size > 18 * 1024 * 1024) return res.status(400).json({ error: 'ファイルサイズが18MBを超えています' });
-      const ext = (req.file.originalname.split('.').pop() || 'jpg').toLowerCase();
+      // 差し替え画像も保存前に向きを自動補正
+      const oriented = await orientCardUpright(req.file.buffer, req.file.mimetype);
+      const ext = oriented.mimeType === 'image/jpeg' ? 'jpg' : (req.file.originalname.split('.').pop() || 'jpg').toLowerCase();
       const fileName = `${Date.now()}-${uuidv4()}.${ext}`;
       // category はパッチ済みの値、なければ既存の値を使用
       const effectiveCategory = ('category' in patch ? patch.category : existing.category) || null;
       patch.image_ref = await storeCardFile({
         category: effectiveCategory,
         fileName,
-        buffer: req.file.buffer,
-        mimeType: req.file.mimetype,
+        buffer: oriented.buffer,
+        mimeType: oriented.mimeType,
       });
     }
 
