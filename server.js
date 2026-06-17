@@ -8221,14 +8221,14 @@ async function extractBusinessCard(buffer, mimeType) {
 }
 
 // ── Drive / Storage 保存ヘルパー（storeBidFile と同型）──────────
-//   Drive: （DRIVE_FOLDER_ID）/名刺/<氏名 or '未分類'>/
+//   Drive: （DRIVE_FOLDER_ID）/名刺/<カテゴリ or '未分類'>/
 //   未設定時は Supabase Storage バケット 'card-images' へフォールバック。
 const CARD_BUCKET = 'card-images';
 
-async function storeCardFile({ ownerName, fileName, buffer, mimeType }) {
+async function storeCardFile({ category, fileName, buffer, mimeType }) {
   if (driveConfigured()) {
-    const personSeg = sanitizeDriveSeg(ownerName || '未分類');
-    const folderId = await ensureFolderPath(['名刺', personSeg]);
+    const categorySeg = sanitizeDriveSeg(category || '未分類');
+    const folderId = await ensureFolderPath(['名刺', categorySeg]);
     const fileId = await driveUpload({ name: fileName, buffer, mimeType, folderId });
     return `drive:${fileId}`;
   }
@@ -8273,6 +8273,25 @@ app.get('/api/card-file', async (req, res) => {
   } catch (error) {
     console.error('Error (card-file proxy):', error.message);
     res.status(error.status || 500).send(error.message);
+  }
+});
+
+// ✅ 名刺 - カテゴリ一覧取得（自分が使ったカテゴリ候補を返す）
+//    GET /api/cards/categories
+//    レスポンス: { categories: ["官公庁", "協力会社", ...] }（name 昇順）
+app.get('/api/cards/categories', requireAuth, requireCardAccess, async (req, res) => {
+  try {
+    const email = String(req.user.email || '').toLowerCase();
+    const { data, error } = await supabase
+      .from('card_categories')
+      .select('name')
+      .eq('user_email', email)
+      .order('name', { ascending: true });
+    if (error) throw error;
+    res.json({ categories: (data || []).map((r) => r.name) });
+  } catch (error) {
+    console.error('Error (cards categories):', error.message);
+    res.status(500).json({ error: error.message });
   }
 });
 
@@ -8365,11 +8384,13 @@ app.post('/api/cards', requireAuth, requireCardAccess, upload.single('file'), as
       full_name, company, department, title,
       phone, mobile, email: cardEmail, fax,
       postal_code, address, website, qualifications, note,
-      visibility,
+      visibility, category,
     } = req.body || {};
 
     const ownerEmail = String(req.user.email || '').toLowerCase();
-    const vis = visibility === 'shared' ? 'shared' : 'private';
+    // デフォルトは 'shared'（未指定 or 不正値は shared 扱い。既存データは変更しない）
+    const vis = visibility === 'private' ? 'private' : 'shared';
+    const cat = (category || '').trim() || null;
 
     let image_ref = null;
     if (req.file) {
@@ -8377,7 +8398,7 @@ app.post('/api/cards', requireAuth, requireCardAccess, upload.single('file'), as
       const ext = (req.file.originalname.split('.').pop() || 'jpg').toLowerCase();
       const fileName = `${Date.now()}-${uuidv4()}.${ext}`;
       image_ref = await storeCardFile({
-        ownerName: (full_name || '').trim() || null,
+        category: cat,
         fileName,
         buffer: req.file.buffer,
         mimeType: req.file.mimetype,
@@ -8400,12 +8421,20 @@ app.post('/api/cards', requireAuth, requireCardAccess, upload.single('file'), as
         website:        (website        || null),
         qualifications: (qualifications || null),
         note:           (note           || null),
+        category:       cat,
         image_ref,
         visibility:     vis,
         owner_email:    ownerEmail,
       }])
       .select('*');
     if (error) throw error;
+
+    // カテゴリが指定されていれば card_categories に upsert（候補として保存）
+    if (cat) {
+      await supabase
+        .from('card_categories')
+        .upsert({ user_email: ownerEmail, name: cat }, { onConflict: 'user_email,name' });
+    }
 
     const row = data[0];
     res.json({ ...row, image_url: row.image_ref ? await cardSignedUrl(row.image_ref) : null });
@@ -8433,12 +8462,14 @@ app.patch('/api/cards/:id', requireAuth, requireCardAccess, upload.single('file'
     }
 
     const UPDATABLE = ['full_name', 'company', 'department', 'title', 'phone', 'mobile',
-      'email', 'fax', 'postal_code', 'address', 'website', 'qualifications', 'note', 'visibility'];
+      'email', 'fax', 'postal_code', 'address', 'website', 'qualifications', 'note', 'visibility', 'category'];
     const patch = {};
     for (const key of UPDATABLE) {
       if (req.body && key in req.body) {
         if (key === 'visibility') {
-          patch[key] = req.body[key] === 'shared' ? 'shared' : 'private';
+          patch[key] = req.body[key] === 'private' ? 'private' : 'shared';
+        } else if (key === 'category') {
+          patch[key] = (req.body[key] || '').trim() || null;
         } else {
           patch[key] = req.body[key] || null;
         }
@@ -8449,9 +8480,10 @@ app.patch('/api/cards/:id', requireAuth, requireCardAccess, upload.single('file'
       if (req.file.size > 18 * 1024 * 1024) return res.status(400).json({ error: 'ファイルサイズが18MBを超えています' });
       const ext = (req.file.originalname.split('.').pop() || 'jpg').toLowerCase();
       const fileName = `${Date.now()}-${uuidv4()}.${ext}`;
-      const ownerName = (patch.full_name || existing.full_name || '').trim() || null;
+      // category はパッチ済みの値、なければ既存の値を使用
+      const effectiveCategory = ('category' in patch ? patch.category : existing.category) || null;
       patch.image_ref = await storeCardFile({
-        ownerName,
+        category: effectiveCategory,
         fileName,
         buffer: req.file.buffer,
         mimeType: req.file.mimetype,
@@ -8466,6 +8498,15 @@ app.patch('/api/cards/:id', requireAuth, requireCardAccess, upload.single('file'
       .eq('id', req.params.id)
       .select('*');
     if (error) throw error;
+
+    // カテゴリが更新・指定されていれば card_categories に upsert
+    const savedCategory = 'category' in patch ? patch.category : null;
+    if (savedCategory) {
+      const ownerEmailForCat = String(req.user.email || '').toLowerCase();
+      await supabase
+        .from('card_categories')
+        .upsert({ user_email: ownerEmailForCat, name: savedCategory }, { onConflict: 'user_email,name' });
+    }
 
     const row = data[0];
     res.json({ ...row, image_url: row.image_ref ? await cardSignedUrl(row.image_ref) : null });
