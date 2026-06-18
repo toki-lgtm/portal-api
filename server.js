@@ -369,6 +369,7 @@ app.get('/api/apps', requireAuth, async (req, res) => {
       { id: 11, key: 'workscope', name: 'WorkScope 導入', icon: '🖥️', internal: true, view: 'workscope', description: '業務記録ツールの導入（インストーラーのダウンロード）' },
       { id: 12, key: 'construction', name: '工事管理', icon: '🏗️', internal: true, view: 'construction', description: '工事の提出書類・検査書類の進捗を管理（九州防衛局 建築工事）' },
       { id: 14, key: 'cards', name: '名刺管理', icon: '📇', internal: true, view: 'cards', description: '受け取った名刺をOCRで登録・全社で検索' },
+      { id: 15, key: 'manual', name: '操作マニュアル', icon: '📖', internal: true, view: 'manual', description: 'ポータルと各アプリの使い方ガイド' },
       // 【凍結 2026-06-17】法令集はメニューから除外（機能・API・データは残置、復活時はこの行を戻す）
       // { id: 13, key: 'regulations', name: '法令集', icon: '📚', internal: true, view: 'regulations', description: '建設・不動産・林業・労務・会社経営の法令を条文単位で検索・閲覧' },
     ];
@@ -385,6 +386,8 @@ app.get('/api/apps', requireAuth, async (req, res) => {
       if (a.key === 'feedback') return fbRole.role === 'admin';
       // WorkScope 導入は全社員に配布したいので常に表示する（管理用UIは画面内で admin のみ表示）。
       if (a.key === 'workscope') return true;
+      // 操作マニュアルは全社員に常に表示する（読み取り専用の使い方ガイド）。
+      if (a.key === 'manual') return true;
       if (perms.role === 'admin') return true;
       return !!appPerms[a.key];
     });
