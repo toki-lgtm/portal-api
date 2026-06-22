@@ -13,6 +13,7 @@ import sharp from 'sharp';
 import { parseEstimateFromXlsx } from './bidEstimate.js';
 import { parseBoqFromXlsx, CANONICAL_TRADES } from './boqParser.js';
 import { driveUpload, driveDownload, driveThumbnail, driveTrash, driveConfigured, ensureFolderPath } from './googleDrive.js';
+import { classifyQuote, classNoOf } from './classifyQuote.js';
 
 dotenv.config();
 
@@ -370,6 +371,7 @@ app.get('/api/apps', requireAuth, async (req, res) => {
       { id: 12, key: 'construction', name: '工事管理', icon: '🏗️', internal: true, view: 'construction', description: '工事の提出書類・検査書類の進捗を管理（九州防衛局 建築工事）' },
       { id: 14, key: 'cards', name: '名刺管理', icon: '📇', internal: true, view: 'cards', description: '受け取った名刺をOCRで登録・全社で検索' },
       { id: 15, key: 'manual', name: '操作マニュアル', icon: '📖', internal: true, view: 'manual', description: 'ポータルと各アプリの使い方ガイド' },
+      { id: 16, key: 'quote_compare', name: '見積比較', icon: '💰', internal: true, view: 'quote-compare', description: '相見積の単価を横並び比較し最安見積を作成（築城方式）' },
       // 【凍結 2026-06-17】法令集はメニューから除外（機能・API・データは残置、復活時はこの行を戻す）
       // { id: 13, key: 'regulations', name: '法令集', icon: '📚', internal: true, view: 'regulations', description: '建設・不動産・林業・労務・会社経営の法令を条文単位で検索・閲覧' },
     ];
@@ -6412,6 +6414,368 @@ async function resolveFeedbackRole(email) {
   const role = level === 'admin' ? 'admin' : level ? 'member' : 'none';
   return { role, staffId: perms.staffId };
 }
+
+// ============================================================
+// 見積比較（quote_compare）API ── P0: 骨格＋6類型分類
+//   設計書: D:\01.claude code\04.アプリ\見積比較_設計書.md（＝正）
+//   1プロジェクト＝1つの入札時積算数量書（工事×分野）に複数社の見積をぶら下げる。
+//   原本xlsx → boqParser で BOQ行(sheet,excel_row付)に分解（書き戻しの骨格）。
+//   各社見積はアップロード時に6類型（書式軸×媒体軸）を自動分類＋人が確認・上書き。
+//   ※ Excel直読抽出・PDFキュー抽出・横並び比較・最安・書き戻しは P1 以降。
+// ============================================================
+
+// 権限: staff_app_permissions['quote_compare'] に行があれば全操作可（入札担当中心）。
+//   グローバル管理者は常に許可。bids と同型（行があれば閲覧/編集を分けない）。
+async function resolveQuoteCompareRole(email) {
+  const perms = await resolvePermissions(email); // { role, staffId }
+  if (perms.role === 'admin') return { role: 'admin', access: true, staffId: perms.staffId, globalAdmin: true };
+  let level = null;
+  if (perms.staffId) {
+    const { data } = await supabase
+      .from('staff_app_permissions')
+      .select('access_level')
+      .eq('staff_id', perms.staffId)
+      .eq('app_key', 'quote_compare')
+      .maybeSingle();
+    level = data?.access_level || null;
+  }
+  const role = level === 'admin' ? 'admin' : level ? 'member' : 'none';
+  return { role, access: role !== 'none', staffId: perms.staffId, globalAdmin: false };
+}
+
+async function requireQuoteCompareAccess(req, res, next) {
+  try {
+    const r = await resolveQuoteCompareRole(req.user.email);
+    if (!r.access) return res.status(403).json({ error: '見積比較へのアクセス権がありません' });
+    req.qcRole = r;
+    next();
+  } catch (e) { res.status(500).json({ error: e.message }); }
+}
+
+// 見積比較の有効な軸の値
+const QC_FORM_TYPES = ['official', 'vendor'];
+const QC_MEDIA = ['excel', 'text_pdf', 'image_pdf'];
+const QC_DISCIPLINES = ['建築', '機械', '電気・通信'];
+
+// 見積比較ファイルを Drive に保存し drive:<id> を返す（共有ドライブ「見積比較/<工事名>/<sub>/」）。
+//   Drive 未設定時は Supabase バケットへフォールバック（construction と同型）。
+async function storeQuoteFile({ projectName, sub, fileName, buffer, mimeType }) {
+  if (driveConfigured()) {
+    const folderId = await ensureFolderPath([
+      '見積比較',
+      sanitizeDriveSeg(projectName || 'project'),
+      sanitizeDriveSeg(sub || '見積'),
+    ]);
+    const fileId = await driveUpload({ name: fileName, buffer, mimeType, folderId });
+    return `drive:${fileId}`;
+  }
+  await ensureConstructionBucket();
+  const path = `quote/${Date.now()}-${uuidv4()}-${sanitizeDriveSeg(fileName)}`;
+  const { error } = await supabase.storage.from(CONSTRUCTION_BUCKET).upload(path, buffer, { contentType: mimeType });
+  if (error) throw error;
+  return path;
+}
+
+// boqParser の nodes を quote_boq_rows へ保存（全行 replace）。
+//   書き戻しの鍵として sheet_name / excel_row を必ず保持する（boqParser 拡張で付与済み）。
+async function persistQuoteBoq(projectId, parsed) {
+  await supabase.from('quote_boq_rows').delete().eq('project_id', projectId);
+  const rows = parsed.nodes.map((x) => ({
+    project_id: projectId,
+    sheet_name: x.sheet_name || null,
+    excel_row: x.excel_row ?? null,
+    path: x.path || null,
+    level: x.level ?? 2,
+    kind: x.kind || '細目',
+    item_name: x.item_name || null,
+    spec: x.spec || null,
+    // quantity_raw は書き戻し（P3）で原本の文字列(▲/カンマ)を参照する想定。
+    // 現状 boqParser は数値のみ公開のため暫定で文字列化（原本書式の厳密保持は P3 で対応）。
+    quantity_raw: x.quantity != null ? String(x.quantity) : null,
+    quantity_num: x.quantity ?? null,
+    unit: x.unit || null,
+    official_unit_price: null,
+    beppi_no: x.beppi_no || null,
+    trade: x.trade || null,
+    canonical: x.trade || null,
+    sort_order: x.sort_order ?? 0,
+  }));
+  for (let i = 0; i < rows.length; i += 200) {
+    const { error } = await supabase.from('quote_boq_rows').insert(rows.slice(i, i + 200));
+    if (error) throw error;
+  }
+}
+
+// ✅ 見積比較 - プロジェクト一覧（権限内は全件。業者数を付与）
+app.get('/api/quote-compare/projects', requireAuth, requireQuoteCompareAccess, async (req, res) => {
+  try {
+    const { data: projects, error } = await supabase
+      .from('quote_compare_projects').select('*').order('updated_at', { ascending: false });
+    if (error) throw error;
+    const ids = (projects || []).map((p) => p.id);
+    const vcount = {};
+    if (ids.length) {
+      const { data: vs } = await supabase.from('quote_vendors').select('project_id').in('project_id', ids);
+      for (const v of vs || []) vcount[v.project_id] = (vcount[v.project_id] || 0) + 1;
+    }
+    res.json((projects || []).map((p) => ({ ...p, vendor_count: vcount[p.id] || 0 })));
+  } catch (error) {
+    console.error('Error (quote-compare projects):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 見積比較 - プロジェクト新規（bid_project_id 任意紐付け）
+app.post('/api/quote-compare/projects', requireAuth, requireQuoteCompareAccess, async (req, res) => {
+  try {
+    const name = String(req.body?.name || '').trim();
+    if (!name) return res.status(400).json({ error: 'name（プロジェクト名）は必須です' });
+    const discipline = req.body?.discipline ? String(req.body.discipline) : null;
+    if (discipline && !QC_DISCIPLINES.includes(discipline)) {
+      return res.status(400).json({ error: 'discipline は 建築/機械/電気・通信 のいずれかです' });
+    }
+    const rawBid = req.body?.bid_project_id;
+    const bidProjectId = rawBid != null && rawBid !== '' ? Number(rawBid) : null;
+    if (bidProjectId != null && isNaN(bidProjectId)) {
+      return res.status(400).json({ error: 'bid_project_id は数値で指定してください' });
+    }
+    const { data, error } = await supabase
+      .from('quote_compare_projects')
+      .insert({
+        name,
+        client: req.body?.client ? String(req.body.client) : null,
+        discipline,
+        bid_project_id: bidProjectId,
+        created_by: req.user.email,
+      })
+      .select('*')
+      .single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (quote-compare create):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 見積比較 - プロジェクト詳細（BOQ件数＋業者一覧）
+app.get('/api/quote-compare/projects/:id', requireAuth, requireQuoteCompareAccess, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { data: project, error } = await supabase
+      .from('quote_compare_projects').select('*').eq('id', id).maybeSingle();
+    if (error) throw error;
+    if (!project) return res.status(404).json({ error: 'プロジェクトが見つかりません' });
+    const [{ count: boqCount }, { data: vendors }] = await Promise.all([
+      supabase.from('quote_boq_rows').select('id', { count: 'exact', head: true }).eq('project_id', id),
+      supabase.from('quote_vendors').select('*').eq('project_id', id).order('created_at', { ascending: true }),
+    ]);
+    res.json({ ...project, boq_row_count: boqCount || 0, vendors: vendors || [] });
+  } catch (error) {
+    console.error('Error (quote-compare detail):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 見積比較 - プロジェクト削除（紐づく行はCASCADE）
+app.delete('/api/quote-compare/projects/:id', requireAuth, requireQuoteCompareAccess, async (req, res) => {
+  try {
+    const { error } = await supabase.from('quote_compare_projects').delete().eq('id', req.params.id);
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error (quote-compare delete):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 見積比較 - 原本（入札時積算数量書 xlsx）取込 → boqParser → quote_boq_rows
+app.post('/api/quote-compare/projects/:id/import-template', requireAuth, requireQuoteCompareAccess, upload.single('file'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!req.file) return res.status(400).json({ error: 'file フィールド（数量書 .xlsx）が必要です' });
+    const { data: project, error } = await supabase
+      .from('quote_compare_projects').select('id, name').eq('id', id).maybeSingle();
+    if (error) throw error;
+    if (!project) return res.status(404).json({ error: 'プロジェクトが見つかりません' });
+
+    const originalName = decodeUploadName(req.file.originalname);
+    const ext = (originalName.split('.').pop() || '').toLowerCase();
+    if (!['xlsx', 'xlsm'].includes(ext)) {
+      return res.status(400).json({ error: '原本数量書は Excel(.xlsx) 形式でアップロードしてください' });
+    }
+
+    const parsed = parseBoqFromXlsx(req.file.buffer, originalName);
+    if (parsed.mode === 'empty' || !parsed.nodes.length) {
+      return res.status(422).json({ error: '数量書の明細を読み取れませんでした。様式（種目・科目・細目の各シート）をご確認ください', mode: parsed.mode });
+    }
+
+    await persistQuoteBoq(id, parsed);
+
+    // 原本テンプレを Drive に保存（書き戻しジョブで現物同梱するための参照。失敗しても取込は成功とする）
+    let templateRef = null;
+    try {
+      templateRef = await storeQuoteFile({
+        projectName: project.name, sub: '原本', fileName: originalName,
+        buffer: req.file.buffer,
+        mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      });
+    } catch (e) {
+      console.error('Warning (quote template store):', e.message);
+    }
+
+    await supabase.from('quote_compare_projects')
+      .update({
+        template_drive_id: templateRef,
+        template_filename: originalName,
+        boq_total: Math.round(parsed.total || 0),
+        boq_imported_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', id);
+
+    res.json({
+      ok: true,
+      file_name: originalName,
+      total: parsed.total,
+      line_count: parsed.lineCount,
+      counts: parsed.counts,
+      template_saved: !!templateRef,
+    });
+  } catch (error) {
+    console.error('Error (quote-compare import-template):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 見積比較 - 保存済み BOQ 行を取得（タブ1 数量書ツリー表示用）
+app.get('/api/quote-compare/projects/:id/boq', requireAuth, requireQuoteCompareAccess, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const [{ data: rows }, { data: project }] = await Promise.all([
+      supabase.from('quote_boq_rows').select('*').eq('project_id', id).order('sort_order', { ascending: true }),
+      supabase.from('quote_compare_projects').select('boq_total, boq_imported_at, template_filename').eq('id', id).maybeSingle(),
+    ]);
+    res.json({
+      rows: rows || [],
+      total: project?.boq_total ?? null,
+      imported_at: project?.boq_imported_at ?? null,
+      template_filename: project?.template_filename ?? null,
+    });
+  } catch (error) {
+    console.error('Error (quote-compare boq get):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 見積比較 - 業者追加＋見積アップロード＋6類型 自動分類
+//   multipart: name（業者名）, files（見積ファイル 1つ以上。1アップロード＝1業者）。
+//   先頭ファイルで自動分類（媒体軸=拡張子/PDFテキスト層プローブ, 書式軸=シート/表題ヘッダ）。
+app.post('/api/quote-compare/projects/:id/vendors', requireAuth, requireQuoteCompareAccess, upload.array('files', 10), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const name = String(req.body?.name || '').trim();
+    if (!name) return res.status(400).json({ error: 'name（業者名）は必須です' });
+    const { data: project, error } = await supabase
+      .from('quote_compare_projects').select('id, name').eq('id', id).maybeSingle();
+    if (error) throw error;
+    if (!project) return res.status(404).json({ error: 'プロジェクトが見つかりません' });
+    const files = req.files || [];
+    if (!files.length) return res.status(400).json({ error: 'files（見積ファイル）を1つ以上添付してください' });
+
+    // 先頭ファイルで自動分類（例外は classifyQuote 内で握り低確信フォールバック）
+    const primary = files[0];
+    const primaryName = decodeUploadName(primary.originalname);
+    const cls = await classifyQuote({ buffer: primary.buffer, filename: primaryName });
+
+    // 全ファイルを Drive 保存（失敗してもレコードは作る。参照は取れたものだけ）
+    const driveIds = [];
+    for (const f of files) {
+      try {
+        const ref = await storeQuoteFile({
+          projectName: project.name, sub: '見積',
+          fileName: `${name}__${decodeUploadName(f.originalname)}`,
+          buffer: f.buffer, mimeType: f.mimetype || 'application/octet-stream',
+        });
+        driveIds.push(ref);
+      } catch (e) {
+        console.error('Warning (quote vendor file store):', e.message);
+      }
+    }
+
+    const { data, error: insErr } = await supabase
+      .from('quote_vendors')
+      .insert({
+        project_id: id,
+        name,
+        form_type: cls.form_type,
+        medium: cls.medium,
+        class_no: cls.class_no,
+        auto_classified: true,
+        classify_confidence: cls.confidence,
+        source_drive_ids: driveIds,
+        status: 'classified',
+        created_by: req.user.email,
+      })
+      .select('*')
+      .single();
+    if (insErr) throw insErr;
+
+    await supabase.from('quote_compare_projects')
+      .update({ updated_at: new Date().toISOString() }).eq('id', id);
+
+    res.json({ ...data, classify_signals: cls.signals || null, primary_file: primaryName });
+  } catch (error) {
+    console.error('Error (quote-compare add vendor):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 見積比較 - 分類の手動上書き（書式軸/媒体軸トグル）。class_no を再導出し auto_classified=false。
+app.patch('/api/quote-compare/vendors/:id/classification', requireAuth, requireQuoteCompareAccess, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { data: vendor, error } = await supabase
+      .from('quote_vendors').select('*').eq('id', id).maybeSingle();
+    if (error) throw error;
+    if (!vendor) return res.status(404).json({ error: '業者が見つかりません' });
+
+    const formType = req.body?.form_type != null ? String(req.body.form_type) : vendor.form_type;
+    const medium = req.body?.medium != null ? String(req.body.medium) : vendor.medium;
+    if (!QC_FORM_TYPES.includes(formType)) return res.status(400).json({ error: 'form_type は official / vendor のいずれかです' });
+    if (!QC_MEDIA.includes(medium)) return res.status(400).json({ error: 'medium は excel / text_pdf / image_pdf のいずれかです' });
+
+    const { data, error: upErr } = await supabase
+      .from('quote_vendors')
+      .update({
+        form_type: formType,
+        medium,
+        class_no: classNoOf(formType, medium),
+        auto_classified: false,
+        classify_confidence: 'high', // 人が確認・確定したので high
+      })
+      .eq('id', id)
+      .select('*')
+      .single();
+    if (upErr) throw upErr;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (quote-compare reclassify):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 見積比較 - 業者削除
+app.delete('/api/quote-compare/vendors/:id', requireAuth, requireQuoteCompareAccess, async (req, res) => {
+  try {
+    const { error } = await supabase.from('quote_vendors').delete().eq('id', req.params.id);
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error (quote-compare vendor delete):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
 
 // バグ報告・改善の利用権限（member 以上＝報告できる）。要 requireAuth 後段。
 async function requireFeedbackAccess(req, res, next) {

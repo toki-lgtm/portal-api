@@ -15,6 +15,9 @@
 // フロントはこれを使ってインデント・折りたたみのツリーを再構成する。
 // 加えて、科目（＝工種）別の構成比率 summary と、施工計画書チェックリスト絞り込み用の
 // 正規化工種集合 presentTrades を返す（工種別構成比率の維持）。
+//
+// 各ノードには書き戻し用の物理Excel行番号 excel_row（1始まり）と
+// シート名 sheet_name が必ず付与される。
 import * as XLSX from 'xlsx';
 
 // ── 正規化工種の語彙（required_doc_templates.trade と一致させる）──
@@ -138,14 +141,22 @@ function isTitleRow(row) {
   return !!b && /(内訳|明細)$/.test(b);
 }
 
+// シートの全行を { rows, rowNums } として返す。
+// rows[i] は i 番目の行の配列（空行も含む）。
+// rowNums[i] は rows[i] に対応する物理Excel行番号（1始まり）。
+// blankrows:true にすることで配列indexと物理行番号が線形対応する。
 function sheetRows(ws) {
-  if (!ws || !ws['!ref']) return [];
-  return XLSX.utils.sheet_to_json(ws, { header: 1, raw: true, defval: null, blankrows: false });
+  if (!ws || !ws['!ref']) return { rows: [], rowNums: [] };
+  const range = XLSX.utils.decode_range(ws['!ref']);
+  const origin = range.s.r; // 先頭行の0始まりインデックス
+  const rows = XLSX.utils.sheet_to_json(ws, { header: 1, raw: true, defval: null, blankrows: true });
+  const rowNums = rows.map((_, i) => origin + i + 1); // 1始まり物理行番号
+  return { rows, rowNums };
 }
 
 // 1ブロック（ヘッダ行〜次ヘッダ/シート末）を読み、明細行配列＋小見出し帯を返す。
-// 戻り: { rows: [{name, spec, qty, unit, price, amount, remark, beppi_no, group_label}], end }
-function readBlock(rows, headerIdx, cols) {
+// 戻り: { rows: [{name, spec, qty, unit, price, amount, remark, beppi_no, group_label, excel_row}], end }
+function readBlock(rows, rowNums, headerIdx, cols) {
   const out = [];
   let group = null;
   let r = headerIdx + 1;
@@ -168,14 +179,16 @@ function readBlock(rows, headerIdx, cols) {
       name: name || '(名称なし)', spec: spec || null, qty, unit: unit || null,
       price, amount: amount != null ? Math.round(amount) : null,
       remark: remark || null, beppi_no: beppiNo(remark), group_label: group,
+      excel_row: rowNums[r],
     });
   }
   return { rows: out, end: r };
 }
 
 // シート内の全ブロックを { taneArea, kamoku, rows } で返す（細目別内訳/別紙明細用）
-function parseBlocks(ws) {
-  const rows = sheetRows(ws);
+// sheetName を受け取り、各 item に sheet_name を付与する。
+function parseBlocks(ws, sheetName) {
+  const { rows, rowNums } = sheetRows(ws);
   const blocks = [];
   let r = 0;
   while (r < rows.length) {
@@ -185,51 +198,58 @@ function parseBlocks(ws) {
     const info = rows[r - 1] || [];
     const taneText = toText(info[1]);
     const kamoku = toText(info[3]);
-    const { rows: items, end } = readBlock(rows, r, cols);
-    blocks.push({ taneArea: areaKey(taneText), taneText, kamoku, rows: items });
+    const { rows: items, end } = readBlock(rows, rowNums, r, cols);
+    // 各 item に sheet_name を付与
+    const itemsWithSheet = items.map((it) => ({ ...it, sheet_name: sheetName || null }));
+    blocks.push({ taneArea: areaKey(taneText), taneText, kamoku, rows: itemsWithSheet });
     r = end;
   }
   return blocks;
 }
 
-// 種目シート: 種目（建物単位）の一覧 [{name, area, qty, unit, amount, group_label}]
-function parseTane(ws) {
-  const rows = sheetRows(ws);
+// 種目シート: 種目（建物単位）の一覧 [{name, area, qty, unit, amount, group_label, excel_row, sheet_name}]
+function parseTane(ws, sheetName) {
+  const { rows, rowNums } = sheetRows(ws);
   let cols = null, hi = -1;
   for (let r = 0; r < rows.length; r++) { const c = isHeaderRow(rows[r] || []); if (c) { cols = c; hi = r; break; } }
   if (!cols) return [];
-  const { rows: items } = readBlock(rows, hi, cols);
+  const { rows: items } = readBlock(rows, rowNums, hi, cols);
   return items.map((it) => ({
     name: it.name, area: areaKey(it.name), qty: it.qty, unit: it.unit,
     amount: it.amount, group_label: it.group_label,
+    excel_row: it.excel_row, sheet_name: sheetName || null,
   }));
 }
 
 // 科目シート: ある種目の科目（工種）一覧。area は見出しB2から、items は科目行。
-function parseKamoku(ws) {
-  const rows = sheetRows(ws);
+// sheetName を受け取り、各 item に sheet_name を付与する。
+function parseKamoku(ws, sheetName) {
+  const { rows, rowNums } = sheetRows(ws);
   let cols = null, hi = -1;
   for (let r = 0; r < rows.length; r++) { const c = isHeaderRow(rows[r] || []); if (c) { cols = c; hi = r; break; } }
   if (!cols) return null;
   const area = areaKey(toText((rows[hi - 1] || [])[1]));
-  const { rows: items } = readBlock(rows, hi, cols);
-  return { area, items };
+  const { rows: items } = readBlock(rows, rowNums, hi, cols);
+  const itemsWithSheet = items.map((it) => ({ ...it, sheet_name: sheetName || null }));
+  return { area, items: itemsWithSheet };
 }
 
 // 別紙明細: 別紙番号 → 内訳行配列。番号付きの親行に続く行を計まで内訳とする。
-function parseBeppi(ws) {
-  const rows = sheetRows(ws);
+// sheetName を受け取り、各 item に sheet_name を付与する。
+function parseBeppi(ws, sheetName) {
+  const { rows, rowNums } = sheetRows(ws);
   const map = new Map();
   let r = 0;
   while (r < rows.length) {
     const cols = isHeaderRow(rows[r] || []);
     if (!cols) { r++; continue; }
-    const { rows: items, end } = readBlock(rows, r, cols);
+    const { rows: items, end } = readBlock(rows, rowNums, r, cols);
     // ブロック内を走査: 別紙番号を持つ行が親、その後ろ〜次の別紙番号/末尾が内訳
     let curNo = null;
     for (const it of items) {
-      if (it.beppi_no) { curNo = it.beppi_no; if (!map.has(curNo)) map.set(curNo, []); continue; }
-      if (curNo) map.get(curNo).push(it);
+      const itWithSheet = { ...it, sheet_name: sheetName || null };
+      if (itWithSheet.beppi_no) { curNo = itWithSheet.beppi_no; if (!map.has(curNo)) map.set(curNo, []); continue; }
+      if (curNo) map.get(curNo).push(itWithSheet);
     }
     r = end;
   }
@@ -249,17 +269,17 @@ export function parseBoqFromXlsx(buffer, sourceFile) {
   const detailSheets = find(/^細目別内訳/);
   const beppiSheet = find(/^別紙明細/)[0];
 
-  const tane = taneSheet ? parseTane(wb.Sheets[taneSheet]) : [];
+  const tane = taneSheet ? parseTane(wb.Sheets[taneSheet], taneSheet) : [];
   const kamokuByArea = new Map();
   for (const sn of kamokuSheets) {
-    const k = parseKamoku(wb.Sheets[sn]);
+    const k = parseKamoku(wb.Sheets[sn], sn);
     if (k && k.area) kamokuByArea.set(k.area, k.items);
   }
   // 細目ブロックを (種目area, 科目名) で索引。共通費など種目に紐付かないブロックは別枠へ。
   const detailByArea = new Map();   // area -> { kamoku -> rows[] }（同一科目の連続ブロックは連結）
   const orphanBlocks = [];          // 種目に属さない明細（共通費 積上分など）
   for (const sn of detailSheets) {
-    for (const b of parseBlocks(wb.Sheets[sn])) {
+    for (const b of parseBlocks(wb.Sheets[sn], sn)) {
       const matchesTane = b.taneArea && tane.some((t) => t.area === b.taneArea);
       if (matchesTane && b.kamoku) {
         if (!detailByArea.has(b.taneArea)) detailByArea.set(b.taneArea, new Map());
@@ -273,12 +293,12 @@ export function parseBoqFromXlsx(buffer, sourceFile) {
       }
     }
   }
-  const beppiMap = beppiSheet ? parseBeppi(wb.Sheets[beppiSheet]) : new Map();
+  const beppiMap = beppiSheet ? parseBeppi(wb.Sheets[beppiSheet], beppiSheet) : new Map();
 
   // ── ツリー構築（pre-order フラット配列）──
   const nodes = [];
   let sort = 0;
-  const push = (n) => { nodes.push({ ...n, sort_order: sort++, sheet_name: n.sheet_name || null, source_file: sourceFile || null }); };
+  const push = (n) => { nodes.push({ ...n, sort_order: sort++, sheet_name: n.sheet_name ?? null, excel_row: n.excel_row ?? null, source_file: sourceFile || null }); };
 
   let seqT = 0;
   for (const t of tane) {
@@ -287,7 +307,8 @@ export function parseBoqFromXlsx(buffer, sourceFile) {
     push({
       level: 0, kind: '種目', path: pathT, seq: seqT, group_label: t.group_label,
       item_name: t.name, spec: null, quantity: t.qty, unit: t.unit, unit_price: null,
-      amount: t.amount, beppi_no: null, trade: null, raw_category: t.name, sheet_name: taneSheet,
+      amount: t.amount, beppi_no: null, trade: null, raw_category: t.name,
+      sheet_name: t.sheet_name, excel_row: t.excel_row,
     });
 
     const kamokuItems = kamokuByArea.get(t.area) || [];
@@ -300,7 +321,8 @@ export function parseBoqFromXlsx(buffer, sourceFile) {
       push({
         level: 1, kind: '科目', path: pathK, seq: seqK, group_label: k.group_label,
         item_name: k.name, spec: null, quantity: k.qty, unit: k.unit, unit_price: null,
-        amount: k.amount, beppi_no: null, trade, raw_category: k.name, sheet_name: null,
+        amount: k.amount, beppi_no: null, trade, raw_category: k.name,
+        sheet_name: k.sheet_name, excel_row: k.excel_row,
       });
 
       const detailRows = detailMap.get(k.name) || [];
@@ -311,7 +333,8 @@ export function parseBoqFromXlsx(buffer, sourceFile) {
         push({
           level: 2, kind: '細目', path: pathD, seq: seqD, group_label: d.group_label,
           item_name: d.name, spec: d.spec, quantity: d.qty, unit: d.unit, unit_price: d.price,
-          amount: d.amount, beppi_no: d.beppi_no, trade, raw_category: k.name, sheet_name: null,
+          amount: d.amount, beppi_no: d.beppi_no, trade, raw_category: k.name,
+          sheet_name: d.sheet_name, excel_row: d.excel_row,
         });
         const sub = d.beppi_no ? beppiMap.get(d.beppi_no) : null;
         if (sub && sub.length) {
@@ -321,7 +344,8 @@ export function parseBoqFromXlsx(buffer, sourceFile) {
             push({
               level: 3, kind: '別紙', path: `${pathD}.${pad(seqB)}`, seq: seqB, group_label: b.group_label,
               item_name: b.name, spec: b.spec, quantity: b.qty, unit: b.unit, unit_price: b.price,
-              amount: b.amount, beppi_no: d.beppi_no, trade, raw_category: k.name, sheet_name: beppiSheet,
+              amount: b.amount, beppi_no: d.beppi_no, trade, raw_category: k.name,
+              sheet_name: b.sheet_name, excel_row: b.excel_row,
             });
           }
         }
@@ -338,7 +362,8 @@ export function parseBoqFromXlsx(buffer, sourceFile) {
     push({
       level: 0, kind: '共通費', path: pathT, seq: seqT, group_label: null,
       item_name: toText(ob.title), spec: null, quantity: null, unit: null, unit_price: null,
-      amount: groupTotal || null, beppi_no: null, trade: null, raw_category: toText(ob.title), sheet_name: null,
+      amount: groupTotal || null, beppi_no: null, trade: null, raw_category: toText(ob.title),
+      sheet_name: null, excel_row: null,
     });
     let seqD = 0;
     for (const d of ob.rows) {
@@ -346,7 +371,8 @@ export function parseBoqFromXlsx(buffer, sourceFile) {
       push({
         level: 2, kind: '細目', path: `${pathT}.${pad(seqD)}`, seq: seqD, group_label: d.group_label,
         item_name: d.name, spec: d.spec, quantity: d.qty, unit: d.unit, unit_price: d.price,
-        amount: d.amount, beppi_no: d.beppi_no, trade: null, raw_category: toText(ob.title), sheet_name: null,
+        amount: d.amount, beppi_no: d.beppi_no, trade: null, raw_category: toText(ob.title),
+        sheet_name: d.sheet_name, excel_row: d.excel_row,
       });
     }
   }
