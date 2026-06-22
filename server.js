@@ -4284,7 +4284,7 @@ app.post('/api/bids/extract', requireAuth, requireBidAccess, upload.array('files
 //   Drive: "drive:<fileId>"（（DRIVE_FOLDER_ID）/入札案件/<案件名>/）。未設定時のみ Supabase バケットへフォールバック。
 async function storeBidFile({ projectName, fileName, buffer, mimeType, fallbackPath }) {
   if (driveConfigured()) {
-    const folderId = await ensureFolderPath(['入札案件', sanitizeDriveSeg(projectName || '未設定')], SHARED_DRIVE_ROOT_ID);
+    const folderId = await ensureFolderPath(['03.入札案件', sanitizeDriveSeg(projectName || '未設定')], SHARED_DRIVE_ROOT_ID);
     const fileId = await driveUpload({ name: fileName, buffer, mimeType, folderId });
     return `drive:${fileId}`;
   }
@@ -5367,7 +5367,7 @@ function categoryFolderName(no, name) {
 async function storeConstructionFile({ projectName, categoryNo, categoryName, fileName, buffer, mimeType }) {
   if (driveConfigured()) {
     const folderId = await ensureFolderPath([
-      '工事管理',
+      '05.工事管理',
       sanitizeDriveSeg(projectName),
       sanitizeDriveSeg(categoryFolderName(categoryNo, categoryName)),
     ], SHARED_DRIVE_ROOT_ID);
@@ -5742,7 +5742,7 @@ app.delete('/api/construction/design-changes/:changeId', requireAuth, requireCon
 async function storeDesignChangeFile({ projectName, changeNo, fileName, buffer, mimeType }) {
   if (driveConfigured()) {
     const folderId = await ensureFolderPath([
-      '工事管理',
+      '05.工事管理',
       sanitizeDriveSeg(projectName),
       '設計変更',
       sanitizeDriveSeg(`第${changeNo}回`),
@@ -6469,7 +6469,7 @@ const QC_DISCIPLINES = ['建築', '機械', '電気・通信'];
 async function storeQuoteFile({ projectName, sub, fileName, buffer, mimeType }) {
   if (driveConfigured()) {
     const folderId = await ensureFolderPath([
-      '見積比較',
+      '04.見積比較',
       sanitizeDriveSeg(projectName || 'project'),
       sanitizeDriveSeg(sub || '見積'),
     ], SHARED_DRIVE_ROOT_ID);
@@ -7326,7 +7326,7 @@ app.post('/api/circulars/analyze', requireAuth, requireDocAdmin, upload.single('
     // 一時領域に保存して batch_ref を取得
     const year = new Date().getFullYear();
     const tmpName = `tmp_${Date.now()}_${uuidv4()}.${isImage ? mimeType.split('/')[1] : 'pdf'}`;
-    const tmpRef = await storeCircular(`tmp/${tmpName}`, buffer, mimeType, ['文書回覧', '_一時']);
+    const tmpRef = await storeCircular(`tmp/${tmpName}`, buffer, mimeType, ['07.文書回覧', '_一時']);
 
     let splits;
     if (isImage) {
@@ -7414,7 +7414,7 @@ app.post('/api/circulars', requireAuth, requireDocAdmin, async (req, res) => {
         `docs/${year}/${fileName}`,
         docBuffer,
         docMime,
-        ['文書回覧', year, sanitizeSeg(doc_type || 'その他')],
+        ['07.文書回覧', year, sanitizeSeg(doc_type || 'その他')],
       );
 
       // circular_documents 挿入
@@ -8661,7 +8661,7 @@ const CARD_BUCKET = 'card-images';
 async function storeCardFile({ category, fileName, buffer, mimeType }) {
   if (driveConfigured()) {
     const categorySeg = sanitizeDriveSeg(category || '未分類');
-    const folderId = await ensureFolderPath(['名刺', categorySeg], SHARED_DRIVE_ROOT_ID);
+    const folderId = await ensureFolderPath(['06.名刺', categorySeg], SHARED_DRIVE_ROOT_ID);
     const fileId = await driveUpload({ name: fileName, buffer, mimeType, folderId });
     return `drive:${fileId}`;
   }

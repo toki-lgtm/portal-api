@@ -223,6 +223,21 @@ export async function driveListChildren(parentId) {
   return out;
 }
 
+// ファイル/フォルダの名前を変更する（fileId は不変＝DBの drive:<id> 参照は壊れない）。
+export async function driveRename(fileId, newName) {
+  const token = await getAccessToken();
+  const res = await fetch(
+    `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?supportsAllDrives=true&fields=id,name`,
+    {
+      method: 'PATCH',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: newName }),
+    },
+  );
+  if (!res.ok) throw new Error(`Drive 改名に失敗（${res.status}）: ${await res.text()}`);
+  return res.json();
+}
+
 // ファイル/フォルダを別の親へ移動する（fileId は不変＝DBの drive:<id> 参照は壊れない）。
 export async function driveMove(fileId, addParentId, removeParentId) {
   const token = await getAccessToken();
