@@ -14,6 +14,7 @@ import { parseEstimateFromXlsx } from './bidEstimate.js';
 import { parseBoqFromXlsx, CANONICAL_TRADES } from './boqParser.js';
 import { driveUpload, driveDownload, driveThumbnail, driveTrash, driveConfigured, ensureFolderPath, driveListChildren } from './googleDrive.js';
 import { classifyQuote, classNoOf } from './classifyQuote.js';
+import { extractExcelQuote } from './quoteExcelExtract.js';
 
 dotenv.config();
 
@@ -6811,31 +6812,124 @@ async function readDriveJson(folderId, name) {
   try { return JSON.parse(buffer.toString('utf8')); } catch { return null; }
 }
 
-// ✅ 見積比較 - 抽出を実行。PDF(類型3-6)は共有ドライブの _queue に extract ジョブを投入し、
-//    ローカル常駐エージェント（このPC）が処理する。Excel(類型1,2)直読は P1 で対応予定。
+// 見積ファイルの実体（buffer）を取得。drive:<id> は Drive から、それ以外は Supabase バケットから。
+async function fetchQuoteSourceBuffer(ref) {
+  const s = String(ref || '');
+  if (s.startsWith('drive:')) {
+    const { buffer } = await driveDownload(s.slice('drive:'.length));
+    return buffer;
+  }
+  const { data, error } = await supabase.storage.from(CONSTRUCTION_BUCKET).download(s);
+  if (error || !data) return null;
+  return Buffer.from(await data.arrayBuffer());
+}
+
+// 業者の添付から最初の xlsx(zip:PK) を取得（無ければ先頭ファイル）。Excel直読の入力。
+async function fetchVendorXlsx(vendor) {
+  const refs = Array.isArray(vendor.source_drive_ids) ? vendor.source_drive_ids : [];
+  let fallback = null;
+  for (const ref of refs) {
+    try {
+      const buf = await fetchQuoteSourceBuffer(ref);
+      if (!buf) continue;
+      if (fallback == null) fallback = buf;
+      if (buf.length >= 2 && buf[0] === 0x50 && buf[1] === 0x4b) return buf; // PK = zip(xlsx)
+    } catch (e) { console.error('Warning (quote source fetch):', e.message); }
+  }
+  return fallback;
+}
+
+// エージェント result.json 形（{cells,unmatched,excluded,extracted_total}）を DB へ取り込む。
+// Drive 経由(PDF)と Excel 直読(同期)で共用。extracted を取込済の印にする（冪等に置換）。
+async function importQuoteResult(vendor, result) {
+  const qById = new Map((await supabase.from('quote_boq_rows').select('id, quantity_num').eq('project_id', vendor.project_id)).data?.map((r) => [r.id, r.quantity_num]) || []);
+  const cells = (result.cells || []).map((c) => {
+    const q = qById.get(c.boq_row_id);
+    const amount = (c.unit_price != null && q != null) ? Math.round(c.unit_price * Math.abs(q)) : null;
+    return {
+      project_id: vendor.project_id, vendor_id: vendor.id, boq_row_id: c.boq_row_id,
+      unit_price: c.unit_price ?? null, amount,
+      match_type: c.match_type || null, sim: c.sim ?? null,
+      source_label: c.source_label || null,
+      confidence: c.match_type === 'qty' ? 'high' : 'review',
+    };
+  }).filter((c) => c.boq_row_id != null);
+
+  const unmatched = (result.unmatched || []).map((u) => ({
+    project_id: vendor.project_id, vendor_id: vendor.id,
+    name: u.name || null, spec: u.spec || null, quantity: u.quantity ?? null, unit: u.unit || null,
+    unit_price: u.unit_price ?? null,
+    best_candidate: u.best_candidate != null ? { name: u.best_candidate, sim: u.sim ?? null } : null,
+    sim: u.sim ?? null,
+  }));
+
+  await supabase.from('quote_cells').delete().eq('vendor_id', vendor.id);
+  await supabase.from('quote_unmatched').delete().eq('vendor_id', vendor.id);
+  for (let i = 0; i < cells.length; i += 200) {
+    const { error } = await supabase.from('quote_cells').insert(cells.slice(i, i + 200));
+    if (error) throw error;
+  }
+  if (unmatched.length) {
+    const { error } = await supabase.from('quote_unmatched').insert(unmatched);
+    if (error) throw error;
+  }
+  await supabase.from('quote_vendors').update({
+    status: 'extracted',
+    extracted_total: result.extracted_total != null ? Math.round(result.extracted_total) : null,
+    excluded: Array.isArray(result.excluded) ? result.excluded : [],
+  }).eq('id', vendor.id);
+
+  return { cells: cells.length, unmatched: unmatched.length, extracted_total: result.extracted_total ?? null };
+}
+
+// BOQ行（照合・書き戻しの鍵 sheet/excel_row を持つ行）をジョブ/抽出用に整形して返す。
+async function loadQuoteBoqRows(projectId) {
+  const { data: boq } = await supabase.from('quote_boq_rows').select('*').eq('project_id', projectId).order('sort_order', { ascending: true });
+  return (boq || [])
+    .filter((r) => r.sheet_name && r.excel_row != null)
+    .map((r) => ({
+      boq_row_id: r.id, sheet: r.sheet_name, row: r.excel_row,
+      name: r.item_name, spec: r.spec, quantity_num: r.quantity_num, unit: r.unit, beppi_no: r.beppi_no,
+    }));
+}
+
+// ✅ 見積比較 - 抽出を実行。
+//   Excel(類型1,2)はクラウド Node で直読・即時取込（ローカル不要）。
+//   PDF(類型3-6)は共有ドライブの _queue に extract ジョブを投入し、このPC常駐エージェントが処理する。
 app.post('/api/quote-compare/vendors/:id/extract', requireAuth, requireQuoteCompareAccess, async (req, res) => {
   try {
     const { id } = req.params;
     const { data: vendor, error } = await supabase.from('quote_vendors').select('*').eq('id', id).maybeSingle();
     if (error) throw error;
     if (!vendor) return res.status(404).json({ error: '業者が見つかりません' });
+
+    const boqRows = await loadQuoteBoqRows(vendor.project_id);
+    if (!boqRows.length) return res.status(400).json({ error: '先に原本数量書を取込んでください（BOQ行がありません）' });
+
+    // ── Excel 直読（類型1=公式 / 類型2=各社）: クラウド完結・同期 ──
+    if (vendor.medium === 'excel') {
+      const buf = await fetchVendorXlsx(vendor);
+      if (!buf) return res.status(502).json({ error: '見積Excelの取得に失敗しました（添付をご確認ください）' });
+      let result;
+      try {
+        result = extractExcelQuote({ buffer: buf, boqRows, formType: vendor.form_type });
+      } catch (e) {
+        console.error('Error (quote excel extract):', e.message);
+        return res.status(422).json({ error: `Excelの読取に失敗しました: ${e.message}` });
+      }
+      const imp = await importQuoteResult(vendor, result);
+      return res.json({ ok: true, mode: 'excel', imported: true, cells: imp.cells, unmatched: imp.unmatched, extracted_total: imp.extracted_total });
+    }
+
+    // ── PDF: ローカルエージェントへキュー投入 ──
     if (!['text_pdf', 'image_pdf'].includes(vendor.medium)) {
-      return res.status(400).json({ error: 'PDF(類型3-6)のみ抽出に対応しています。Excel直読(類型1,2)は P1 で対応予定です' });
+      return res.status(400).json({ error: '抽出に対応しない媒体です（Excel または PDF を指定してください）' });
     }
     if (!driveConfigured()) return res.status(503).json({ error: '共有ドライブ未設定のためキュー投入できません' });
     const srcIds = (Array.isArray(vendor.source_drive_ids) ? vendor.source_drive_ids : []).map(driveIdOf).filter(Boolean);
     if (!srcIds.length) return res.status(400).json({ error: 'この業者に見積ファイルが添付されていません' });
 
-    // BOQ行（書き戻しの鍵 sheet/excel_row を持つ行のみ）をジョブに同梱
-    const { data: boq } = await supabase.from('quote_boq_rows').select('*').eq('project_id', vendor.project_id).order('sort_order', { ascending: true });
-    const boqRows = (boq || [])
-      .filter((r) => r.sheet_name && r.excel_row != null)
-      .map((r) => ({
-        boq_row_id: r.id, sheet: r.sheet_name, row: r.excel_row,
-        name: r.item_name, spec: r.spec, quantity_num: r.quantity_num, unit: r.unit, beppi_no: r.beppi_no,
-      }));
-    if (!boqRows.length) return res.status(400).json({ error: '先に原本数量書を取込んでください（BOQ行がありません）' });
-
+    // boqRows（書き戻しの鍵 sheet/excel_row を持つ行のみ）は上で取得済み。ジョブに同梱する。
     const ts = new Date().toISOString().replace(/[:.]/g, '').replace('T', '_').slice(0, 15);
     const jobFolderId = await ensureFolderPath(
       [...QC_QUEUE_SEGMENTS, String(vendor.project_id), 'extract', `${vendor.id}__${ts}`],
@@ -6909,46 +7003,8 @@ app.get('/api/quote-compare/vendors/:id/extract-status', requireAuth, requireQuo
     if (vendor.status !== 'extracted') {
       const result = await readDriveJson(job.id, 'result.json');
       if (!result) return res.json({ status: 'done', message: 'result.json 未到着（同期待ち）' });
-
-      const qById = new Map((await supabase.from('quote_boq_rows').select('id, quantity_num').eq('project_id', vendor.project_id)).data?.map((r) => [r.id, r.quantity_num]) || []);
-      const cells = (result.cells || []).map((c) => {
-        const q = qById.get(c.boq_row_id);
-        const amount = (c.unit_price != null && q != null) ? Math.round(c.unit_price * Math.abs(q)) : null;
-        return {
-          project_id: vendor.project_id, vendor_id: vendor.id, boq_row_id: c.boq_row_id,
-          unit_price: c.unit_price ?? null, amount,
-          match_type: c.match_type || null, sim: c.sim ?? null,
-          source_label: c.source_label || null,
-          confidence: c.match_type === 'qty' ? 'high' : 'review',
-        };
-      }).filter((c) => c.boq_row_id != null);
-
-      const unmatched = (result.unmatched || []).map((u) => ({
-        project_id: vendor.project_id, vendor_id: vendor.id,
-        name: u.name || null, spec: u.spec || null, quantity: u.quantity ?? null, unit: u.unit || null,
-        unit_price: u.unit_price ?? null,
-        best_candidate: u.best_candidate != null ? { name: u.best_candidate, sim: u.sim ?? null } : null,
-        sim: u.sim ?? null,
-      }));
-
-      // 既存を置換してから挿入（再取込の冪等性）
-      await supabase.from('quote_cells').delete().eq('vendor_id', vendor.id);
-      await supabase.from('quote_unmatched').delete().eq('vendor_id', vendor.id);
-      for (let i = 0; i < cells.length; i += 200) {
-        const { error: e } = await supabase.from('quote_cells').insert(cells.slice(i, i + 200));
-        if (e) throw e;
-      }
-      if (unmatched.length) {
-        const { error: e } = await supabase.from('quote_unmatched').insert(unmatched);
-        if (e) throw e;
-      }
-      await supabase.from('quote_vendors').update({
-        status: 'extracted',
-        extracted_total: result.extracted_total != null ? Math.round(result.extracted_total) : null,
-        excluded: Array.isArray(result.excluded) ? result.excluded : [],
-      }).eq('id', vendor.id);
-
-      return res.json({ status: 'done', imported: true, cells: cells.length, unmatched: unmatched.length, extracted_total: result.extracted_total ?? null });
+      const imp = await importQuoteResult(vendor, result);
+      return res.json({ status: 'done', imported: true, cells: imp.cells, unmatched: imp.unmatched, extracted_total: imp.extracted_total });
     }
 
     // 既に取込済

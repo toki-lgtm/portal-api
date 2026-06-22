@@ -71,7 +71,7 @@ export function toNumber(v) {
 }
 
 // セル値を1行テキストに（セル内改行 _x000D_ / \r / \n を空白へ畳む）
-function toText(v) {
+export function toText(v) {
   if (v == null) return '';
   return String(v).replace(/_x000D_/g, ' ').replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ').trim();
 }
@@ -115,7 +115,7 @@ const HEADER_KEYS = {
   remark: ['備考', '備 考', '備　考'],
 };
 
-function detectCols(row) {
+export function detectCols(row) {
   const cols = {};
   for (let c = 0; c < row.length; c++) {
     const t = toText(row[c]).replace(/\s/g, '');
@@ -145,7 +145,7 @@ function isTitleRow(row) {
 // rows[i] は i 番目の行の配列（空行も含む）。
 // rowNums[i] は rows[i] に対応する物理Excel行番号（1始まり）。
 // blankrows:true にすることで配列indexと物理行番号が線形対応する。
-function sheetRows(ws) {
+export function sheetRows(ws) {
   if (!ws || !ws['!ref']) return { rows: [], rowNums: [] };
   const range = XLSX.utils.decode_range(ws['!ref']);
   const origin = range.s.r; // 先頭行の0始まりインデックス
