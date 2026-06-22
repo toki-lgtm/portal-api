@@ -12,7 +12,7 @@ import JSZip from 'jszip';
 import sharp from 'sharp';
 import { parseEstimateFromXlsx } from './bidEstimate.js';
 import { parseBoqFromXlsx, CANONICAL_TRADES } from './boqParser.js';
-import { driveUpload, driveDownload, driveThumbnail, driveTrash, driveConfigured, ensureFolderPath } from './googleDrive.js';
+import { driveUpload, driveDownload, driveThumbnail, driveTrash, driveConfigured, ensureFolderPath, driveListChildren } from './googleDrive.js';
 import { classifyQuote, classNoOf } from './classifyQuote.js';
 
 dotenv.config();
@@ -6573,11 +6573,19 @@ app.get('/api/quote-compare/projects/:id', requireAuth, requireQuoteCompareAcces
       .from('quote_compare_projects').select('*').eq('id', id).maybeSingle();
     if (error) throw error;
     if (!project) return res.status(404).json({ error: 'プロジェクトが見つかりません' });
-    const [{ count: boqCount }, { data: vendors }] = await Promise.all([
+    const [{ count: boqCount }, { data: vendors }, { data: cellRows }, { data: unmatchedRows }] = await Promise.all([
       supabase.from('quote_boq_rows').select('id', { count: 'exact', head: true }).eq('project_id', id),
       supabase.from('quote_vendors').select('*').eq('project_id', id).order('created_at', { ascending: true }),
+      supabase.from('quote_cells').select('vendor_id').eq('project_id', id),
+      supabase.from('quote_unmatched').select('vendor_id').eq('project_id', id),
     ]);
-    res.json({ ...project, boq_row_count: boqCount || 0, vendors: vendors || [] });
+    const cellCount = {}; for (const c of cellRows || []) cellCount[c.vendor_id] = (cellCount[c.vendor_id] || 0) + 1;
+    const unmCount = {}; for (const u of unmatchedRows || []) unmCount[u.vendor_id] = (unmCount[u.vendor_id] || 0) + 1;
+    res.json({
+      ...project,
+      boq_row_count: boqCount || 0,
+      vendors: (vendors || []).map((v) => ({ ...v, cell_count: cellCount[v.id] || 0, unmatched_count: unmCount[v.id] || 0 })),
+    });
   } catch (error) {
     console.error('Error (quote-compare detail):', error.message);
     res.status(500).json({ error: error.message });
@@ -6780,6 +6788,177 @@ app.delete('/api/quote-compare/vendors/:id', requireAuth, requireQuoteCompareAcc
     res.json({ ok: true });
   } catch (error) {
     console.error('Error (quote-compare vendor delete):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ── 見積比較 抽出（P2: PDFはローカルエージェントへキュー投入）──────────────
+// 見積比較キューのルート（共有ドライブ root\04.見積比較\_queue\）。
+const QC_QUEUE_SEGMENTS = ['04.見積比較', '_queue'];
+
+// drive:<id> 参照から fileId を取り出す（接頭辞なしはそのまま）。
+function driveIdOf(ref) {
+  const s = String(ref || '');
+  return s.startsWith('drive:') ? s.slice('drive:'.length) : s;
+}
+
+// Drive フォルダ内の name のファイルを探して JSON として読む（無ければ null）。
+async function readDriveJson(folderId, name) {
+  const kids = await driveListChildren(folderId);
+  const f = kids.find((k) => k.name === name);
+  if (!f) return null;
+  const { buffer } = await driveDownload(f.id);
+  try { return JSON.parse(buffer.toString('utf8')); } catch { return null; }
+}
+
+// ✅ 見積比較 - 抽出を実行。PDF(類型3-6)は共有ドライブの _queue に extract ジョブを投入し、
+//    ローカル常駐エージェント（このPC）が処理する。Excel(類型1,2)直読は P1 で対応予定。
+app.post('/api/quote-compare/vendors/:id/extract', requireAuth, requireQuoteCompareAccess, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { data: vendor, error } = await supabase.from('quote_vendors').select('*').eq('id', id).maybeSingle();
+    if (error) throw error;
+    if (!vendor) return res.status(404).json({ error: '業者が見つかりません' });
+    if (!['text_pdf', 'image_pdf'].includes(vendor.medium)) {
+      return res.status(400).json({ error: 'PDF(類型3-6)のみ抽出に対応しています。Excel直読(類型1,2)は P1 で対応予定です' });
+    }
+    if (!driveConfigured()) return res.status(503).json({ error: '共有ドライブ未設定のためキュー投入できません' });
+    const srcIds = (Array.isArray(vendor.source_drive_ids) ? vendor.source_drive_ids : []).map(driveIdOf).filter(Boolean);
+    if (!srcIds.length) return res.status(400).json({ error: 'この業者に見積ファイルが添付されていません' });
+
+    // BOQ行（書き戻しの鍵 sheet/excel_row を持つ行のみ）をジョブに同梱
+    const { data: boq } = await supabase.from('quote_boq_rows').select('*').eq('project_id', vendor.project_id).order('sort_order', { ascending: true });
+    const boqRows = (boq || [])
+      .filter((r) => r.sheet_name && r.excel_row != null)
+      .map((r) => ({
+        boq_row_id: r.id, sheet: r.sheet_name, row: r.excel_row,
+        name: r.item_name, spec: r.spec, quantity_num: r.quantity_num, unit: r.unit, beppi_no: r.beppi_no,
+      }));
+    if (!boqRows.length) return res.status(400).json({ error: '先に原本数量書を取込んでください（BOQ行がありません）' });
+
+    const ts = new Date().toISOString().replace(/[:.]/g, '').replace('T', '_').slice(0, 15);
+    const jobFolderId = await ensureFolderPath(
+      [...QC_QUEUE_SEGMENTS, String(vendor.project_id), 'extract', `${vendor.id}__${ts}`],
+      SHARED_DRIVE_ROOT_ID,
+    );
+
+    const job = {
+      job_type: 'extract',
+      project_id: vendor.project_id,
+      vendor: { id: vendor.id, name: vendor.name, form_type: vendor.form_type, medium: vendor.medium, class_no: vendor.class_no },
+      boq_rows: boqRows,
+      options: {
+        official_minimal: vendor.form_type === 'official',
+        name_fallback: vendor.form_type === 'vendor',
+        dpi: 200, jpg_quality: 65,
+      },
+    };
+    await driveUpload({ name: 'extract_job.json', buffer: Buffer.from(JSON.stringify(job, null, 2), 'utf8'), mimeType: 'application/json', folderId: jobFolderId });
+
+    // 見積PDFをジョブフォルダへ同梱（エージェントはキューフォルダだけ見れば完結）
+    let n = 0;
+    for (const fid of srcIds) {
+      try {
+        const { buffer } = await driveDownload(fid);
+        n += 1;
+        await driveUpload({ name: `source_${n}.pdf`, buffer, mimeType: 'application/pdf', folderId: jobFolderId });
+      } catch (e) { console.error('Warning (quote extract source copy):', e.message); }
+    }
+    if (!n) return res.status(502).json({ error: '見積ファイルの取得に失敗しました' });
+
+    await driveUpload({
+      name: 'status.json',
+      buffer: Buffer.from(JSON.stringify({ status: 'queued', message: '', updated_at: new Date().toISOString() }), 'utf8'),
+      mimeType: 'application/json', folderId: jobFolderId,
+    });
+
+    await supabase.from('quote_vendors').update({ status: 'extracting' }).eq('id', vendor.id);
+    res.json({ ok: true, job: `${vendor.id}__${ts}`, queued_files: n });
+  } catch (error) {
+    console.error('Error (quote-compare extract enqueue):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 見積比較 - 抽出ジョブの状態取得。done なら result.json を取り込み cells/unmatched を保存（画面ポーリング用）。
+app.get('/api/quote-compare/vendors/:id/extract-status', requireAuth, requireQuoteCompareAccess, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { data: vendor, error } = await supabase.from('quote_vendors').select('*').eq('id', id).maybeSingle();
+    if (error) throw error;
+    if (!vendor) return res.status(404).json({ error: '業者が見つかりません' });
+    if (!driveConfigured()) return res.json({ status: 'none' });
+
+    const extractFolderId = await ensureFolderPath(
+      [...QC_QUEUE_SEGMENTS, String(vendor.project_id), 'extract'],
+      SHARED_DRIVE_ROOT_ID,
+    );
+    const jobs = (await driveListChildren(extractFolderId))
+      .filter((k) => k.mimeType === 'application/vnd.google-apps.folder' && k.name.startsWith(`${vendor.id}__`))
+      .sort((a, b) => (a.name < b.name ? 1 : -1)); // 最新(ts降順)
+    if (!jobs.length) return res.json({ status: 'none' });
+    const job = jobs[0];
+
+    const status = await readDriveJson(job.id, 'status.json');
+    const st = status?.status || 'queued';
+    if (st !== 'done') {
+      return res.json({ status: st, message: status?.message || '', already_imported: vendor.status === 'extracted' });
+    }
+
+    // done: まだ未取込なら result.json を取り込む（extracted を取込済の印にする）
+    if (vendor.status !== 'extracted') {
+      const result = await readDriveJson(job.id, 'result.json');
+      if (!result) return res.json({ status: 'done', message: 'result.json 未到着（同期待ち）' });
+
+      const qById = new Map((await supabase.from('quote_boq_rows').select('id, quantity_num').eq('project_id', vendor.project_id)).data?.map((r) => [r.id, r.quantity_num]) || []);
+      const cells = (result.cells || []).map((c) => {
+        const q = qById.get(c.boq_row_id);
+        const amount = (c.unit_price != null && q != null) ? Math.round(c.unit_price * Math.abs(q)) : null;
+        return {
+          project_id: vendor.project_id, vendor_id: vendor.id, boq_row_id: c.boq_row_id,
+          unit_price: c.unit_price ?? null, amount,
+          match_type: c.match_type || null, sim: c.sim ?? null,
+          source_label: c.source_label || null,
+          confidence: c.match_type === 'qty' ? 'high' : 'review',
+        };
+      }).filter((c) => c.boq_row_id != null);
+
+      const unmatched = (result.unmatched || []).map((u) => ({
+        project_id: vendor.project_id, vendor_id: vendor.id,
+        name: u.name || null, spec: u.spec || null, quantity: u.quantity ?? null, unit: u.unit || null,
+        unit_price: u.unit_price ?? null,
+        best_candidate: u.best_candidate != null ? { name: u.best_candidate, sim: u.sim ?? null } : null,
+        sim: u.sim ?? null,
+      }));
+
+      // 既存を置換してから挿入（再取込の冪等性）
+      await supabase.from('quote_cells').delete().eq('vendor_id', vendor.id);
+      await supabase.from('quote_unmatched').delete().eq('vendor_id', vendor.id);
+      for (let i = 0; i < cells.length; i += 200) {
+        const { error: e } = await supabase.from('quote_cells').insert(cells.slice(i, i + 200));
+        if (e) throw e;
+      }
+      if (unmatched.length) {
+        const { error: e } = await supabase.from('quote_unmatched').insert(unmatched);
+        if (e) throw e;
+      }
+      await supabase.from('quote_vendors').update({
+        status: 'extracted',
+        extracted_total: result.extracted_total != null ? Math.round(result.extracted_total) : null,
+        excluded: Array.isArray(result.excluded) ? result.excluded : [],
+      }).eq('id', vendor.id);
+
+      return res.json({ status: 'done', imported: true, cells: cells.length, unmatched: unmatched.length, extracted_total: result.extracted_total ?? null });
+    }
+
+    // 既に取込済
+    const [{ count: cc }, { count: uc }] = await Promise.all([
+      supabase.from('quote_cells').select('id', { count: 'exact', head: true }).eq('vendor_id', vendor.id),
+      supabase.from('quote_unmatched').select('id', { count: 'exact', head: true }).eq('vendor_id', vendor.id),
+    ]);
+    res.json({ status: 'done', imported: true, cells: cc || 0, unmatched: uc || 0, extracted_total: vendor.extracted_total });
+  } catch (error) {
+    console.error('Error (quote-compare extract-status):', error.message);
     res.status(500).json({ error: error.message });
   }
 });
