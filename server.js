@@ -6893,6 +6893,62 @@ async function loadQuoteBoqRows(projectId) {
     }));
 }
 
+// Excel 見積を直読抽出し DB へ取込（同期）。importQuoteResult の戻り値を返す。失敗時は status 付きで throw。
+async function runQuoteExcelExtract(vendor, boqRows) {
+  const buf = await fetchVendorXlsx(vendor);
+  if (!buf) { const e = new Error('見積Excelの取得に失敗しました（添付をご確認ください）'); e.status = 502; throw e; }
+  let result;
+  try {
+    result = extractExcelQuote({ buffer: buf, boqRows, formType: vendor.form_type });
+  } catch (err) {
+    const e = new Error(`Excelの読取に失敗しました: ${err.message}`); e.status = 422; throw e;
+  }
+  return importQuoteResult(vendor, result);
+}
+
+// PDF 見積の抽出ジョブを共有ドライブ _queue に投入（このPC常駐エージェントが処理）。{job, queued_files} を返す。
+async function enqueueQuotePdfExtract(vendor, boqRows) {
+  if (!driveConfigured()) { const e = new Error('共有ドライブ未設定のためキュー投入できません'); e.status = 503; throw e; }
+  const srcIds = (Array.isArray(vendor.source_drive_ids) ? vendor.source_drive_ids : []).map(driveIdOf).filter(Boolean);
+  if (!srcIds.length) { const e = new Error('この業者に見積ファイルが添付されていません'); e.status = 400; throw e; }
+
+  const ts = new Date().toISOString().replace(/[:.]/g, '').replace('T', '_').slice(0, 15);
+  const jobFolderId = await ensureFolderPath(
+    [...QC_QUEUE_SEGMENTS, String(vendor.project_id), 'extract', `${vendor.id}__${ts}`],
+    SHARED_DRIVE_ROOT_ID,
+  );
+  const job = {
+    job_type: 'extract',
+    project_id: vendor.project_id,
+    vendor: { id: vendor.id, name: vendor.name, form_type: vendor.form_type, medium: vendor.medium, class_no: vendor.class_no },
+    boq_rows: boqRows,
+    options: {
+      official_minimal: vendor.form_type === 'official',
+      name_fallback: vendor.form_type === 'vendor',
+      dpi: 200, jpg_quality: 65,
+    },
+  };
+  await driveUpload({ name: 'extract_job.json', buffer: Buffer.from(JSON.stringify(job, null, 2), 'utf8'), mimeType: 'application/json', folderId: jobFolderId });
+
+  let n = 0;
+  for (const fid of srcIds) {
+    try {
+      const { buffer } = await driveDownload(fid);
+      n += 1;
+      await driveUpload({ name: `source_${n}.pdf`, buffer, mimeType: 'application/pdf', folderId: jobFolderId });
+    } catch (e) { console.error('Warning (quote extract source copy):', e.message); }
+  }
+  if (!n) { const e = new Error('見積ファイルの取得に失敗しました'); e.status = 502; throw e; }
+
+  await driveUpload({
+    name: 'status.json',
+    buffer: Buffer.from(JSON.stringify({ status: 'queued', message: '', updated_at: new Date().toISOString() }), 'utf8'),
+    mimeType: 'application/json', folderId: jobFolderId,
+  });
+  await supabase.from('quote_vendors').update({ status: 'extracting' }).eq('id', vendor.id);
+  return { job: `${vendor.id}__${ts}`, queued_files: n };
+}
+
 // ✅ 見積比較 - 抽出を実行。
 //   Excel(類型1,2)はクラウド Node で直読・即時取込（ローカル不要）。
 //   PDF(類型3-6)は共有ドライブの _queue に extract ジョブを投入し、このPC常駐エージェントが処理する。
@@ -6906,70 +6962,158 @@ app.post('/api/quote-compare/vendors/:id/extract', requireAuth, requireQuoteComp
     const boqRows = await loadQuoteBoqRows(vendor.project_id);
     if (!boqRows.length) return res.status(400).json({ error: '先に原本数量書を取込んでください（BOQ行がありません）' });
 
-    // ── Excel 直読（類型1=公式 / 類型2=各社）: クラウド完結・同期 ──
     if (vendor.medium === 'excel') {
-      const buf = await fetchVendorXlsx(vendor);
-      if (!buf) return res.status(502).json({ error: '見積Excelの取得に失敗しました（添付をご確認ください）' });
-      let result;
-      try {
-        result = extractExcelQuote({ buffer: buf, boqRows, formType: vendor.form_type });
-      } catch (e) {
-        console.error('Error (quote excel extract):', e.message);
-        return res.status(422).json({ error: `Excelの読取に失敗しました: ${e.message}` });
-      }
-      const imp = await importQuoteResult(vendor, result);
+      const imp = await runQuoteExcelExtract(vendor, boqRows);
       return res.json({ ok: true, mode: 'excel', imported: true, cells: imp.cells, unmatched: imp.unmatched, extracted_total: imp.extracted_total });
     }
-
-    // ── PDF: ローカルエージェントへキュー投入 ──
     if (!['text_pdf', 'image_pdf'].includes(vendor.medium)) {
       return res.status(400).json({ error: '抽出に対応しない媒体です（Excel または PDF を指定してください）' });
     }
-    if (!driveConfigured()) return res.status(503).json({ error: '共有ドライブ未設定のためキュー投入できません' });
-    const srcIds = (Array.isArray(vendor.source_drive_ids) ? vendor.source_drive_ids : []).map(driveIdOf).filter(Boolean);
-    if (!srcIds.length) return res.status(400).json({ error: 'この業者に見積ファイルが添付されていません' });
-
-    // boqRows（書き戻しの鍵 sheet/excel_row を持つ行のみ）は上で取得済み。ジョブに同梱する。
-    const ts = new Date().toISOString().replace(/[:.]/g, '').replace('T', '_').slice(0, 15);
-    const jobFolderId = await ensureFolderPath(
-      [...QC_QUEUE_SEGMENTS, String(vendor.project_id), 'extract', `${vendor.id}__${ts}`],
-      SHARED_DRIVE_ROOT_ID,
-    );
-
-    const job = {
-      job_type: 'extract',
-      project_id: vendor.project_id,
-      vendor: { id: vendor.id, name: vendor.name, form_type: vendor.form_type, medium: vendor.medium, class_no: vendor.class_no },
-      boq_rows: boqRows,
-      options: {
-        official_minimal: vendor.form_type === 'official',
-        name_fallback: vendor.form_type === 'vendor',
-        dpi: 200, jpg_quality: 65,
-      },
-    };
-    await driveUpload({ name: 'extract_job.json', buffer: Buffer.from(JSON.stringify(job, null, 2), 'utf8'), mimeType: 'application/json', folderId: jobFolderId });
-
-    // 見積PDFをジョブフォルダへ同梱（エージェントはキューフォルダだけ見れば完結）
-    let n = 0;
-    for (const fid of srcIds) {
-      try {
-        const { buffer } = await driveDownload(fid);
-        n += 1;
-        await driveUpload({ name: `source_${n}.pdf`, buffer, mimeType: 'application/pdf', folderId: jobFolderId });
-      } catch (e) { console.error('Warning (quote extract source copy):', e.message); }
-    }
-    if (!n) return res.status(502).json({ error: '見積ファイルの取得に失敗しました' });
-
-    await driveUpload({
-      name: 'status.json',
-      buffer: Buffer.from(JSON.stringify({ status: 'queued', message: '', updated_at: new Date().toISOString() }), 'utf8'),
-      mimeType: 'application/json', folderId: jobFolderId,
-    });
-
-    await supabase.from('quote_vendors').update({ status: 'extracting' }).eq('id', vendor.id);
-    res.json({ ok: true, job: `${vendor.id}__${ts}`, queued_files: n });
+    const q = await enqueueQuotePdfExtract(vendor, boqRows);
+    res.json({ ok: true, ...q });
   } catch (error) {
-    console.error('Error (quote-compare extract enqueue):', error.message);
+    if (error.status) return res.status(error.status).json({ error: error.message });
+    console.error('Error (quote-compare extract):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ── 見積比較 フォルダ一括取込（残②続き）─────────────────────────────────
+// 共有ドライブ「04.見積比較/<工事名>/_取込/」に各社見積をまとめて入れ、ボタン一発で
+// 「業者作成＋6類型分類＋抽出（Excelは即時 / PDFはエージェント）」を全ファイル実行する。
+// 1ファイル=1業者（業者名はファイル名から推定。取込前に確認・修正できる）。
+
+// ファイル名から業者名を推定（見積/数量書/日付/括弧注記などの定型語を除去）。
+function guessVendorName(filename) {
+  let s = String(filename || '').normalize('NFKC').replace(/\.[^.]+$/, '');
+  s = s.replace(/(御見積書?|お見積書?|見積書?|見積り?|内訳書?|数量書?|単価表|明細書?|工事費内訳|入札時積算|積算)/g, '');
+  s = s.replace(/[(（[【].*?[)）\]】]/g, '');                       // 括弧内（日付・注記）
+  s = s.replace(/\d{4}[._\-/年]?\d{1,2}[._\-/月]?\d{1,2}日?/g, ''); // 日付
+  s = s.replace(/[_\-\s]+/g, ' ').trim();
+  return s || String(filename || '').replace(/\.[^.]+$/, '');
+}
+
+// プロジェクトの取込フォルダ（_取込）の Drive フォルダ ID とパスセグメントを返す。
+async function quoteIngestFolder(projectName) {
+  const segs = ['04.見積比較', sanitizeDriveSeg(projectName || 'project'), '_取込'];
+  const folderId = await ensureFolderPath(segs, SHARED_DRIVE_ROOT_ID);
+  return { folderId, path: segs.join('/') };
+}
+
+// 既に業者として取込済みの元ファイル drive_id 集合（重複取込の防止）。
+async function ingestedDriveIds(projectId) {
+  const { data: vendors } = await supabase.from('quote_vendors').select('source_drive_ids').eq('project_id', projectId);
+  const taken = new Set();
+  for (const v of vendors || []) for (const r of (v.source_drive_ids || [])) taken.add(driveIdOf(r));
+  return taken;
+}
+
+// ✅ 見積比較 - 取込フォルダをスキャンして候補ファイル一覧を返す（取込前のプレビュー）。
+app.get('/api/quote-compare/projects/:id/ingest-folder', requireAuth, requireQuoteCompareAccess, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { data: project } = await supabase.from('quote_compare_projects').select('id, name').eq('id', id).maybeSingle();
+    if (!project) return res.status(404).json({ error: 'プロジェクトが見つかりません' });
+    if (!driveConfigured()) return res.status(503).json({ error: '共有ドライブ未設定のためフォルダ取込は使用できません' });
+
+    const { folderId, path } = await quoteIngestFolder(project.name);
+    const taken = await ingestedDriveIds(id);
+    const kids = (await driveListChildren(folderId))
+      .filter((k) => k.mimeType !== 'application/vnd.google-apps.folder');
+    const files = kids.map((k) => {
+      const ext = (k.name.split('.').pop() || '').toLowerCase();
+      return {
+        drive_id: k.id, name: k.name, ext,
+        supported: ['xlsx', 'xlsm', 'pdf'].includes(ext),
+        already: taken.has(k.id),
+        guessed_name: guessVendorName(k.name),
+      };
+    }).sort((a, b) => (a.name < b.name ? -1 : 1));
+
+    // 原本数量書が未取込ならフロントで誘導する（取込は BOQ 必須）
+    const { count: boqCount } = await supabase.from('quote_boq_rows').select('id', { count: 'exact', head: true }).eq('project_id', id);
+    res.json({
+      folder_path: path, folder_id: folderId,
+      folder_url: `https://drive.google.com/drive/folders/${folderId}`,
+      boq_ready: (boqCount || 0) > 0,
+      files,
+    });
+  } catch (error) {
+    console.error('Error (quote ingest-folder):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 見積比較 - 選択ファイルを一括取込（業者作成＋分類＋抽出）。
+//   body: { items: [{ drive_id, name(業者名), filename }] }。1ファイル=1業者。
+app.post('/api/quote-compare/projects/:id/ingest', requireAuth, requireQuoteCompareAccess, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { data: project } = await supabase.from('quote_compare_projects').select('id, name').eq('id', id).maybeSingle();
+    if (!project) return res.status(404).json({ error: 'プロジェクトが見つかりません' });
+    const items = Array.isArray(req.body?.items) ? req.body.items : [];
+    if (!items.length) return res.status(400).json({ error: '取込対象（items）がありません' });
+
+    const boqRows = await loadQuoteBoqRows(id);
+    if (!boqRows.length) return res.status(400).json({ error: '先に原本数量書を取込んでください（BOQ行がありません）' });
+    const taken = await ingestedDriveIds(id);
+
+    const results = [];
+    for (const it of items) {
+      const driveId = String(it.drive_id || '').trim();
+      const filename = String(it.filename || it.name || 'file');
+      const vname = String(it.name || '').trim() || guessVendorName(filename);
+      if (!driveId) { results.push({ name: vname, ok: false, error: 'drive_id がありません' }); continue; }
+      if (taken.has(driveId)) { results.push({ name: vname, ok: false, error: '既に取込済みのファイルです' }); continue; }
+      try {
+        const { buffer } = await driveDownload(driveId);
+        const cls = await classifyQuote({ buffer, filename });
+        // 元ファイル（_取込内）を直接参照（コピーせず重複を避ける）
+        const { data: vendor, error: insErr } = await supabase
+          .from('quote_vendors')
+          .insert({
+            project_id: id, name: vname,
+            form_type: cls.form_type, medium: cls.medium, class_no: cls.class_no,
+            auto_classified: true, classify_confidence: cls.confidence,
+            source_drive_ids: [`drive:${driveId}`], status: 'classified', created_by: req.user.email,
+          })
+          .select('*').single();
+        if (insErr) throw insErr;
+        taken.add(driveId);
+
+        // 自動抽出（Excelは同期・即時取込 / PDFはエージェントへキュー投入）
+        const base = { name: vname, ok: true, vendor_id: vendor.id, class_no: cls.class_no, confidence: cls.confidence, medium: cls.medium };
+        if (cls.medium === 'excel') {
+          try {
+            const result = extractExcelQuote({ buffer, boqRows, formType: cls.form_type });
+            const imp = await importQuoteResult(vendor, result);
+            results.push({ ...base, extract: 'excel', cells: imp.cells, unmatched: imp.unmatched });
+          } catch (e) {
+            console.error('Warning (ingest excel extract):', e.message);
+            results.push({ ...base, extract: 'error', error: `抽出失敗: ${e.message}` });
+          }
+        } else {
+          try {
+            const q = await enqueueQuotePdfExtract(vendor, boqRows);
+            results.push({ ...base, extract: 'queued', queued_files: q.queued_files });
+          } catch (e) {
+            console.error('Warning (ingest pdf enqueue):', e.message);
+            results.push({ ...base, extract: 'queue_error', error: e.message });
+          }
+        }
+      } catch (e) {
+        console.error('Warning (ingest item):', e.message);
+        results.push({ name: vname, ok: false, error: e.message });
+      }
+    }
+
+    await supabase.from('quote_compare_projects').update({ updated_at: new Date().toISOString() }).eq('id', id);
+    const created = results.filter((r) => r.ok).length;
+    const excelDone = results.filter((r) => r.extract === 'excel').length;
+    const queued = results.filter((r) => r.extract === 'queued').length;
+    res.json({ ok: true, total: items.length, created, excel_done: excelDone, queued, results });
+  } catch (error) {
+    console.error('Error (quote ingest):', error.message);
     res.status(500).json({ error: error.message });
   }
 });
