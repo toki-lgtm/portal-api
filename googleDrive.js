@@ -223,6 +223,28 @@ export async function driveListChildren(parentId) {
   return out;
 }
 
+// サービスアカウントが参加している共有ドライブ一覧 [{id,name}] を返す。
+export async function driveListSharedDrives() {
+  const token = await getAccessToken();
+  const res = await fetch('https://www.googleapis.com/drive/v3/drives?pageSize=100&fields=drives(id,name)', {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) throw new Error(`共有ドライブ一覧取得に失敗（${res.status}）: ${await res.text()}`);
+  return (await res.json()).drives || [];
+}
+
+// 共有ドライブ横断でフォルダを名前検索する（[{id,name,driveId,parents}]）。
+//   親フォルダの指定が無いとき（収集用「データ保管」等）の解決に使う。
+export async function driveFindFolderByName(name) {
+  const token = await getAccessToken();
+  const q = `name='${escapeQ(name)}' and mimeType='application/vnd.google-apps.folder' and trashed=false`;
+  const url = `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(q)}`
+    + '&fields=files(id,name,driveId,parents)&corpora=allDrives&supportsAllDrives=true&includeItemsFromAllDrives=true&pageSize=20';
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+  if (!res.ok) throw new Error(`Drive 検索に失敗（${res.status}）: ${await res.text()}`);
+  return (await res.json()).files || [];
+}
+
 // ファイル/フォルダの名前を変更する（fileId は不変＝DBの drive:<id> 参照は壊れない）。
 export async function driveRename(fileId, newName) {
   const token = await getAccessToken();

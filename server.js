@@ -7032,9 +7032,14 @@ app.get('/api/quote-compare/projects/:id/ingest-folder', requireAuth, requireQuo
 
     // 原本数量書が未取込ならフロントで誘導する（取込は BOQ 必須）
     const { count: boqCount } = await supabase.from('quote_boq_rows').select('id', { count: 'exact', head: true }).eq('project_id', id);
+    // 社員のドロップ先＝データ保管（社内システムは社員アクセス不可）。このPC常駐エージェントが
+    // データ保管→社内システムの _取込 へ移送し、ここ(社内システム)で分析する。
+    const dropName = sanitizeDriveSeg(project.name || 'project');
     res.json({
       folder_path: path, folder_id: folderId,
       folder_url: `https://drive.google.com/drive/folders/${folderId}`,
+      inbox_drop_path: `データ保管/見積比較/${dropName}`,
+      inbox_drop_win: `G:\\共有ドライブ\\データ保管\\見積比較\\${dropName}`,
       boq_ready: (boqCount || 0) > 0,
       files,
     });
