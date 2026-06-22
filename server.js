@@ -6963,6 +6963,77 @@ app.get('/api/quote-compare/vendors/:id/extract-status', requireAuth, requireQuo
   }
 });
 
+// ✅ 見積比較 - 横並び比較（科目サマリー＋細目マトリクス＋行ごと最安）。P1の主役。
+//   比較は公式数量に各社単価を当てた金額(=単価×|公式数量|)で同一土俵。行ごと min(単価)が最安。
+app.get('/api/quote-compare/projects/:id/comparison', requireAuth, requireQuoteCompareAccess, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const [{ data: rows }, { data: vendors }, { data: cells }] = await Promise.all([
+      supabase.from('quote_boq_rows').select('id,path,level,kind,item_name,spec,quantity_num,unit,beppi_no,sort_order').eq('project_id', id).order('sort_order', { ascending: true }),
+      supabase.from('quote_vendors').select('id,name,form_type,medium,class_no,status,net_ratio,extracted_total').eq('project_id', id).order('created_at', { ascending: true }),
+      supabase.from('quote_cells').select('vendor_id,boq_row_id,unit_price,amount').eq('project_id', id),
+    ]);
+    const rowById = new Map((rows || []).map((r) => [r.id, r]));
+    const byRow = new Map(); // boq_row_id -> { vid: {unit_price, amount} }
+    for (const c of cells || []) {
+      if (!byRow.has(c.boq_row_id)) byRow.set(c.boq_row_id, {});
+      byRow.get(c.boq_row_id)[c.vendor_id] = { unit_price: c.unit_price, amount: c.amount };
+    }
+    const kamokuPathOf = (p) => String(p || '').split('.').slice(0, 2).join('.');
+    const amtOf = (price, q) => (price != null && q != null ? Math.round(price * Math.abs(q)) : null);
+
+    const detailByKamoku = {};         // kpath -> [{boq_row_id,item_name,spec,quantity_num,unit,kind,byVendor{vid:unit_price},min_price,min_vendor}]
+    const cheapestByKamoku = {};       // kpath -> Σ min amount
+    const vendorTotals = {};           // vid -> Σ amount（その社が見積った行の合計）
+    let cheapestTotal = 0;
+
+    for (const r of rows || []) {
+      const cellsFor = byRow.get(r.id);
+      if (!cellsFor || !Object.keys(cellsFor).length) continue; // 単価のある行だけ比較
+      const kp = kamokuPathOf(r.path);
+      const byVendor = {};
+      let minAmt = null, minVid = null, minPrice = null;
+      for (const [vid, o] of Object.entries(cellsFor)) {
+        byVendor[vid] = o.unit_price;
+        const amt = o.amount != null ? o.amount : amtOf(o.unit_price, r.quantity_num);
+        vendorTotals[vid] = (vendorTotals[vid] || 0) + (amt || 0);
+        if (amt != null && (minAmt == null || amt < minAmt)) { minAmt = amt; minVid = Number(vid); minPrice = o.unit_price; }
+      }
+      (detailByKamoku[kp] ||= []).push({
+        boq_row_id: r.id, item_name: r.item_name, spec: r.spec, quantity_num: r.quantity_num,
+        unit: r.unit, kind: r.kind, byVendor, min_price: minPrice, min_vendor: minVid,
+      });
+      if (minAmt != null) { cheapestByKamoku[kp] = (cheapestByKamoku[kp] || 0) + minAmt; cheapestTotal += minAmt; }
+    }
+
+    const summary = Object.keys(detailByKamoku).map((kp) => {
+      const head = (rows || []).find((r) => r.path === kp) || (rows || []).find((r) => r.path === kp.split('.')[0]);
+      const dets = detailByKamoku[kp];
+      const byVendor = {};
+      for (const d of dets) {
+        const q = rowById.get(d.boq_row_id)?.quantity_num;
+        for (const [vid, price] of Object.entries(d.byVendor)) {
+          byVendor[vid] = (byVendor[vid] || 0) + (amtOf(price, q) || 0);
+        }
+      }
+      // 科目ごとの最安社（小計が最小の社）
+      let minVid = null, minVal = null;
+      for (const [vid, v] of Object.entries(byVendor)) { if (minVal == null || v < minVal) { minVal = v; minVid = Number(vid); } }
+      return { path: kp, item_name: head?.item_name || kp, byVendor, min_total: cheapestByKamoku[kp] || 0, min_vendor: minVid, detail_count: dets.length };
+    }).sort((a, b) => (a.path < b.path ? -1 : 1));
+
+    res.json({
+      vendors: vendors || [],
+      summary,
+      detailByKamoku,
+      totals: { byVendor: vendorTotals, cheapest_total: cheapestTotal },
+    });
+  } catch (error) {
+    console.error('Error (quote-compare comparison):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // バグ報告・改善の利用権限（member 以上＝報告できる）。要 requireAuth 後段。
 async function requireFeedbackAccess(req, res, next) {
   try {
