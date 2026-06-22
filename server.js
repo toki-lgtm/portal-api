@@ -20,6 +20,13 @@ dotenv.config();
 // ✅ multer: 写真アップロード用（メモリストレージ）
 const upload = multer({ storage: multer.memoryStorage() });
 
+// 共有ドライブ「社内システム」のルート（＝各機能の保存先の基点）。
+//   資格者証(DRIVE_FOLDER_ID=02.資格者証)以外の機能は、このルート直下に
+//   「<機能名>\…」で格納する（root\見積比較 / root\工事管理 / root\入札案件 / root\名刺 …）。
+//   こうすることで全機能が 02.資格者証 配下に潜らず 社内システム 直下に整列する。
+//   既定値は共有ドライブのルートID（文書回覧の CIRCULAR_DRIVE_FOLDER_ID と同一）。
+const SHARED_DRIVE_ROOT_ID = process.env.SHARED_DRIVE_ROOT_ID || '0AK5TgtO_Sr4RUk9PVA';
+
 // multer/busboy は日本語ファイル名を latin1 として解釈し文字化けする。
 // 元の UTF-8 へ復元する（既に日本語が含まれる場合は変換不要としてそのまま返す）。
 function decodeUploadName(name) {
@@ -4277,7 +4284,7 @@ app.post('/api/bids/extract', requireAuth, requireBidAccess, upload.array('files
 //   Drive: "drive:<fileId>"（（DRIVE_FOLDER_ID）/入札案件/<案件名>/）。未設定時のみ Supabase バケットへフォールバック。
 async function storeBidFile({ projectName, fileName, buffer, mimeType, fallbackPath }) {
   if (driveConfigured()) {
-    const folderId = await ensureFolderPath(['入札案件', sanitizeDriveSeg(projectName || '未設定')]);
+    const folderId = await ensureFolderPath(['入札案件', sanitizeDriveSeg(projectName || '未設定')], SHARED_DRIVE_ROOT_ID);
     const fileId = await driveUpload({ name: fileName, buffer, mimeType, folderId });
     return `drive:${fileId}`;
   }
@@ -5363,7 +5370,7 @@ async function storeConstructionFile({ projectName, categoryNo, categoryName, fi
       '工事管理',
       sanitizeDriveSeg(projectName),
       sanitizeDriveSeg(categoryFolderName(categoryNo, categoryName)),
-    ]);
+    ], SHARED_DRIVE_ROOT_ID);
     const fileId = await driveUpload({ name: fileName, buffer, mimeType, folderId });
     return `drive:${fileId}`;
   }
@@ -5739,7 +5746,7 @@ async function storeDesignChangeFile({ projectName, changeNo, fileName, buffer, 
       sanitizeDriveSeg(projectName),
       '設計変更',
       sanitizeDriveSeg(`第${changeNo}回`),
-    ]);
+    ], SHARED_DRIVE_ROOT_ID);
     const fileId = await driveUpload({ name: fileName, buffer, mimeType, folderId });
     return `drive:${fileId}`;
   }
@@ -6465,7 +6472,7 @@ async function storeQuoteFile({ projectName, sub, fileName, buffer, mimeType }) 
       '見積比較',
       sanitizeDriveSeg(projectName || 'project'),
       sanitizeDriveSeg(sub || '見積'),
-    ]);
+    ], SHARED_DRIVE_ROOT_ID);
     const fileId = await driveUpload({ name: fileName, buffer, mimeType, folderId });
     return `drive:${fileId}`;
   }
@@ -8654,7 +8661,7 @@ const CARD_BUCKET = 'card-images';
 async function storeCardFile({ category, fileName, buffer, mimeType }) {
   if (driveConfigured()) {
     const categorySeg = sanitizeDriveSeg(category || '未分類');
-    const folderId = await ensureFolderPath(['名刺', categorySeg]);
+    const folderId = await ensureFolderPath(['名刺', categorySeg], SHARED_DRIVE_ROOT_ID);
     const fileId = await driveUpload({ name: fileName, buffer, mimeType, folderId });
     return `drive:${fileId}`;
   }

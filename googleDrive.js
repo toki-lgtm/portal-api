@@ -192,6 +192,17 @@ async function resolveFolder(name, parent) {
   return cdata.id;
 }
 
+// fileId のメタ情報を取得する（name/parents 等）。フォルダ階層の特定やジョブ状態ファイルの
+// 解決に使う汎用ヘルパ。fields はカンマ区切り（既定 id,name,parents）。
+export async function driveFileMeta(fileId, fields = 'id,name,parents') {
+  const token = await getAccessToken();
+  const url = `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}`
+    + `?fields=${encodeURIComponent(fields)}&supportsAllDrives=true`;
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+  if (!res.ok) throw new Error(`Drive メタ取得に失敗（${res.status}）: ${await res.text()}`);
+  return res.json();
+}
+
 // 親フォルダ直下の子（フォルダ/ファイル）を全件返す（ページング対応）。掃除・点検用。
 export async function driveListChildren(parentId) {
   const parent = parentId || process.env.DRIVE_FOLDER_ID;
