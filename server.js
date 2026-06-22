@@ -6963,6 +6963,133 @@ app.get('/api/quote-compare/vendors/:id/extract-status', requireAuth, requireQuo
   }
 });
 
+// ── 見積比較 書き戻し（P3: 各社の単価を原本書式へ。形式保持xlsxを生成）─────────────
+// Excel COM(pywin32)で「形式を一切変えず」単価を埋める処理は Render(Linux) では不可能なので、
+// P2 抽出と同じ郵便受け方式で共有ドライブ _queue にジョブを投入し、このPC常駐エージェント
+// (quote_agent.py)が writeback_job.json を処理して 【単価書戻し】社名.xlsx を生成する。
+
+// 業者の最新の書き戻しジョブフォルダを取得（status / download で共用）。
+async function latestQuoteWritebackJob(vendor) {
+  const wbFolderId = await ensureFolderPath(
+    [...QC_QUEUE_SEGMENTS, String(vendor.project_id), 'writeback'],
+    SHARED_DRIVE_ROOT_ID,
+  );
+  const jobs = (await driveListChildren(wbFolderId))
+    .filter((k) => k.mimeType === 'application/vnd.google-apps.folder' && k.name.startsWith(`${vendor.id}__`))
+    .sort((a, b) => (a.name < b.name ? 1 : -1)); // 最新(ts降順)
+  return jobs[0] || null;
+}
+
+// ✅ 見積比較 - 書き戻しジョブ投入。この業者の確定単価＋原本テンプレを _queue へ。
+app.post('/api/quote-compare/vendors/:id/writeback', requireAuth, requireQuoteCompareAccess, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { data: vendor, error } = await supabase.from('quote_vendors').select('*').eq('id', id).maybeSingle();
+    if (error) throw error;
+    if (!vendor) return res.status(404).json({ error: '業者が見つかりません' });
+    if (!driveConfigured()) return res.status(503).json({ error: '共有ドライブ未設定のためキュー投入できません' });
+
+    const { data: project } = await supabase
+      .from('quote_compare_projects').select('id, name, template_drive_id, template_filename').eq('id', vendor.project_id).maybeSingle();
+    if (!project) return res.status(404).json({ error: 'プロジェクトが見つかりません' });
+    if (!project.template_drive_id) {
+      return res.status(400).json({ error: '原本数量書のテンプレートが保存されていません。「数量書」タブで原本を再取込してください' });
+    }
+
+    // この業者の単価セルを BOQ行（sheet/excel_row）と突き合わせて書き戻し対象を作る
+    const [{ data: cellRows }, { data: boqRows }] = await Promise.all([
+      supabase.from('quote_cells').select('boq_row_id, unit_price').eq('vendor_id', vendor.id).not('unit_price', 'is', null),
+      supabase.from('quote_boq_rows').select('id, sheet_name, excel_row').eq('project_id', vendor.project_id),
+    ]);
+    const rowById = new Map((boqRows || []).map((r) => [r.id, r]));
+    const cells = (cellRows || []).map((c) => {
+      const r = rowById.get(c.boq_row_id);
+      return (r && r.sheet_name && r.excel_row != null)
+        ? { sheet: r.sheet_name, row: r.excel_row, unit_price: c.unit_price } : null;
+    }).filter(Boolean);
+    if (!cells.length) return res.status(400).json({ error: '書き戻せる単価がありません。先に「抽出」で単価を取り込んでください' });
+
+    // 原本テンプレートをジョブに現物同梱（エージェントはパス解決不要）
+    const { buffer: templateBuf } = await driveDownload(driveIdOf(project.template_drive_id));
+
+    const ts = new Date().toISOString().replace(/[:.]/g, '').replace('T', '_').slice(0, 15);
+    const jobFolderId = await ensureFolderPath(
+      [...QC_QUEUE_SEGMENTS, String(vendor.project_id), 'writeback', `${vendor.id}__${ts}`],
+      SHARED_DRIVE_ROOT_ID,
+    );
+    const job = {
+      job_type: 'writeback',
+      project_id: vendor.project_id,
+      vendor: { id: vendor.id, name: vendor.name },
+      template_filename: project.template_filename || 'template.xlsx',
+      cells,
+      options: { yellow_mask: true },
+    };
+    await driveUpload({ name: 'writeback_job.json', buffer: Buffer.from(JSON.stringify(job, null, 2), 'utf8'), mimeType: 'application/json', folderId: jobFolderId });
+    await driveUpload({ name: 'template.xlsx', buffer: templateBuf, mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', folderId: jobFolderId });
+    await driveUpload({
+      name: 'status.json',
+      buffer: Buffer.from(JSON.stringify({ status: 'queued', message: '', updated_at: new Date().toISOString() }), 'utf8'),
+      mimeType: 'application/json', folderId: jobFolderId,
+    });
+
+    res.json({ ok: true, job: `${vendor.id}__${ts}`, cells: cells.length });
+  } catch (error) {
+    console.error('Error (quote-compare writeback enqueue):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 見積比較 - 書き戻しジョブの状態取得（画面ポーリング用）。done かつ出力xlsxが揃えば ready。
+app.get('/api/quote-compare/vendors/:id/writeback-status', requireAuth, requireQuoteCompareAccess, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { data: vendor, error } = await supabase.from('quote_vendors').select('id, project_id, name').eq('id', id).maybeSingle();
+    if (error) throw error;
+    if (!vendor) return res.status(404).json({ error: '業者が見つかりません' });
+    if (!driveConfigured()) return res.json({ status: 'none' });
+
+    const job = await latestQuoteWritebackJob(vendor);
+    if (!job) return res.json({ status: 'none' });
+    const status = await readDriveJson(job.id, 'status.json');
+    const st = status?.status || 'queued';
+    if (st !== 'done') return res.json({ status: st, message: status?.message || '' });
+
+    const kids = await driveListChildren(job.id);
+    const out = kids.find((k) => k.name !== 'template.xlsx' && /\.xlsx$/i.test(k.name));
+    if (!out) return res.json({ status: 'done', ready: false, message: '生成ファイルの同期待ち' });
+    const result = await readDriveJson(job.id, 'result.json');
+    res.json({ status: 'done', ready: true, file: out.name, total: result?.total ?? null, cells_written: result?.cells_written ?? null });
+  } catch (error) {
+    console.error('Error (quote-compare writeback-status):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 見積比較 - 生成済みの書き戻しExcelをダウンロード（Drive から中継）。
+app.get('/api/quote-compare/vendors/:id/writeback-download', requireAuth, requireQuoteCompareAccess, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { data: vendor, error } = await supabase.from('quote_vendors').select('id, project_id, name').eq('id', id).maybeSingle();
+    if (error) throw error;
+    if (!vendor) return res.status(404).json({ error: '業者が見つかりません' });
+    if (!driveConfigured()) return res.status(503).json({ error: '共有ドライブ未設定です' });
+
+    const job = await latestQuoteWritebackJob(vendor);
+    if (!job) return res.status(404).json({ error: '生成済みのExcelがありません' });
+    const out = (await driveListChildren(job.id)).find((k) => k.name !== 'template.xlsx' && /\.xlsx$/i.test(k.name));
+    if (!out) return res.status(404).json({ error: '生成済みのExcelがありません' });
+
+    const { buffer } = await driveDownload(out.id);
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(out.name)}`);
+    res.send(buffer);
+  } catch (error) {
+    console.error('Error (quote-compare writeback-download):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // ✅ 見積比較 - 横並び比較（科目サマリー＋細目マトリクス＋行ごと最安）。P1の主役。
 //   比較は公式数量に各社単価を当てた金額(=単価×|公式数量|)で同一土俵。行ごと min(単価)が最安。
 app.get('/api/quote-compare/projects/:id/comparison', requireAuth, requireQuoteCompareAccess, async (req, res) => {
