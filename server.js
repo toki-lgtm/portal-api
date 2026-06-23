@@ -9177,6 +9177,140 @@ async function extractBusinessCard(buffer, mimeType) {
   };
 }
 
+// ── Gemini 複数名刺 一括 OCR（1画像に複数枚の名刺が写るケース）────────
+// 画像内のすべての名刺を1回の呼び出しで検出し、各フィールド＋枠(box_2d)を配列で返す。
+// box_2d は Gemini 物体検出の規約に従い [ymin, xmin, ymax, xmax]（0〜1000正規化）。
+async function extractBusinessCards(buffer, mimeType) {
+  if (!GEMINI_API_KEY) {
+    const e = new Error('GEMINI_API_KEY が未設定です。Render の環境変数に設定してください。');
+    e.status = 503;
+    throw e;
+  }
+  const prompt = [
+    'これは1枚の画像で、中に日本のビジネス名刺が1枚以上写っています（机に並べた複数枚など）。',
+    '写っている名刺を1枚ずつすべて検出し、各名刺について次の項目を読み取って配列で返してください。',
+    '名刺が斜め・横向き・上下逆に写っていても、文字を読み取って正しい値を返してください。',
+    '同じ名刺の表と裏が別々に写っている場合もそれぞれ1件として返してください。',
+    '各要素の項目:',
+    '- box_2d: その名刺の画像内の位置 [ymin, xmin, ymax, xmax]（0〜1000で正規化した整数。必須）',
+    '- full_name: 氏名（姓名の間の空白は除いて返す。読めなければ空文字）',
+    '- company: 会社名（読めなければ空文字）',
+    '- department: 部署名（読めなければ空文字）',
+    '- title: 役職名（読めなければ空文字）',
+    '- phone: 電話番号（直通・代表。複数ある場合は最初の1つ。読めなければ空文字）',
+    '- mobile: 携帯電話番号（読めなければ空文字）',
+    '- email: メールアドレス（読めなければ空文字）',
+    '- fax: FAX番号（読めなければ空文字）',
+    '- postal_code: 郵便番号（ハイフン付き。例: 123-4567。読めなければ空文字）',
+    '- address: 住所（郵便番号は含めない。読めなければ空文字）',
+    '- website: ウェブサイトURL（読めなければ空文字）',
+    '- qualifications: 資格・肩書き（記載があれば。複数はカンマ区切り。なければ空文字）',
+    '- note: その他の特記事項（なければ空文字）',
+    '読み取れない項目は空文字にしてください。推測で埋めないでください。',
+    '名刺以外（背景・指・机など）は無視してください。',
+  ].join('\n');
+
+  const cardProps = {
+    box_2d:         { type: 'ARRAY', items: { type: 'INTEGER' } },
+    full_name:      { type: 'STRING' },
+    company:        { type: 'STRING' },
+    department:     { type: 'STRING' },
+    title:          { type: 'STRING' },
+    phone:          { type: 'STRING' },
+    mobile:         { type: 'STRING' },
+    email:          { type: 'STRING' },
+    fax:            { type: 'STRING' },
+    postal_code:    { type: 'STRING' },
+    address:        { type: 'STRING' },
+    website:        { type: 'STRING' },
+    qualifications: { type: 'STRING' },
+    note:           { type: 'STRING' },
+  };
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+  const body = {
+    contents: [{
+      parts: [
+        { text: prompt },
+        { inlineData: { mimeType: mimeType || 'image/jpeg', data: buffer.toString('base64') } },
+      ],
+    }],
+    generationConfig: {
+      temperature: 0,
+      responseMimeType: 'application/json',
+      responseSchema: {
+        type: 'ARRAY',
+        items: { type: 'OBJECT', properties: cardProps, required: ['full_name', 'company'] },
+      },
+    },
+  };
+
+  const resp = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!resp.ok) {
+    const t = await resp.text();
+    const e = new Error(`Gemini API エラー (${resp.status}): ${t.slice(0, 300)}`);
+    e.status = 502;
+    throw e;
+  }
+  const json = await resp.json();
+  const text = json?.candidates?.[0]?.content?.parts?.[0]?.text;
+  if (!text) throw new Error('Gemini から有効な応答が得られませんでした');
+  let parsed;
+  try { parsed = JSON.parse(text); } catch { throw new Error('Gemini 応答の解析に失敗しました'); }
+  if (!Array.isArray(parsed)) parsed = parsed ? [parsed] : [];
+
+  const norm = (s) => (s == null ? '' : String(s)).trim();
+  return parsed.map((c) => {
+    const box = Array.isArray(c.box_2d) && c.box_2d.length === 4 ? c.box_2d.map((n) => Number(n)) : null;
+    return {
+      box_2d: box && box.every((n) => Number.isFinite(n)) ? box : null,
+      extracted: {
+        full_name:      norm(c.full_name),
+        company:        norm(c.company),
+        department:     norm(c.department),
+        title:          norm(c.title),
+        phone:          norm(c.phone),
+        mobile:         norm(c.mobile),
+        email:          norm(c.email),
+        fax:            norm(c.fax),
+        postal_code:    norm(c.postal_code),
+        address:        norm(c.address),
+        website:        norm(c.website),
+        qualifications: norm(c.qualifications),
+        note:           norm(c.note),
+      },
+    };
+  });
+}
+
+// 元画像（EXIF正規化済み base）から box_2d（0〜1000）に対応する領域を切り出す。
+// パディングを少し足し、画像範囲にクランプ。box が無効なら画像全体を返す。
+async function cropCardRegion(base, box, meta) {
+  const W = meta.width, H = meta.height;
+  if (!Array.isArray(box) || box.length !== 4) return sharp(base).toBuffer();
+  let [ymin, xmin, ymax, xmax] = box.map((n) => Number(n));
+  if (![ymin, xmin, ymax, xmax].every((n) => Number.isFinite(n))) return sharp(base).toBuffer();
+  // 0〜1000 正規化 → ピクセル
+  let left = Math.round((Math.min(xmin, xmax) / 1000) * W);
+  let top = Math.round((Math.min(ymin, ymax) / 1000) * H);
+  let right = Math.round((Math.max(xmin, xmax) / 1000) * W);
+  let bottom = Math.round((Math.max(ymin, ymax) / 1000) * H);
+  // パディング（短辺の3%）
+  const pad = Math.round(Math.min(W, H) * 0.03);
+  left = Math.max(0, left - pad);
+  top = Math.max(0, top - pad);
+  right = Math.min(W, right + pad);
+  bottom = Math.min(H, bottom + pad);
+  const width = Math.max(1, right - left);
+  const height = Math.max(1, bottom - top);
+  if (width >= W && height >= H) return sharp(base).toBuffer();
+  return sharp(base).extract({ left, top, width, height }).toBuffer();
+}
+
 // ── 名刺の向き自動補正（Gemini で正立判定 → sharp で回転）──────────
 // 既存の一括補正と同じ思想: モデルは「正立(0°)」の判定は高信頼だが
 // 90/270 の方向判定は不安定。そこで まず1回判定し、傾いていれば
@@ -9426,14 +9560,26 @@ app.post('/api/cards/suggest-category', requireAuth, requireCardAccess, async (r
 // ✅ 名刺 - 画像スキャン（OCR のみ。DB 保存しない）
 //    POST /api/cards/scan
 //    multipart/form-data: file（名刺画像）
+//    1画像に複数枚の名刺が写っている場合は cards 配列（各 box_2d 付き）を返す。
+//    返却形: { count, extracted(=1枚目, 後方互換), cards: [{ extracted, box_2d }] }
 app.post('/api/cards/scan', requireAuth, requireCardAccess, upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'file（名刺画像）が必要です' });
     if (req.file.size > 18 * 1024 * 1024) return res.status(400).json({ error: 'ファイルサイズが18MBを超えています' });
-    // 向きを自動補正してから OCR（横倒し名刺の読み取り精度を確保）
-    const oriented = await orientCardUpright(req.file.buffer, req.file.mimetype);
-    const extracted = await extractBusinessCard(oriented.buffer, oriented.mimeType);
-    res.json({ extracted });
+
+    // EXIF の向きを画素へ焼き込んだ base（box_2d 座標の基準。一括登録側と一致させる）
+    const base = await sharp(req.file.buffer).rotate().toBuffer();
+    const cards = await extractBusinessCards(base, 'image/jpeg');
+
+    if (cards.length <= 1) {
+      // 従来どおり1枚として高精度に読む（向き補正→OCR）。後方互換のため extracted を返す。
+      const oriented = await orientCardUpright(req.file.buffer, req.file.mimetype);
+      const extracted = await extractBusinessCard(oriented.buffer, oriented.mimeType);
+      return res.json({ count: 1, extracted, cards: [{ extracted, box_2d: null }] });
+    }
+
+    // 複数枚 → 配列で返す（フロントは複数名刺レビュー画面を表示）
+    res.json({ count: cards.length, extracted: cards[0].extracted, cards });
   } catch (error) {
     console.error('Error (cards scan):', error.message);
     res.status(error.status || 500).json({ error: error.message });
@@ -9649,6 +9795,80 @@ app.post('/api/cards', requireAuth, requireCardAccess, upload.single('file'), as
     res.json({ ...row, image_url: row.image_ref ? await cardSignedUrl(row.image_ref, { size: 600 }) : null });
   } catch (error) {
     console.error('Error (cards create):', error.message);
+    res.status(error.status || 500).json({ error: error.message });
+  }
+});
+
+// ✅ 名刺 - 複数名刺の一括登録（1画像に複数枚写っている場合）
+//    POST /api/cards/batch
+//    multipart/form-data:
+//      file  : 元画像（1枚。scan に渡したものと同じ）
+//      cards : JSON文字列。各要素 = { 各フィールド, box_2d:[ymin,xmin,ymax,xmax]|null, category, visibility }
+//    サーバー側で box_2d ごとに切り出し→正立補正→保存し、名刺を1件ずつ登録する。
+app.post('/api/cards/batch', requireAuth, requireCardAccess, upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'file（元画像）が必要です' });
+    if (req.file.size > 18 * 1024 * 1024) return res.status(400).json({ error: 'ファイルサイズが18MBを超えています' });
+
+    let cardsInput;
+    try { cardsInput = JSON.parse(req.body?.cards || '[]'); } catch { cardsInput = null; }
+    if (!Array.isArray(cardsInput) || cardsInput.length === 0) {
+      return res.status(400).json({ error: 'cards（登録する名刺の配列）が必要です' });
+    }
+    if (cardsInput.length > 20) {
+      return res.status(400).json({ error: '一度に登録できるのは20件までです' });
+    }
+
+    const ownerEmail = String(req.user.email || '').toLowerCase();
+    // scan と同じ EXIF 正規化 base（box_2d 座標の基準）
+    const base = await sharp(req.file.buffer).rotate().toBuffer();
+    const meta = await sharp(base).metadata();
+
+    const FIELDS = ['full_name', 'company', 'department', 'title', 'phone', 'mobile',
+      'email', 'fax', 'postal_code', 'address', 'website', 'qualifications', 'note'];
+
+    const created = [];
+    const usedCategories = new Set();
+
+    // 切り出し→正立→保存→DB登録 を1件ずつ（Gemini 向き判定の同時呼び出しを抑える）
+    for (const c of cardsInput) {
+      const vis = c.visibility === 'private' ? 'private' : 'shared';
+      const cat = (c.category || '').trim() || null;
+
+      // 領域を切り出して正立補正
+      const crop = await cropCardRegion(base, c.box_2d, meta);
+      const oriented = await orientCardUpright(crop, 'image/jpeg');
+      const fileName = `${Date.now()}-${uuidv4()}.jpg`;
+      const image_ref = await storeCardFile({
+        category: cat,
+        fileName,
+        buffer: oriented.buffer,
+        mimeType: oriented.mimeType,
+      });
+
+      const row = {};
+      for (const k of FIELDS) row[k] = (c[k] != null && String(c[k]).trim() !== '') ? String(c[k]) : null;
+      row.category = cat;
+      row.image_ref = image_ref;
+      row.visibility = vis;
+      row.owner_email = ownerEmail;
+
+      const { data, error } = await supabase.from('business_cards').insert([row]).select('*');
+      if (error) throw error;
+      if (cat) usedCategories.add(cat);
+
+      const saved = data[0];
+      created.push({ ...saved, image_url: saved.image_ref ? await cardSignedUrl(saved.image_ref, { size: 600 }) : null });
+    }
+
+    // 使われたカテゴリを候補として upsert
+    for (const name of usedCategories) {
+      await supabase.from('card_categories').upsert({ user_email: ownerEmail, name }, { onConflict: 'user_email,name' });
+    }
+
+    res.json({ count: created.length, created });
+  } catch (error) {
+    console.error('Error (cards batch):', error.message);
     res.status(error.status || 500).json({ error: error.message });
   }
 });
