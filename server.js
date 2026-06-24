@@ -7916,10 +7916,15 @@ app.post('/api/circulars/analyze', requireAuth, requireDocAdmin, upload.single('
   try {
     if (!req.file) return res.status(400).json({ error: 'file フィールドが必要です' });
 
-    const buffer = req.file.buffer;
-    // クライアントが汎用タイプで送る場合があるため、未指定/octet-stream は中身から判定する。
+    // モバイルの内容検査(PDF署名)による送信遮断を避けるため、クライアントは
+    // ファイルを Base64 テキストで送ってくることがある（encoding=base64）。その場合は復号。
+    let buffer = req.file.buffer;
+    if (String(req.body?.encoding || '').toLowerCase() === 'base64') {
+      buffer = Buffer.from(req.file.buffer.toString('utf8'), 'base64');
+    }
+    // クライアントが汎用/テキストタイプで送る場合があるため、中身(マジックバイト)から判定する。
     let mimeType = req.file.mimetype;
-    if (!mimeType || mimeType === 'application/octet-stream') {
+    if (!mimeType || mimeType === 'application/octet-stream' || mimeType === 'text/plain') {
       mimeType = sniffMimeFromBuffer(buffer, 'application/pdf');
     }
     const isImage = mimeType.startsWith('image/');
