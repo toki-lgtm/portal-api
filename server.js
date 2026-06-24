@@ -7897,12 +7897,31 @@ function isCircularAudienceMatch(doc, targets, profile, email) {
 
 // ✅ 文書回覧 - バッチ解析（POST /api/circulars/analyze）※ 管理者のみ
 //    ファイルを受領してGeminiに掛け、書類境界の解析結果を返す（DBには保存しない）。
+// ファイル先頭のマジックバイトから MIME を推定する。クライアントが
+// モバイルの送信失敗回避のため汎用タイプ(application/octet-stream)で送ってくる
+// ケースに対応（宛先がPDFか画像かをここで確定する）。
+function sniffMimeFromBuffer(buf, fallback = 'application/pdf') {
+  if (!buf || buf.length < 4) return fallback;
+  if (buf[0] === 0x25 && buf[1] === 0x50 && buf[2] === 0x44 && buf[3] === 0x46) return 'application/pdf'; // %PDF
+  if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'image/jpeg';
+  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return 'image/png';
+  if (buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46) return 'image/gif';
+  if (buf.length >= 12 && buf[0] === 0x52 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x46 &&
+      buf[8] === 0x57 && buf[9] === 0x45 && buf[10] === 0x42 && buf[11] === 0x50) return 'image/webp';
+  if (buf.length >= 12 && buf[4] === 0x66 && buf[5] === 0x74 && buf[6] === 0x79 && buf[7] === 0x70) return 'image/heic'; // ....ftyp
+  return fallback;
+}
+
 app.post('/api/circulars/analyze', requireAuth, requireDocAdmin, upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'file フィールドが必要です' });
 
     const buffer = req.file.buffer;
-    const mimeType = req.file.mimetype;
+    // クライアントが汎用タイプで送る場合があるため、未指定/octet-stream は中身から判定する。
+    let mimeType = req.file.mimetype;
+    if (!mimeType || mimeType === 'application/octet-stream') {
+      mimeType = sniffMimeFromBuffer(buffer, 'application/pdf');
+    }
     const isImage = mimeType.startsWith('image/');
 
     // 一時領域に保存して batch_ref を取得
