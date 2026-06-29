@@ -10845,6 +10845,23 @@ app.post('/api/doboku/past-questions/:id/ai-grade', requireAuth, requireExamAcce
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── 過去問: 「要復習」フラグの オン/オフ（穴埋め・記述問わず手動付与）──────
+//   body: { needs_review: boolean }
+//   学習記録(doboku_pq_progress)に needs_review 列だけを upsert（attempts等は保持）。
+app.post('/api/doboku/past-questions/:id/review-flag', requireAuth, requireExamAccess, requireDobokuAccess, async (req, res) => {
+  try {
+    const role = req.examRole;
+    const needs_review = !!(req.body && req.body.needs_review);
+    const { data: q } = await supabase.from('doboku_past_questions').select('id').eq('id', req.params.id).maybeSingle();
+    if (!q) return res.status(404).json({ error: '設問が見つかりません' });
+    await supabase.from('doboku_pq_progress').upsert({
+      staff_id: role.staffId, past_question_id: q.id, subject_id: DOBOKU_SUBJECT_ID,
+      needs_review, updated_at: new Date().toISOString(),
+    }, { onConflict: 'staff_id,past_question_id' });
+    res.json({ ok: true, needs_review });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── 経験記述ドラフト: 一覧（本人スコープ。最新の添削サマリ付き）─────
 app.get('/api/doboku/records', requireAuth, requireExamAccess, requireDobokuAccess, async (req, res) => {
   try {
