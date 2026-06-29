@@ -10437,6 +10437,101 @@ app.get('/api/exam/subjects/:sid/chapters', requireAuth, requireExamAccess, asyn
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// 学習分析（履歴の集計）。方針=履歴は蓄積(exam_answer_log)・表示は最新(exam_progress.last_correct)。
+//   summary: 全体サマリ / daily: 日別の学習量と正答率(JST) / byChapter: 章別の最新正答率 / weak: 苦手問題TOP
+app.get('/api/exam/subjects/:sid/analytics', requireAuth, requireExamAccess, async (req, res) => {
+  try {
+    const role = req.examRole; const sid = req.params.sid;
+    if (!(await canAccessSubject(role, sid))) return res.status(403).json({ error: 'この科目のアクセス権がありません' });
+    if (!role.staffId) return res.json({ summary: null, daily: [], byChapter: [], weak: [] });
+
+    const { data: chaps } = await supabase
+      .from('exam_chapters').select('id,chapter_no,title').eq('subject_id', sid).order('chapter_no');
+    const chapById = {}; for (const c of chaps || []) chapById[c.id] = c;
+    const { count: totalQ } = await supabase
+      .from('exam_questions').select('id', { count: 'exact', head: true }).eq('subject_id', sid);
+
+    // 最新状態（集計）と 全回答履歴
+    const prog = await pagedSelect(() => supabase
+      .from('exam_progress').select('question_id,chapter_id,last_correct,attempts,correct_count')
+      .eq('staff_id', role.staffId).eq('subject_id', sid).order('id'));
+    const logs = await pagedSelect(() => supabase
+      .from('exam_answer_log').select('chapter_id,is_correct,answered_at')
+      .eq('staff_id', role.staffId).eq('subject_id', sid).order('id'));
+
+    // サマリ：最新正答率(last_correct) と 通算正答率(全試行平均) を併記
+    const distinctAnswered = prog.length;
+    const latestCorrect = prog.filter(p => p.last_correct).length;
+    const totalAttempts = prog.reduce((s, p) => s + (p.attempts || 0), 0);
+    const totalCorrectAll = prog.reduce((s, p) => s + (p.correct_count || 0), 0);
+
+    // 日別（JST基準でバケット）
+    const jstDate = (ts) => {
+      const d = new Date(ts); if (isNaN(d.getTime())) return null;
+      return new Date(d.getTime() + 9 * 3600 * 1000).toISOString().slice(0, 10);
+    };
+    const dayMap = {};
+    for (const l of logs) {
+      const k = jstDate(l.answered_at); if (!k) continue;
+      const o = dayMap[k] || (dayMap[k] = { date: k, count: 0, correct: 0 });
+      o.count++; if (l.is_correct) o.correct++;
+    }
+    const daily = Object.values(dayMap).sort((a, b) => a.date.localeCompare(b.date))
+      .map(o => ({ ...o, rate: o.count ? Math.round(o.correct / o.count * 100) : 0 }));
+
+    const summary = {
+      total_questions: totalQ || 0,
+      distinct_answered: distinctAnswered,
+      unanswered: Math.max(0, (totalQ || 0) - distinctAnswered),
+      latest_correct: latestCorrect,
+      latest_correct_rate: distinctAnswered ? Math.round(latestCorrect / distinctAnswered * 100) : null,
+      total_answers: logs.length,
+      lifetime_correct_rate: totalAttempts ? Math.round(totalCorrectAll / totalAttempts * 100) : null,
+      study_days: daily.length,
+    };
+
+    // 章別（最新状態）
+    const byChapAgg = {};
+    for (const p of prog) {
+      const o = byChapAgg[p.chapter_id] || (byChapAgg[p.chapter_id] = { answered: 0, correct: 0 });
+      o.answered++; if (p.last_correct) o.correct++;
+    }
+    const byChapter = (chaps || []).map(c => {
+      const o = byChapAgg[c.id] || { answered: 0, correct: 0 };
+      return {
+        chapter_no: c.chapter_no, title: c.title, answered: o.answered, correct: o.correct,
+        rate: o.answered ? Math.round(o.correct / o.answered * 100) : null,
+      };
+    });
+
+    // 苦手TOP（2回以上挑戦して誤答が残るもの・誤答率高い順）
+    const weakRows = prog
+      .filter(p => (p.attempts || 0) >= 2 && (p.correct_count || 0) < p.attempts)
+      .map(p => ({
+        question_id: p.question_id, chapter_id: p.chapter_id,
+        attempts: p.attempts, correct_count: p.correct_count || 0,
+        err: (p.attempts - (p.correct_count || 0)) / p.attempts,
+      }))
+      .sort((a, b) => b.err - a.err || b.attempts - a.attempts)
+      .slice(0, 10);
+    let weak = [];
+    if (weakRows.length) {
+      const { data: qrows } = await supabase
+        .from('exam_questions').select('id,q_no,stem').in('id', weakRows.map(w => w.question_id));
+      const qm = {}; for (const q of qrows || []) qm[q.id] = q;
+      weak = weakRows.map(w => ({
+        question_id: w.question_id, q_no: qm[w.question_id]?.q_no,
+        chapter_no: chapById[w.chapter_id]?.chapter_no,
+        stem: (qm[w.question_id]?.stem || '').slice(0, 60),
+        attempts: w.attempts, correct_count: w.correct_count,
+        miss_rate: Math.round(w.err * 100),
+      }));
+    }
+
+    res.json({ summary, daily, byChapter, weak });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // 演習セッションの問題リストを返す
 //   body: { subject_id, chapter_ids:[...], mode:'continue'|'wrong'|'weak', limit? }
 app.post('/api/exam/session', requireAuth, requireExamAccess, async (req, res) => {
@@ -10750,9 +10845,10 @@ app.get('/api/doboku/past-questions', requireAuth, requireExamAccess, requireDob
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── 過去問: 採点（穴埋め=機械採点 / 自由記述=模範解答返却＋自己採点記録）──
+// ── 過去問: 採点（穴埋め=機械採点で正誤を記録 / 自由記述=模範解答を返すだけ）──
 //   body(穴埋め): { blanks: { "イ":"...", "ロ":"..." } }
-//   body(自由記述): { self_rating?: '○'|'△'|'×' }（任意。記録のみ）
+//   ※ 自由記述は模範解答を見ただけでは学習記録を作らない。
+//     記述の記録は AI判定（/ai-grade で ai_score を保存）したときだけ残す方針（2026-06-29 トキ確定）。
 app.post('/api/doboku/past-questions/:id/grade', requireAuth, requireExamAccess, requireDobokuAccess, async (req, res) => {
   try {
     const role = req.examRole;
@@ -10773,17 +10869,19 @@ app.post('/api/doboku/past-questions/:id/grade', requireAuth, requireExamAccess,
       isCorrect = blankResults.length > 0 && blankResults.every(b => b.correct);
     }
 
-    // 学習記録（upsert）
-    const self_rating = (req.body && req.body.self_rating) || null;
-    const { data: cur } = await supabase.from('doboku_pq_progress')
-      .select('attempts,correct_count').eq('staff_id', role.staffId).eq('past_question_id', q.id).maybeSingle();
-    const attempts = (cur?.attempts || 0) + 1;
-    const correct_count = (cur?.correct_count || 0) + (isCorrect ? 1 : 0);
-    await supabase.from('doboku_pq_progress').upsert({
-      staff_id: role.staffId, past_question_id: q.id, subject_id: DOBOKU_SUBJECT_ID,
-      attempts, correct_count, last_correct: isCorrect, self_rating,
-      last_answered: new Date().toISOString(), updated_at: new Date().toISOString(),
-    }, { onConflict: 'staff_id,past_question_id' });
+    // 学習記録（upsert）── 穴埋めのみ正誤を記録する。
+    //   記述は模範解答を見ただけでは記録しない（記録は /ai-grade の AI判定だけ）。
+    if (q.q_type === 'blank') {
+      const { data: cur } = await supabase.from('doboku_pq_progress')
+        .select('attempts,correct_count').eq('staff_id', role.staffId).eq('past_question_id', q.id).maybeSingle();
+      const attempts = (cur?.attempts || 0) + 1;
+      const correct_count = (cur?.correct_count || 0) + (isCorrect ? 1 : 0);
+      await supabase.from('doboku_pq_progress').upsert({
+        staff_id: role.staffId, past_question_id: q.id, subject_id: DOBOKU_SUBJECT_ID,
+        attempts, correct_count, last_correct: isCorrect,
+        last_answered: new Date().toISOString(), updated_at: new Date().toISOString(),
+      }, { onConflict: 'staff_id,past_question_id' });
+    }
 
     res.json({
       q_type: q.q_type, is_correct: isCorrect, blank_results: blankResults,
