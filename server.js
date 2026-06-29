@@ -10466,8 +10466,9 @@ app.post('/api/exam/session', requireAuth, requireExamAccess, async (req, res) =
         .filter(x => x.err > 0);
       scored.sort((a, b) => b.err - a.err || String(a.last || '').localeCompare(String(b.last || '')));
       pickIds = scored.map(x => x.id);
-    } else { // continue: 未回答をランダム
+    } else { // continue: 未回答をランダム。一周完了なら全問で最初からやり直し
       pickIds = (qs || []).filter(q => !progByQ[q.id]).map(q => q.id);
+      if (pickIds.length === 0) pickIds = (qs || []).map(q => q.id); // 全問回答済み → もう一周
       shuffle(pickIds);
     }
     pickIds = pickIds.slice(0, limit);
