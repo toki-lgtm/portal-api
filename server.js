@@ -10561,6 +10561,404 @@ app.post('/api/exam/admin/access', requireAuth, requireExamAccess, async (req, r
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ============================================================
+// 1級土木施工管理技士 第二次検定アプリ  /api/doboku/*
+//   入口は資格学習(exam-prep)に相乗り。権限は exam の2層をそのまま流用。
+//   科目は固定: 'doboku-1-2ji'（exam_subjects に登録済み, kind='doboku-2ji'）。
+//   記述式のため採点・データは doboku_* で別建て。
+// ============================================================
+const DOBOKU_SUBJECT_ID = 'doboku-1-2ji';
+const DOBOKU_IMG_BASE = `${process.env.SUPABASE_URL}/storage/v1/object/public/doboku-images/`;
+function dobokuImageUrl(p) { return p ? DOBOKU_IMG_BASE + p : null; }
+
+// 第二次検定科目へのアクセスを保証するミドルウェア（exam の権限機構を流用）
+async function requireDobokuAccess(req, res, next) {
+  try {
+    if (!(await canAccessSubject(req.examRole, DOBOKU_SUBJECT_ID)))
+      return res.status(403).json({ error: '第二次検定アプリのアクセス権がありません' });
+    next();
+  } catch (e) { res.status(500).json({ error: e.message }); }
+}
+
+// 施工経験記述のドラフトを Gemini で添削（テキスト生成。ファイルは送らない）。
+//   出力契約: { score, summary, good_points[], improvements[], revised_example }
+async function reviewExperienceRecord(record) {
+  if (!GEMINI_API_KEY) {
+    const e = new Error('GEMINI_API_KEY が未設定です。AI添削は利用できません。');
+    e.status = 503;
+    throw e;
+  }
+  const ov = record.overview || {};
+  const ovText = ['工事名', '立場', '発注者', '工事場所', '工期', '主な工種', '施工量']
+    .map(k => `  ${k}: ${ov[k] || '（未記入）'}`).join('\n');
+
+  const prompt = [
+    'あなたは1級土木施工管理技士 第二次検定の採点・添削を専門とするベテラン講師です。',
+    '受験者が書いた「施工経験記述」の下書きを、本試験の採点基準に照らして厳格かつ建設的に添削してください。',
+    '',
+    `【課題種別】${record.theme || '（未指定）'}`,
+    '【工事概要】',
+    ovText,
+    '',
+    '【設問1：現場状況・技術的課題・検討した項目】',
+    (record.answer1 || '（未記入）'),
+    '',
+    '【設問2：対応処置とその評価】',
+    (record.answer2 || '（未記入）'),
+    '',
+    '次の観点で評価してください:',
+    '- 課題→検討→対応処置→評価の論理が一貫しているか',
+    '- 技術的に具体的か（数値・基準・固有名詞があるか。抽象論でないか）',
+    '- 課題種別（品質/安全/工程/施工計画/環境）に合致しているか',
+    '- 自分が実施した立場での記述になっているか、誇張・矛盾がないか',
+    '- 文章量・構成が解答欄の目安に収まっているか',
+    '',
+    '出力JSON:',
+    '- score: 100点満点の目安（整数）',
+    '- summary: 総評（2〜4文）',
+    '- good_points: 良い点（短い箇条書きの配列）',
+    '- improvements: 改善点（具体的・実行可能な指摘の配列）',
+    '- revised_example: 改善を反映した添削後の記述例（設問1・設問2をまとめた文章）',
+    '日本語で、現場目線の実務的な指摘を行ってください。',
+  ].join('\n');
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+  const body = {
+    contents: [{ parts: [{ text: prompt }] }],
+    generationConfig: {
+      temperature: 0.4,
+      // 2.5系の思考が出力枠を食い切る対策（資格者証/ソムリエ抽出と同方針）
+      thinkingConfig: { thinkingBudget: 0 },
+      responseMimeType: 'application/json',
+      responseSchema: {
+        type: 'OBJECT',
+        properties: {
+          score: { type: 'INTEGER' },
+          summary: { type: 'STRING' },
+          good_points: { type: 'ARRAY', items: { type: 'STRING' } },
+          improvements: { type: 'ARRAY', items: { type: 'STRING' } },
+          revised_example: { type: 'STRING' },
+        },
+        required: ['summary', 'improvements'],
+      },
+    },
+  };
+
+  const resp = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!resp.ok) {
+    const t = await resp.text();
+    const e = new Error(`Gemini API エラー (${resp.status}): ${t.slice(0, 300)}`);
+    e.status = 502;
+    throw e;
+  }
+  const json = await resp.json();
+  const text = json?.candidates?.[0]?.content?.parts?.[0]?.text;
+  if (!text) throw new Error('Gemini から有効な応答が得られませんでした');
+  let p;
+  try { p = JSON.parse(text); } catch { throw new Error('Gemini 応答の解析に失敗しました'); }
+  return {
+    score: Number.isFinite(p.score) ? p.score : null,
+    summary: (p.summary || '').trim(),
+    good_points: Array.isArray(p.good_points) ? p.good_points : [],
+    improvements: Array.isArray(p.improvements) ? p.improvements : [],
+    revised_example: (p.revised_example || '').trim(),
+  };
+}
+
+// ── 通読: 編→章ツリー＋本文＋図 ───────────────────────────────
+app.get('/api/doboku/sections', requireAuth, requireExamAccess, requireDobokuAccess, async (req, res) => {
+  try {
+    const secs = await pagedSelect(() => supabase
+      .from('doboku_sections').select('*').eq('subject_id', DOBOKU_SUBJECT_ID).order('part_no').order('sort_order'));
+    const figs = await pagedSelect(() => supabase
+      .from('doboku_figures').select('*').order('sort_order'));
+    const figBySec = {};
+    for (const f of figs) (figBySec[f.section_id] || (figBySec[f.section_id] = [])).push({
+      id: f.id, image_url: dobokuImageUrl(f.image_path), caption: f.caption,
+    });
+    // 編ごとにまとめる
+    const parts = [];
+    const byPart = {};
+    for (const s of secs) {
+      let pt = byPart[s.part_no];
+      if (!pt) { pt = byPart[s.part_no] = { part_no: s.part_no, part_name: s.part_name, sections: [] }; parts.push(pt); }
+      pt.sections.push({
+        id: s.id, chapter_no: s.chapter_no, chapter_title: s.chapter_title,
+        body_md: s.body_md, figures: figBySec[s.id] || [],
+      });
+    }
+    res.json({ subject_id: DOBOKU_SUBJECT_ID, parts });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── 模範解答例ライブラリ（工事種別・課題種別で絞込） ─────────────
+app.get('/api/doboku/model-records', requireAuth, requireExamAccess, requireDobokuAccess, async (req, res) => {
+  try {
+    const { trade, theme } = req.query;
+    let rows = await pagedSelect(() => supabase
+      .from('doboku_model_records').select('*').eq('subject_id', DOBOKU_SUBJECT_ID).order('sort_order').order('id'));
+    if (trade) rows = rows.filter(r => r.trade === trade);
+    if (theme) rows = rows.filter(r => r.theme === theme);
+    const trades = [...new Set(rows.length ? rows.map(r => r.trade) : [])];
+    // フィルタ前の選択肢一覧も返す（UI用）
+    const allForFacets = await pagedSelect(() => supabase
+      .from('doboku_model_records').select('trade,theme').eq('subject_id', DOBOKU_SUBJECT_ID).order('id'));
+    res.json({
+      records: rows,
+      facets: {
+        trades: [...new Set(allForFacets.map(r => r.trade))],
+        themes: [...new Set(allForFacets.map(r => r.theme))],
+      },
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── 過去問: 一覧（編・年度で絞込）＋ 自分の学習記録 ─────────────
+app.get('/api/doboku/past-questions', requireAuth, requireExamAccess, requireDobokuAccess, async (req, res) => {
+  try {
+    const role = req.examRole;
+    const { part, year } = req.query;
+    let qs = await pagedSelect(() => supabase
+      .from('doboku_past_questions').select('*').eq('subject_id', DOBOKU_SUBJECT_ID).order('part_no').order('sort_order'));
+    if (part) qs = qs.filter(q => String(q.part_no) === String(part));
+    if (year) qs = qs.filter(q => q.year_label === year);
+    // 学習記録
+    const prog = await pagedSelect(() => supabase
+      .from('doboku_pq_progress').select('*').eq('staff_id', role.staffId).eq('subject_id', DOBOKU_SUBJECT_ID).order('id'));
+    const progByQ = {}; for (const p of prog) progByQ[p.past_question_id] = p;
+    const facetsRows = await pagedSelect(() => supabase
+      .from('doboku_past_questions').select('part_no,part_name,year_label').eq('subject_id', DOBOKU_SUBJECT_ID).order('part_no'));
+    const partsMap = {};
+    for (const r of facetsRows) partsMap[r.part_no] = r.part_name;
+    res.json({
+      questions: qs.map(q => ({
+        id: q.id, part_no: q.part_no, part_name: q.part_name, q_no: q.q_no,
+        year_label: q.year_label, exam_no: q.exam_no, q_type: q.q_type,
+        stem: q.stem, note: q.note, image_url: dobokuImageUrl(q.image_path),
+        progress: progByQ[q.id] || null,
+      })),
+      facets: {
+        parts: Object.entries(partsMap).map(([no, name]) => ({ part_no: Number(no), part_name: name })),
+        years: [...new Set(facetsRows.map(r => r.year_label).filter(Boolean))],
+      },
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── 過去問: 採点（穴埋め=機械採点 / 自由記述=模範解答返却＋自己採点記録）──
+//   body(穴埋め): { blanks: { "イ":"...", "ロ":"..." } }
+//   body(自由記述): { self_rating?: '○'|'△'|'×' }（任意。記録のみ）
+app.post('/api/doboku/past-questions/:id/grade', requireAuth, requireExamAccess, requireDobokuAccess, async (req, res) => {
+  try {
+    const role = req.examRole;
+    const { data: q } = await supabase.from('doboku_past_questions').select('*').eq('id', req.params.id).maybeSingle();
+    if (!q) return res.status(404).json({ error: '設問が見つかりません' });
+    const { data: ans } = await supabase.from('doboku_pq_answers').select('*').eq('past_question_id', q.id).maybeSingle();
+
+    let isCorrect = null; let blankResults = null;
+    if (q.q_type === 'blank') {
+      const submitted = (req.body && req.body.blanks) || {};
+      const defs = (ans && Array.isArray(ans.blanks)) ? ans.blanks : [];
+      blankResults = defs.map(d => {
+        const want = [d.answer, ...(d.alts || [])].map(normalizeWritten).filter(Boolean);
+        const got = submitted[d.mark];
+        const ok = want.includes(normalizeWritten(got));
+        return { mark: d.mark, your: got || '', answer: d.answer, alts: d.alts || [], correct: ok };
+      });
+      isCorrect = blankResults.length > 0 && blankResults.every(b => b.correct);
+    }
+
+    // 学習記録（upsert）
+    const self_rating = (req.body && req.body.self_rating) || null;
+    const { data: cur } = await supabase.from('doboku_pq_progress')
+      .select('attempts,correct_count').eq('staff_id', role.staffId).eq('past_question_id', q.id).maybeSingle();
+    const attempts = (cur?.attempts || 0) + 1;
+    const correct_count = (cur?.correct_count || 0) + (isCorrect ? 1 : 0);
+    await supabase.from('doboku_pq_progress').upsert({
+      staff_id: role.staffId, past_question_id: q.id, subject_id: DOBOKU_SUBJECT_ID,
+      attempts, correct_count, last_correct: isCorrect, self_rating,
+      last_answered: new Date().toISOString(), updated_at: new Date().toISOString(),
+    }, { onConflict: 'staff_id,past_question_id' });
+
+    res.json({
+      q_type: q.q_type, is_correct: isCorrect, blank_results: blankResults,
+      answer_text: ans?.answer_text || null, blanks: ans?.blanks || [],
+      explanation: ans?.explanation || q.note || null,
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── 過去問: 自由記述の AI 採点（任意機能）─────────────────────────
+//   body: { typed }  自分の解答を模範解答と照らして Gemini が採点・講評
+app.post('/api/doboku/past-questions/:id/ai-grade', requireAuth, requireExamAccess, requireDobokuAccess, async (req, res) => {
+  try {
+    if (!GEMINI_API_KEY) return res.status(503).json({ error: 'GEMINI_API_KEY が未設定です。AI採点は利用できません。' });
+    const role = req.examRole;
+    const typed = (req.body && req.body.typed) || '';
+    if (!typed.trim()) return res.status(400).json({ error: '解答が空です' });
+    const { data: q } = await supabase.from('doboku_past_questions').select('*').eq('id', req.params.id).maybeSingle();
+    if (!q) return res.status(404).json({ error: '設問が見つかりません' });
+    const { data: ans } = await supabase.from('doboku_pq_answers').select('*').eq('past_question_id', q.id).maybeSingle();
+
+    const prompt = [
+      'あなたは1級土木施工管理技士 第二次検定の採点者です。受験者の自由記述解答を採点してください。',
+      '', `【問題（${q.year_label || ''} ${q.exam_no || ''}）】`, q.stem,
+      '', '【模範解答】', (ans?.answer_text || '（模範解答データなし）'),
+      '', '【受験者の解答】', typed,
+      '', '模範解答に照らし、要点の網羅度・技術的妥当性・具体性で採点してください。',
+      '出力JSON: score(100点満点の整数), summary(総評), good_points(配列), improvements(配列)',
+    ].join('\n');
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+    const resp = await fetch(url, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: {
+          temperature: 0.3, thinkingConfig: { thinkingBudget: 0 },
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: 'OBJECT',
+            properties: {
+              score: { type: 'INTEGER' }, summary: { type: 'STRING' },
+              good_points: { type: 'ARRAY', items: { type: 'STRING' } },
+              improvements: { type: 'ARRAY', items: { type: 'STRING' } },
+            }, required: ['summary'],
+          },
+        },
+      }),
+    });
+    if (!resp.ok) { const t = await resp.text(); return res.status(502).json({ error: `Gemini API エラー (${resp.status}): ${t.slice(0, 200)}` }); }
+    const j = await resp.json();
+    const text = j?.candidates?.[0]?.content?.parts?.[0]?.text;
+    let p = {}; try { p = JSON.parse(text); } catch { /* noop */ }
+    const ai_score = Number.isFinite(p.score) ? p.score : null;
+    // 学習記録に AI 採点を反映
+    await supabase.from('doboku_pq_progress').upsert({
+      staff_id: role.staffId, past_question_id: q.id, subject_id: DOBOKU_SUBJECT_ID,
+      ai_score, last_answered: new Date().toISOString(), updated_at: new Date().toISOString(),
+    }, { onConflict: 'staff_id,past_question_id' });
+    res.json({ score: ai_score, summary: p.summary || '', good_points: p.good_points || [], improvements: p.improvements || [] });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── 経験記述ドラフト: 一覧（本人スコープ。最新の添削サマリ付き）─────
+app.get('/api/doboku/records', requireAuth, requireExamAccess, requireDobokuAccess, async (req, res) => {
+  try {
+    const role = req.examRole;
+    const recs = await pagedSelect(() => supabase
+      .from('doboku_user_records').select('*').eq('staff_id', role.staffId).order('updated_at', { ascending: false }));
+    const ids = recs.map(r => r.id);
+    let latestByRec = {};
+    if (ids.length) {
+      const reviews = await pagedSelect(() => supabase
+        .from('doboku_ai_reviews').select('record_id,score,created_at').in('record_id', ids).order('created_at', { ascending: false }));
+      for (const rv of reviews) if (!latestByRec[rv.record_id]) latestByRec[rv.record_id] = rv;
+    }
+    res.json(recs.map(r => ({ ...r, latest_review: latestByRec[r.id] || null })));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── 社内共有: 仕上げ済(done)かつ共有ONの経験記述を【匿名】で一覧 ──────────────
+//   全受験者が「社内事例」として閲覧可。投稿者名・AI点数・自分用タイトルは返さない。
+//   ⚠ 工事概要(発注者/工事場所等)から書き手が推測され得る点は周知の上で運用（仕様確定済）。
+app.get('/api/doboku/shared-records', requireAuth, requireExamAccess, requireDobokuAccess, async (req, res) => {
+  try {
+    const recs = await pagedSelect(() => supabase
+      .from('doboku_user_records')
+      .select('id, theme, overview, answer1, answer2, updated_at')
+      .eq('subject_id', DOBOKU_SUBJECT_ID).eq('status', 'done').eq('is_shared', true)
+      .order('updated_at', { ascending: false }));
+    res.json(recs.map(r => ({ id: r.id, theme: r.theme, overview: r.overview, answer1: r.answer1, answer2: r.answer2 })));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── 経験記述ドラフト: 作成 ───────────────────────────────────────
+app.post('/api/doboku/records', requireAuth, requireExamAccess, requireDobokuAccess, async (req, res) => {
+  try {
+    const role = req.examRole;
+    const { title, overview, theme, answer1, answer2, status, is_shared } = req.body || {};
+    const { data, error } = await supabase.from('doboku_user_records').insert({
+      staff_id: role.staffId, subject_id: DOBOKU_SUBJECT_ID,
+      title: title || null, overview: overview || {}, theme: theme || null,
+      answer1: answer1 || null, answer2: answer2 || null,
+      status: status === 'done' ? 'done' : 'draft',
+      is_shared: is_shared === false ? false : true,
+    }).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── 経験記述ドラフト: 更新（本人のみ）───────────────────────────
+app.put('/api/doboku/records/:id', requireAuth, requireExamAccess, requireDobokuAccess, async (req, res) => {
+  try {
+    const role = req.examRole;
+    const { data: cur } = await supabase.from('doboku_user_records').select('staff_id').eq('id', req.params.id).maybeSingle();
+    if (!cur) return res.status(404).json({ error: 'ドラフトが見つかりません' });
+    if (cur.staff_id !== role.staffId) return res.status(403).json({ error: '自分のドラフトのみ編集できます' });
+    const { title, overview, theme, answer1, answer2, status, is_shared } = req.body || {};
+    const patch = { updated_at: new Date().toISOString() };
+    if (title !== undefined) patch.title = title;
+    if (overview !== undefined) patch.overview = overview;
+    if (theme !== undefined) patch.theme = theme;
+    if (answer1 !== undefined) patch.answer1 = answer1;
+    if (answer2 !== undefined) patch.answer2 = answer2;
+    if (status !== undefined) patch.status = status === 'done' ? 'done' : 'draft';
+    if (is_shared !== undefined) patch.is_shared = !!is_shared;
+    const { data, error } = await supabase.from('doboku_user_records').update(patch).eq('id', req.params.id).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── 経験記述ドラフト: 削除（本人のみ）───────────────────────────
+app.delete('/api/doboku/records/:id', requireAuth, requireExamAccess, requireDobokuAccess, async (req, res) => {
+  try {
+    const role = req.examRole;
+    const { data: cur } = await supabase.from('doboku_user_records').select('staff_id').eq('id', req.params.id).maybeSingle();
+    if (!cur) return res.status(404).json({ error: 'ドラフトが見つかりません' });
+    if (cur.staff_id !== role.staffId) return res.status(403).json({ error: '自分のドラフトのみ削除できます' });
+    const { error } = await supabase.from('doboku_user_records').delete().eq('id', req.params.id);
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── 経験記述ドラフト: AI添削（本人のみ）─────────────────────────
+app.post('/api/doboku/records/:id/review', requireAuth, requireExamAccess, requireDobokuAccess, async (req, res) => {
+  try {
+    const role = req.examRole;
+    const { data: rec } = await supabase.from('doboku_user_records').select('*').eq('id', req.params.id).maybeSingle();
+    if (!rec) return res.status(404).json({ error: 'ドラフトが見つかりません' });
+    if (rec.staff_id !== role.staffId) return res.status(403).json({ error: '自分のドラフトのみ添削できます' });
+    const review = await reviewExperienceRecord(rec);
+    const { data, error } = await supabase.from('doboku_ai_reviews').insert({
+      record_id: rec.id, staff_id: role.staffId,
+      score: review.score, summary: review.summary,
+      good_points: review.good_points, improvements: review.improvements,
+      revised_example: review.revised_example, model: GEMINI_MODEL,
+    }).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (e) { res.status(e.status || 500).json({ error: e.message }); }
+});
+
+// ── 経験記述ドラフト: 添削履歴（本人のみ）──────────────────────
+app.get('/api/doboku/records/:id/reviews', requireAuth, requireExamAccess, requireDobokuAccess, async (req, res) => {
+  try {
+    const role = req.examRole;
+    const { data: rec } = await supabase.from('doboku_user_records').select('staff_id').eq('id', req.params.id).maybeSingle();
+    if (!rec) return res.status(404).json({ error: 'ドラフトが見つかりません' });
+    if (rec.staff_id !== role.staffId) return res.status(403).json({ error: '自分のドラフトのみ閲覧できます' });
+    const { data } = await supabase.from('doboku_ai_reviews').select('*').eq('record_id', req.params.id).order('created_at', { ascending: false });
+    res.json(data || []);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.listen(PORT, () => {
   console.log(`✅ Portal API running on http://localhost:${PORT}`);
 });
