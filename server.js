@@ -10499,7 +10499,7 @@ app.get('/api/exam/subjects/:sid/analytics', requireAuth, requireExamAccess, asy
     const byChapter = (chaps || []).map(c => {
       const o = byChapAgg[c.id] || { answered: 0, correct: 0 };
       return {
-        chapter_no: c.chapter_no, title: c.title, answered: o.answered, correct: o.correct,
+        id: c.id, chapter_no: c.chapter_no, title: c.title, answered: o.answered, correct: o.correct,
         rate: o.answered ? Math.round(o.correct / o.answered * 100) : null,
       };
     });
@@ -10529,6 +10529,37 @@ app.get('/api/exam/subjects/:sid/analytics', requireAuth, requireExamAccess, asy
     }
 
     res.json({ summary, daily, byChapter, weak });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// 章の「回(セッション)ごと」正答率推移。
+//   間違いだけを100%になるまで繰り返す学習を、回ごとに分けて推移表示するための履歴。
+//   回の区切り = 前の回答から30分以上空いた / 同じ問題が再登場した(=次の周回に入った)。
+app.get('/api/exam/subjects/:sid/chapters/:cid/history', requireAuth, requireExamAccess, async (req, res) => {
+  try {
+    const role = req.examRole; const sid = req.params.sid; const cid = req.params.cid;
+    if (!(await canAccessSubject(role, sid))) return res.status(403).json({ error: 'この科目のアクセス権がありません' });
+    if (!role.staffId) return res.json({ sessions: [] });
+
+    const logs = await pagedSelect(() => supabase
+      .from('exam_answer_log').select('question_id,is_correct,answered_at')
+      .eq('staff_id', role.staffId).eq('subject_id', sid).eq('chapter_id', cid).order('answered_at'));
+
+    const GAP_MS = 30 * 60 * 1000;
+    const sessions = [];
+    let cur = null, seen = null, lastT = 0;
+    for (const l of logs) {
+      const t = new Date(l.answered_at).getTime();
+      const isNew = !cur || (t - lastT) > GAP_MS || seen.has(l.question_id);
+      if (isNew) { cur = { start: l.answered_at, count: 0, correct: 0 }; sessions.push(cur); seen = new Set(); }
+      cur.count++; if (l.is_correct) cur.correct++; seen.add(l.question_id);
+      lastT = t;
+    }
+    const out = sessions.map((s, i) => ({
+      round: i + 1, start: s.start, count: s.count, correct: s.correct,
+      rate: s.count ? Math.round(s.correct / s.count * 100) : 0,
+    }));
+    res.json({ sessions: out });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
