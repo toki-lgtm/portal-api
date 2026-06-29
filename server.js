@@ -11,7 +11,7 @@ import { PDFDocument } from 'pdf-lib';
 import JSZip from 'jszip';
 import sharp from 'sharp';
 import { parseEstimateFromXlsx } from './bidEstimate.js';
-import { parseBoqFromXlsx, CANONICAL_TRADES } from './boqParser.js';
+import { parseBoqFromXlsx, CANONICAL_TRADES, normalizeTrade } from './boqParser.js';
 import { driveUpload, driveDownload, driveThumbnail, driveTrash, driveConfigured, ensureFolderPath, driveListChildren } from './googleDrive.js';
 import { classifyQuote, classNoOf } from './classifyQuote.js';
 import { extractExcelQuote } from './quoteExcelExtract.js';
@@ -380,6 +380,7 @@ app.get('/api/apps', requireAuth, async (req, res) => {
       { id: 14, key: 'cards', name: '名刺管理', icon: '📇', internal: true, view: 'cards', description: '受け取った名刺をOCRで登録・全社で検索' },
       { id: 15, key: 'manual', name: '操作マニュアル', icon: '📖', internal: true, view: 'manual', description: 'ポータルと各アプリの使い方ガイド' },
       { id: 16, key: 'quote_compare', name: '見積比較', icon: '💰', internal: true, view: 'quote-compare', description: '相見積の単価を横並び比較し最安見積を作成（築城方式）' },
+      { id: 17, key: 'exam-prep', name: '資格学習', icon: '🎓', internal: true, view: 'exam', description: '資格試験の問題演習（4択・記述）。章別に出題し即採点・弱点復習' },
       // 【凍結 2026-06-17】法令集はメニューから除外（機能・API・データは残置、復活時はこの行を戻す）
       // { id: 13, key: 'regulations', name: '法令集', icon: '📚', internal: true, view: 'regulations', description: '建設・不動産・林業・労務・会社経営の法令を条文単位で検索・閲覧' },
     ];
@@ -5847,6 +5848,278 @@ app.delete('/api/construction/design-change-files/:fileId', requireAuth, require
 });
 
 // ============================================================
+// 工事管理 - 工事写真管理（撮るべき写真ツリー × 実写真）
+//   写真ツリー = 数量書(present工種) × 撮影対象表マスタ(photo_spec_master)から生成。
+//   実写真の本体は共有ドライブ（書類添付と同じ drive: 参照方式・署名URLを再利用）。
+//   テーブルは 037_construction_photos.sql / マスタ seed は 038。
+// ============================================================
+
+// 写真ファイルを保存し参照文字列(drive:<id> もしくはバケットパス)を返す。
+//   保存先: （共有ドライブ）/05.工事管理/<工事名>/07_工事写真/<工種>/
+async function storeConstructionPhoto({ projectName, trade, fileName, buffer, mimeType }) {
+  if (driveConfigured()) {
+    const folderId = await ensureFolderPath([
+      '05.工事管理',
+      sanitizeDriveSeg(projectName),
+      '07_工事写真',
+      sanitizeDriveSeg(trade || 'その他'),
+    ], SHARED_DRIVE_ROOT_ID);
+    const fileId = await driveUpload({ name: fileName, buffer, mimeType, folderId });
+    return `drive:${fileId}`;
+  }
+  await ensureConstructionBucket();
+  const path = `photos/${Date.now()}-${uuidv4()}-${sanitizeDriveSeg(fileName)}`;
+  const { error } = await supabase.storage.from(CONSTRUCTION_BUCKET).upload(path, buffer, { contentType: mimeType });
+  if (error) throw error;
+  return path;
+}
+
+// プロジェクトの present 工種（当初版・数量書由来）を取得。
+//   (a) construction_trade_summary（工種別集計。発注者数量書のように工種で階層化された様式）
+//   (b) フォールバック: construction_boq 明細の品名から normalizeTrade で推定
+//       （中原建設の内訳明細書のように、階層名に工種が出ず明細名に工種が現れる様式に対応）
+//   両者の和集合を返すことで、様式に依らず撮影ツリーを工種で生成できる。
+async function constructionPresentTrades(projectId) {
+  const set = new Set();
+  const { data: sum } = await supabase
+    .from('construction_trade_summary').select('trade, canonical, present')
+    .eq('project_id', projectId).is('change_id', null).eq('present', true);
+  for (const r of (sum || [])) {
+    const t = r.canonical || r.trade;
+    if (t && CANONICAL_TRADES.includes(String(t).trim())) set.add(String(t).trim());
+  }
+  const { data: boq } = await supabase
+    .from('construction_boq').select('item_name').eq('project_id', projectId).is('change_id', null);
+  for (const row of (boq || [])) {
+    const t = normalizeTrade(row.item_name);
+    if (t) set.add(t);
+  }
+  return set;
+}
+
+// ✅ 工事写真 - 撮るべき写真ツリーの一覧（ノード＋撮影済み枚数）
+app.get('/api/construction/projects/:id/photo-nodes', requireAuth, requireConstructionAccess, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { data: nodes, error } = await supabase
+      .from('construction_photo_nodes').select('*')
+      .eq('project_id', id)
+      .order('trade', { ascending: true }).order('sort_order', { ascending: true });
+    if (error) throw error;
+    // 写真枚数を集計
+    const { data: photos } = await supabase
+      .from('construction_photos').select('id, node_id').eq('project_id', id);
+    const cnt = new Map();
+    for (const p of (photos || [])) {
+      if (p.node_id != null) cnt.set(p.node_id, (cnt.get(p.node_id) || 0) + 1);
+    }
+    const present = Array.from(await constructionPresentTrades(id));
+    const out = (nodes || []).map((n) => ({ ...n, photo_count: cnt.get(n.id) || 0 }));
+    res.json({ nodes: out, generated: out.length > 0, present_trades: present });
+  } catch (error) {
+    console.error('Error (photo-nodes list):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 工事写真 - ツリー生成/再生成（マスタ × present工種。既存ノードは温存=冪等）
+app.post('/api/construction/projects/:id/photo-nodes/generate', requireAuth, requireConstructionAccess, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { data: project, error: pErr } = await supabase
+      .from('construction_projects').select('id, project_name').eq('id', id).eq('is_active', true).maybeSingle();
+    if (pErr) throw pErr;
+    if (!project) return res.status(404).json({ error: '工事が見つかりません' });
+
+    // 対象 edition（任意指定。未指定=建築＋改修＋電気＋機械＋解体すべて）
+    const editions = Array.isArray(req.body?.editions) && req.body.editions.length
+      ? req.body.editions : null;
+
+    const present = await constructionPresentTrades(id);
+    // '共通'(常時対象) ＋ present 工種に該当するマスタ行を採用
+    let q = supabase.from('photo_spec_master').select('*');
+    if (editions) q = q.in('edition', editions);
+    const { data: master, error: mErr } = await q.order('sort_order', { ascending: true });
+    if (mErr) throw mErr;
+    const picked = (master || []).filter((m) => m.trade === '共通' || present.has(m.trade));
+
+    // 既存ノード(master_id)を取得して重複生成を避ける（冪等）
+    const { data: existing } = await supabase
+      .from('construction_photo_nodes').select('master_id').eq('project_id', id).not('master_id', 'is', null);
+    const have = new Set((existing || []).map((e) => e.master_id));
+
+    const rows = picked.filter((m) => !have.has(m.id)).map((m) => ({
+      project_id: Number(id), master_id: m.id, edition: m.edition, trade: m.trade,
+      category: m.category, photo_item: m.photo_item, target: m.target, timing: m.timing,
+      source: 'auto', required: true, is_active: true, sort_order: m.sort_order,
+      created_by: req.user.email,
+    }));
+    let inserted = 0;
+    for (let i = 0; i < rows.length; i += 200) {
+      const { error } = await supabase.from('construction_photo_nodes').insert(rows.slice(i, i + 200));
+      if (error) throw error;
+      inserted += rows.slice(i, i + 200).length;
+    }
+    res.json({ ok: true, inserted, candidates: picked.length, present_trades: Array.from(present) });
+  } catch (error) {
+    console.error('Error (photo-nodes generate):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 工事写真 - ノードを手動追加（マスタに無い撮影対象）
+app.post('/api/construction/projects/:id/photo-nodes', requireAuth, requireConstructionAccess, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const b = req.body || {};
+    if (!b.target) return res.status(400).json({ error: '撮影対象(target)は必須です' });
+    if (!b.category) return res.status(400).json({ error: '工種種目又は分類(category)は必須です' });
+    const { data, error } = await supabase.from('construction_photo_nodes').insert([{
+      project_id: Number(id), master_id: null, edition: b.edition || null, trade: b.trade || null,
+      category: b.category, photo_item: b.photo_item || null, target: b.target, timing: b.timing || null,
+      source: 'manual', required: b.required !== false, is_active: true,
+      sort_order: b.sort_order ?? 9999, note: b.note || null, created_by: req.user.email,
+    }]).select('*').single();
+    if (error) throw error;
+    res.json({ ...data, photo_count: 0 });
+  } catch (error) {
+    console.error('Error (photo-node add):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 工事写真 - ノード編集（必須/対象外/メモ/文言 等）
+app.patch('/api/construction/photo-nodes/:nodeId', requireAuth, requireConstructionAccess, async (req, res) => {
+  try {
+    const { nodeId } = req.params;
+    const b = req.body || {};
+    const patch = { updated_at: new Date().toISOString() };
+    for (const k of ['category', 'photo_item', 'target', 'timing', 'trade', 'note', 'sort_order']) {
+      if (b[k] !== undefined) patch[k] = b[k];
+    }
+    if (b.required !== undefined) patch.required = !!b.required;
+    if (b.is_active !== undefined) patch.is_active = !!b.is_active;
+    const { data, error } = await supabase
+      .from('construction_photo_nodes').update(patch).eq('id', nodeId).select('*').single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (photo-node patch):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 工事写真 - ノード削除（写真は file_ref を残して node_id を外す=ON DELETE SET NULL）
+app.delete('/api/construction/photo-nodes/:nodeId', requireAuth, requireConstructionAccess, async (req, res) => {
+  try {
+    const { nodeId } = req.params;
+    const { error } = await supabase.from('construction_photo_nodes').delete().eq('id', nodeId);
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error (photo-node delete):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 工事写真 - 写真アップロード（共有ドライブ。node_id 任意）
+app.post('/api/construction/projects/:id/photos', requireAuth, requireConstructionAccess, upload.single('photo'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!req.file) return res.status(400).json({ error: 'photo フィールド（画像）が必要です' });
+    const { data: project } = await supabase
+      .from('construction_projects').select('project_name').eq('id', id).maybeSingle();
+    const b = req.body || {};
+    // node の工種でフォルダ分け（node_id があれば参照）
+    let trade = b.trade || null;
+    if (!trade && b.node_id) {
+      const { data: node } = await supabase
+        .from('construction_photo_nodes').select('trade').eq('id', b.node_id).maybeSingle();
+      trade = node?.trade || null;
+    }
+    const fileName = decodeUploadName(req.file.originalname);
+    const ref = await storeConstructionPhoto({
+      projectName: project?.project_name || `project-${id}`,
+      trade, fileName, buffer: req.file.buffer, mimeType: req.file.mimetype,
+    });
+    let blackboard = null;
+    if (b.blackboard) { try { blackboard = typeof b.blackboard === 'string' ? JSON.parse(b.blackboard) : b.blackboard; } catch { /* noop */ } }
+    const { data, error } = await supabase.from('construction_photos').insert([{
+      node_id: b.node_id ? Number(b.node_id) : null, project_id: Number(id), file_ref: ref,
+      file_name: fileName, mime_type: req.file.mimetype, size_bytes: req.file.size,
+      taken_at: b.taken_at || null, location: b.location || null, caption: b.caption || null,
+      blackboard, uploaded_by: req.user.email,
+    }]).select('*').single();
+    if (error) throw error;
+    const url = await constructionFileSignedUrl(data.file_ref);
+    res.json({ ...data, url });
+  } catch (error) {
+    console.error('Error (construction photo upload):', error.message);
+    res.status(error.status || 500).json({ error: error.message });
+  }
+});
+
+// ✅ 工事写真 - 写真一覧（node_id 指定=そのノード / 未指定=工事全体。署名付きURL）
+app.get('/api/construction/projects/:id/photos', requireAuth, requireConstructionAccess, async (req, res) => {
+  try {
+    const { id } = req.params;
+    let q = supabase.from('construction_photos').select('*').eq('project_id', id);
+    if (req.query.node_id) q = q.eq('node_id', req.query.node_id);
+    const { data, error } = await q.order('created_at', { ascending: false });
+    if (error) throw error;
+    const withUrls = await Promise.all((data || []).map(async (p) => ({
+      ...p, url: await constructionFileSignedUrl(p.file_ref),
+    })));
+    res.json(withUrls);
+  } catch (error) {
+    console.error('Error (construction photos list):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 工事写真 - 写真のメタ編集（撮影日/箇所/コメント/小黒板/ノード付替え）
+app.patch('/api/construction/photos/:photoId', requireAuth, requireConstructionAccess, async (req, res) => {
+  try {
+    const { photoId } = req.params;
+    const b = req.body || {};
+    const patch = {};
+    for (const k of ['taken_at', 'location', 'caption']) if (b[k] !== undefined) patch[k] = b[k];
+    if (b.node_id !== undefined) patch.node_id = b.node_id ? Number(b.node_id) : null;
+    if (b.blackboard !== undefined) {
+      try { patch.blackboard = typeof b.blackboard === 'string' ? JSON.parse(b.blackboard) : b.blackboard; } catch { /* noop */ }
+    }
+    const { data, error } = await supabase
+      .from('construction_photos').update(patch).eq('id', photoId).select('*').single();
+    if (error) throw error;
+    res.json({ ...data, url: await constructionFileSignedUrl(data.file_ref) });
+  } catch (error) {
+    console.error('Error (construction photo patch):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 工事写真 - 写真削除（Drive はゴミ箱へ）
+app.delete('/api/construction/photos/:photoId', requireAuth, requireConstructionAccess, async (req, res) => {
+  try {
+    const { photoId } = req.params;
+    const { data: p, error: pErr } = await supabase
+      .from('construction_photos').select('*').eq('id', photoId).maybeSingle();
+    if (pErr) throw pErr;
+    if (!p) return res.status(404).json({ error: '写真が見つかりません' });
+    if (String(p.file_ref).startsWith('drive:')) {
+      try { await driveTrash(String(p.file_ref).slice('drive:'.length)); } catch (e) { console.error('drive trash:', e.message); }
+    } else {
+      try { await supabase.storage.from(CONSTRUCTION_BUCKET).remove([p.file_ref]); } catch { /* noop */ }
+    }
+    await supabase.from('construction_photos').delete().eq('id', photoId);
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error (construction photo delete):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================================
 // 工事管理 - 書類のAI解析（Gemini）: 自動振り分け & 工事情報の自動抽出
 //   既存の入札資料AI抽出（extractBidInfo）と同じ Gemini 連携方式を踏襲。
 //   - classifyConstructionDoc : 1ファイルの内容＋ファイル名から「必要書類マスタ」のどれかを判定
@@ -9999,6 +10272,293 @@ app.delete('/api/cards/:id', requireAuth, requireCardAccess, async (req, res) =>
     console.error('Error (cards delete):', error.message);
     res.status(500).json({ error: error.message });
   }
+});
+
+// ============================================================
+// 資格学習（問題演習）アプリ  /api/exam/*
+//   2層権限: staff_app_permissions['exam-prep']（アプリ利用）＋ exam_subject_access（科目別）
+//   グローバル管理者は全科目アクセス可。
+// ============================================================
+const EXAM_IMG_BASE = `${process.env.SUPABASE_URL}/storage/v1/object/public/exam-images/`;
+function examImageUrl(p) { return p ? EXAM_IMG_BASE + p : null; }
+
+// 配列を破壊的にシャッフル（Fisher-Yates）
+function shuffle(arr) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+
+// Supabase の既定1000行上限を超えて全件取得する（range でページング）。
+// buildQuery は毎回新しいクエリビルダを返すこと（安定のため .order を含める）。
+async function pagedSelect(buildQuery) {
+  const out = []; const size = 1000; let from = 0;
+  for (;;) {
+    const { data, error } = await buildQuery().range(from, from + size - 1);
+    if (error) throw error;
+    out.push(...(data || []));
+    if (!data || data.length < size) break;
+    from += size;
+  }
+  return out;
+}
+
+// 記述式の表記揺れ吸収（NFKC・空白/中黒/括弧/記号除去・小文字化）
+function normalizeWritten(s) {
+  return String(s || '')
+    .normalize('NFKC')
+    .toLowerCase()
+    .replace(/[\s　・･,，、。.（）()「」『』〈〉【】\-ー―‐]/g, '')
+    .trim();
+}
+
+async function resolveExamRole(email) {
+  const perms = await resolvePermissions(email); // { role, staffId }
+  if (perms.role === 'admin') return { role: 'admin', staffId: perms.staffId, globalAdmin: true };
+  let level = null;
+  if (perms.staffId) {
+    const { data } = await supabase
+      .from('staff_app_permissions')
+      .select('access_level')
+      .eq('staff_id', perms.staffId)
+      .eq('app_key', 'exam-prep')
+      .maybeSingle();
+    level = data?.access_level || null;
+  }
+  const role = level === 'admin' ? 'admin' : level ? 'member' : 'none';
+  return { role, staffId: perms.staffId, globalAdmin: false };
+}
+
+async function requireExamAccess(req, res, next) {
+  try {
+    const r = await resolveExamRole(req.user.email);
+    if (r.role === 'none') return res.status(403).json({ error: '資格学習へのアクセス権がありません' });
+    req.examRole = r;
+    next();
+  } catch (e) { res.status(500).json({ error: e.message }); }
+}
+
+// 指定科目にアクセスできるか（グローバル管理者 or exam_subject_access に行あり）
+async function canAccessSubject(examRole, subjectId) {
+  if (examRole.globalAdmin) return true;
+  if (!examRole.staffId) return false;
+  const { data } = await supabase
+    .from('exam_subject_access')
+    .select('id')
+    .eq('staff_id', examRole.staffId)
+    .eq('subject_id', subjectId)
+    .maybeSingle();
+  return !!data;
+}
+
+// 進捗集計を (chapter_id -> {answered, correct}) と全体に畳む
+function foldProgress(rows) {
+  const byChap = {}; let answered = 0, correct = 0;
+  for (const p of rows || []) {
+    answered++; if (p.last_correct) correct++;
+    const c = byChap[p.chapter_id] || (byChap[p.chapter_id] = { answered: 0, correct: 0 });
+    c.answered++; if (p.last_correct) c.correct++;
+  }
+  return { byChap, total: { answered, correct } };
+}
+
+// 科目一覧（アクセス可能なもの＋自分の正答率）
+app.get('/api/exam/subjects', requireAuth, requireExamAccess, async (req, res) => {
+  try {
+    const role = req.examRole;
+    const { data: subs } = await supabase
+      .from('exam_subjects').select('*').eq('is_active', true).order('sort_order');
+    let allowed = subs || [];
+    if (!role.globalAdmin) {
+      const { data: acc } = await supabase
+        .from('exam_subject_access').select('subject_id').eq('staff_id', role.staffId);
+      const ids = new Set((acc || []).map(a => a.subject_id));
+      allowed = allowed.filter(s => ids.has(s.id));
+    }
+    // 各科目の設問数と自分の進捗
+    const out = [];
+    for (const s of allowed) {
+      const { count: qCount } = await supabase
+        .from('exam_questions').select('id', { count: 'exact', head: true }).eq('subject_id', s.id);
+      let answered = 0, correct = 0;
+      if (role.staffId) {
+        const prog = await pagedSelect(() => supabase
+          .from('exam_progress').select('last_correct').eq('staff_id', role.staffId).eq('subject_id', s.id).order('id'));
+        answered = prog.length;
+        correct = prog.filter(p => p.last_correct).length;
+      }
+      out.push({ ...s, question_count: qCount || 0, answered, correct });
+    }
+    res.json(out);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// 章一覧（設問数・自分の章別進捗）＋ 科目全体の正答率
+app.get('/api/exam/subjects/:sid/chapters', requireAuth, requireExamAccess, async (req, res) => {
+  try {
+    const role = req.examRole; const sid = req.params.sid;
+    if (!(await canAccessSubject(role, sid))) return res.status(403).json({ error: 'この科目のアクセス権がありません' });
+    const { data: chaps } = await supabase
+      .from('exam_chapters').select('*').eq('subject_id', sid).order('chapter_no');
+    // 章ごとの設問数（1000行上限を超えるためページング）
+    const qrows = await pagedSelect(() => supabase
+      .from('exam_questions').select('chapter_id').eq('subject_id', sid).order('id'));
+    const qCountByChap = {};
+    for (const q of qrows) qCountByChap[q.chapter_id] = (qCountByChap[q.chapter_id] || 0) + 1;
+    // 進捗
+    let fold = { byChap: {}, total: { answered: 0, correct: 0 } };
+    if (role.staffId) {
+      const prog = await pagedSelect(() => supabase
+        .from('exam_progress').select('chapter_id,last_correct').eq('staff_id', role.staffId).eq('subject_id', sid).order('id'));
+      fold = foldProgress(prog);
+    }
+    const chapters = (chaps || []).map(c => {
+      const total = qCountByChap[c.id] || 0;
+      const pc = fold.byChap[c.id] || { answered: 0, correct: 0 };
+      return {
+        id: c.id, chapter_no: c.chapter_no, title: c.title,
+        total, answered: pc.answered, correct: pc.correct,
+        unanswered: Math.max(0, total - pc.answered),
+        correct_rate: pc.answered ? Math.round((pc.correct / pc.answered) * 100) : null,
+      };
+    });
+    const t = fold.total;
+    const totalQ = qrows.length;
+    res.json({
+      subject_id: sid, chapters,
+      overall: {
+        total: totalQ, answered: t.answered, correct: t.correct,
+        unanswered: Math.max(0, totalQ - t.answered),
+        correct_rate: t.answered ? Math.round((t.correct / t.answered) * 100) : null,
+      },
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// 演習セッションの問題リストを返す
+//   body: { subject_id, chapter_ids:[...], mode:'continue'|'wrong'|'weak', limit? }
+app.post('/api/exam/session', requireAuth, requireExamAccess, async (req, res) => {
+  try {
+    const role = req.examRole;
+    const { subject_id, chapter_ids, mode = 'continue', limit = 300 } = req.body || {};
+    if (!subject_id || !Array.isArray(chapter_ids) || chapter_ids.length === 0)
+      return res.status(400).json({ error: 'subject_id と chapter_ids が必要です' });
+    if (!(await canAccessSubject(role, subject_id))) return res.status(403).json({ error: 'この科目のアクセス権がありません' });
+
+    // 対象章の全設問（1000行上限を超えるためページング）
+    const qs = await pagedSelect(() => supabase
+      .from('exam_questions').select('*').eq('subject_id', subject_id).in('chapter_id', chapter_ids).order('id'));
+    const qById = {}; for (const q of qs) qById[q.id] = q;
+    // 自分の進捗
+    const prog = await pagedSelect(() => supabase
+      .from('exam_progress').select('*').eq('staff_id', role.staffId).in('chapter_id', chapter_ids).order('id'));
+    const progByQ = {}; for (const p of prog) progByQ[p.question_id] = p;
+
+    let pickIds = [];
+    if (mode === 'wrong') {
+      pickIds = (prog || []).filter(p => p.last_correct === false).map(p => p.question_id);
+      shuffle(pickIds);
+    } else if (mode === 'weak') {
+      const scored = (prog || []).filter(p => p.attempts > 0)
+        .map(p => ({ id: p.question_id, err: (p.attempts - p.correct_count) / p.attempts, last: p.last_answered }))
+        .filter(x => x.err > 0);
+      scored.sort((a, b) => b.err - a.err || String(a.last || '').localeCompare(String(b.last || '')));
+      pickIds = scored.map(x => x.id);
+    } else { // continue: 未回答をランダム
+      pickIds = (qs || []).filter(q => !progByQ[q.id]).map(q => q.id);
+      shuffle(pickIds);
+    }
+    pickIds = pickIds.slice(0, limit);
+    const questions = pickIds.map(id => qById[id]).filter(Boolean).map(q => ({
+      id: q.id, chapter_id: q.chapter_id, q_no: q.q_no, q_type: q.q_type, is_hard: q.is_hard,
+      stem: q.stem, choices: q.choices || [], answer_no: q.answer_no, answer_text: q.answer_text,
+      explanation: q.explanation, explanation_note: q.explanation_note, image_url: examImageUrl(q.image_path),
+    }));
+    res.json({ mode, count: questions.length, questions });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// 1問の回答を記録（サーバ側で採点）。
+//   body(4択): { question_id, chosen_no }   body(記述): { question_id, typed }
+app.post('/api/exam/answer', requireAuth, requireExamAccess, async (req, res) => {
+  try {
+    const role = req.examRole;
+    const { question_id, chosen_no, typed } = req.body || {};
+    if (!question_id) return res.status(400).json({ error: 'question_id が必要です' });
+    const { data: q } = await supabase.from('exam_questions').select('*').eq('id', question_id).maybeSingle();
+    if (!q) return res.status(404).json({ error: '設問が見つかりません' });
+    if (!(await canAccessSubject(role, q.subject_id))) return res.status(403).json({ error: 'アクセス権がありません' });
+
+    let isCorrect = false; let chosen = null;
+    if (q.q_type === 'written') {
+      const want = [q.answer_text, ...(q.answer_alts || [])].map(normalizeWritten).filter(Boolean);
+      isCorrect = want.includes(normalizeWritten(typed));
+    } else {
+      chosen = Number(chosen_no);
+      isCorrect = chosen === q.answer_no;
+    }
+
+    // 履歴（追記）
+    await supabase.from('exam_answer_log').insert({
+      staff_id: role.staffId, question_id: q.id, subject_id: q.subject_id, chapter_id: q.chapter_id,
+      is_correct: isCorrect, chosen_no: chosen,
+    });
+    // 集計（upsert）
+    const { data: cur } = await supabase.from('exam_progress')
+      .select('attempts,correct_count').eq('staff_id', role.staffId).eq('question_id', q.id).maybeSingle();
+    const attempts = (cur?.attempts || 0) + 1;
+    const correct_count = (cur?.correct_count || 0) + (isCorrect ? 1 : 0);
+    await supabase.from('exam_progress').upsert({
+      staff_id: role.staffId, question_id: q.id, subject_id: q.subject_id, chapter_id: q.chapter_id,
+      last_correct: isCorrect, attempts, correct_count, last_answered: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    }, { onConflict: 'staff_id,question_id' });
+
+    res.json({
+      is_correct: isCorrect, answer_no: q.answer_no, answer_text: q.answer_text,
+      explanation: q.explanation, explanation_note: q.explanation_note,
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// 補足解説の追記（管理者）
+app.patch('/api/exam/questions/:id/note', requireAuth, requireExamAccess, async (req, res) => {
+  try {
+    if (req.examRole.role !== 'admin') return res.status(403).json({ error: '管理者のみ可能です' });
+    const { error } = await supabase.from('exam_questions')
+      .update({ explanation_note: req.body?.note ?? null, updated_at: new Date().toISOString() })
+      .eq('id', req.params.id);
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── 管理: 科目別アクセス権の付与/剥奪 ───────────────────────────
+// 一覧: 科目 × 付与済み社員
+app.get('/api/exam/admin/access', requireAuth, requireExamAccess, async (req, res) => {
+  try {
+    if (req.examRole.role !== 'admin') return res.status(403).json({ error: '管理者のみ可能です' });
+    const { data: subs } = await supabase.from('exam_subjects').select('id,name').order('sort_order');
+    const { data: acc } = await supabase.from('exam_subject_access').select('staff_id,subject_id');
+    res.json({ subjects: subs || [], access: acc || [] });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+// 付与/剥奪: { staff_id, subject_id, grant:true|false }
+app.post('/api/exam/admin/access', requireAuth, requireExamAccess, async (req, res) => {
+  try {
+    if (req.examRole.role !== 'admin') return res.status(403).json({ error: '管理者のみ可能です' });
+    const { staff_id, subject_id, grant } = req.body || {};
+    if (!staff_id || !subject_id) return res.status(400).json({ error: 'staff_id と subject_id が必要です' });
+    if (grant) {
+      await supabase.from('exam_subject_access').upsert(
+        { staff_id, subject_id }, { onConflict: 'staff_id,subject_id' });
+    } else {
+      await supabase.from('exam_subject_access').delete().eq('staff_id', staff_id).eq('subject_id', subject_id);
+    }
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.listen(PORT, () => {
