@@ -10534,7 +10534,8 @@ app.get('/api/exam/subjects/:sid/analytics', requireAuth, requireExamAccess, asy
 
 // 章の「回(セッション)ごと」正答率推移。
 //   間違いだけを100%になるまで繰り返す学習を、回ごとに分けて推移表示するための履歴。
-//   回の区切り = 前の回答から30分以上空いた / 同じ問題が再登場した(=次の周回に入った)。
+//   回の区切り = 同じ問題が再登場した時点(=出題されたものを一通り答え終え、次のセットに入った)。
+//   1セット内は各問1回ずつなので、再登場が「1セット完了→次の回」の境目になる。
 app.get('/api/exam/subjects/:sid/chapters/:cid/history', requireAuth, requireExamAccess, async (req, res) => {
   try {
     const role = req.examRole; const sid = req.params.sid; const cid = req.params.cid;
@@ -10545,15 +10546,12 @@ app.get('/api/exam/subjects/:sid/chapters/:cid/history', requireAuth, requireExa
       .from('exam_answer_log').select('question_id,is_correct,answered_at')
       .eq('staff_id', role.staffId).eq('subject_id', sid).eq('chapter_id', cid).order('answered_at'));
 
-    const GAP_MS = 30 * 60 * 1000;
     const sessions = [];
-    let cur = null, seen = null, lastT = 0;
+    let cur = null, seen = null;
     for (const l of logs) {
-      const t = new Date(l.answered_at).getTime();
-      const isNew = !cur || (t - lastT) > GAP_MS || seen.has(l.question_id);
+      const isNew = !cur || seen.has(l.question_id);
       if (isNew) { cur = { start: l.answered_at, count: 0, correct: 0 }; sessions.push(cur); seen = new Set(); }
       cur.count++; if (l.is_correct) cur.correct++; seen.add(l.question_id);
-      lastT = t;
     }
     const out = sessions.map((s, i) => ({
       round: i + 1, start: s.start, count: s.count, correct: s.correct,
