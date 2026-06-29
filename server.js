@@ -10696,6 +10696,20 @@ const DOBOKU_SUBJECT_ID = 'doboku-1-2ji';
 const DOBOKU_IMG_BASE = `${process.env.SUPABASE_URL}/storage/v1/object/public/doboku-images/`;
 function dobokuImageUrl(p) { return p ? DOBOKU_IMG_BASE + p : null; }
 
+// 通読本文(Markdown)を「読み物」として整える serve 時変換（DB原本は不変）。
+//  ① 本文中のインライン画像 ![..](figures/xxx.jpg) の相対パスを Storage の絶対URLへ
+//     → 図が本文の正しい位置に表示される。
+//  ② 図の説明引用ブロック（> 【図】… / > 図の内容:… ＝抽出時に付いたAIの冗長な代替テキスト）を除去
+//     → 画像自体が見えるので長い説明文は不要。本文が読みやすくなる。
+function transformDobokuBody(md) {
+  if (!md) return '';
+  return md
+    .replace(/!\[([^\]]*)\]\((figures\/[^)]+)\)/g, (_, alt, p) => `![${alt}](${dobokuImageUrl(p)})`)
+    .split('\n').filter((line) => !/^\s*>/.test(line)).join('\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
 // 第二次検定科目へのアクセスを保証するミドルウェア（exam の権限機構を流用）
 async function requireDobokuAccess(req, res, next) {
   try {
@@ -10813,7 +10827,7 @@ app.get('/api/doboku/sections', requireAuth, requireExamAccess, requireDobokuAcc
       if (!pt) { pt = byPart[s.part_no] = { part_no: s.part_no, part_name: s.part_name, sections: [] }; parts.push(pt); }
       pt.sections.push({
         id: s.id, chapter_no: s.chapter_no, chapter_title: s.chapter_title,
-        body_md: s.body_md, figures: figBySec[s.id] || [],
+        body_md: transformDobokuBody(s.body_md), figures: figBySec[s.id] || [],
       });
     }
     res.json({ subject_id: DOBOKU_SUBJECT_ID, parts });
