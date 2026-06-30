@@ -4727,6 +4727,8 @@ app.get('/api/construction/projects/:id', requireAuth, requireConstructionAccess
       .from('construction_projects').select('*').eq('id', id).eq('is_active', true).maybeSingle();
     if (error) throw error;
     if (!project) return res.status(404).json({ error: '工事が見つかりません' });
+    // 開いたとき自動棚卸し（24h毎）。失敗しても詳細取得は継続。実行した場合は下のクエリで最新が反映される。
+    try { await maybeAutoSweepInspection(project); } catch (e) { console.error('auto-sweep:', e.message); }
     const [{ data: docs }, { data: files }, { data: changes }, { data: changeFiles }, { data: inspItems }, nameMap] = await Promise.all([
       supabase.from('submission_documents').select('*')
         .eq('project_id', id)
@@ -5404,6 +5406,9 @@ app.post('/api/construction/projects/:id/inspection-sweep', requireAuth, require
   try {
     const { id } = req.params;
     const result = await aiSweepInspectionItems(Number(id));
+    // 自動棚卸し(24h)のタイマーもリセット
+    await supabase.from('construction_projects')
+      .update({ last_inspection_sweep_at: new Date().toISOString() }).eq('id', Number(id));
     res.json(result);
   } catch (error) {
     console.error('Error (inspection sweep):', error.message);
@@ -6451,6 +6456,26 @@ async function aiSweepInspectionItems(projectId) {
     if (!error) matched += 1;
   }
   return { matched, pending: pending.length };
+}
+
+// 「開いたとき自動棚卸し」: 前回から24h以上経っていれば棚卸しを実行（Render Cron 不要）。
+// 二重実行防止のため、先に最終実行時刻を条件付きUPDATEで奪取し、勝ったリクエストだけ実行する。
+async function maybeAutoSweepInspection(project) {
+  if (!GEMINI_API_KEY || !project?.id) return false;
+  const last = project.last_inspection_sweep_at;
+  if (last && (Date.now() - new Date(last).getTime()) < 24 * 3600 * 1000) return false;
+  const cutoffIso = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
+  const nowIso = new Date().toISOString();
+  // last_inspection_sweep_at が NULL もしくは 24h より古いときだけ更新（=実行権の奪取）
+  const { data: won } = await supabase
+    .from('construction_projects')
+    .update({ last_inspection_sweep_at: nowIso })
+    .eq('id', project.id)
+    .or(`last_inspection_sweep_at.is.null,last_inspection_sweep_at.lt.${cutoffIso}`)
+    .select('id');
+  if (!won || !won.length) return false; // 既に他リクエストが実行権を取得済み
+  await aiSweepInspectionItems(project.id);
+  return true;
 }
 
 // 工事情報の抽出対象を絞る（契約・設計図書系を優先。PDF/画像のみ・合計上限内で最大3件）
