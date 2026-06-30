@@ -5307,6 +5307,13 @@ app.patch('/api/construction/documents/:docId', requireAuth, requireConstruction
     const today = new Date().toISOString().slice(0, 10);
     if (payload.status === 'submitted' && !('submitted_at' in req.body)) payload.submitted_at = today;
     if (payload.status === 'approved' && !('approved_at' in req.body)) payload.approved_at = today;
+    // フォルダを変更したら、フォルダ名・大分類も合わせて整える（表示と保管庫の格納先を一致させる）
+    if (payload.folder_no != null && !('folder_name' in req.body)) {
+      const fName = consFolderName(Number(payload.folder_no));
+      payload.folder_name = fName;
+      payload.category_no = Number(payload.folder_no);
+      payload.category = fName;
+    }
     payload.updated_at = new Date().toISOString();
 
     const { data, error } = await supabase
@@ -6247,12 +6254,13 @@ const CONSTRUCTION_CATEGORY_NAMES = [
   { no: 7, name: '工事写真' }, { no: 8, name: '検査' }, { no: 9, name: '完成・引渡' },
 ];
 
-// 書類整理（保管庫）の分類 = 実フォルダ体系 00〜12。九州防衛局 建築工事の現場フォルダに準拠。
+// 書類整理（保管庫）の分類 = 実フォルダ体系 00〜14。九州防衛局 建築工事の現場フォルダに準拠（実ドライブを確認して整備）。
 const CONSTRUCTION_FOLDERS = [
   { no: 0, name: '入札時資料' }, { no: 1, name: '設計図書' }, { no: 2, name: '契約関係' },
   { no: 3, name: '工程表' }, { no: 4, name: '施主提出書類' }, { no: 5, name: '施工計画書' },
   { no: 6, name: '工事打合簿' }, { no: 7, name: '施工図・詳細図・完成図' }, { no: 8, name: '材料承認・数量' },
-  { no: 9, name: '施工体制' }, { no: 10, name: '工事写真' }, { no: 11, name: '協力会社見積' }, { no: 12, name: '打合議事録' },
+  { no: 9, name: '施工体制' }, { no: 10, name: '工事写真・工事記録・検査関係' }, { no: 11, name: '協力会社見積・作業指示書' },
+  { no: 12, name: '打合議事録' }, { no: 13, name: 'KY・新規・安全書類' }, { no: 14, name: '産廃関係' },
 ];
 function consFolderName(no) {
   const f = CONSTRUCTION_FOLDERS.find((x) => x.no === Number(no));
@@ -6291,7 +6299,7 @@ async function getActiveDocTemplates() {
   return data || [];
 }
 
-// 1ファイルの内容＋ファイル名から、書類整理フォルダ(00〜12)と書類名を判定。
+// 1ファイルの内容＋ファイル名から、書類整理フォルダ(00〜14)と書類名を判定。
 // 検査チェックリストへの紐づけはここでは行わない（別途の手動紐づけ＋日次AI棚卸しで反映）。
 async function classifyConstructionDoc({ fileName, buffer, mimeType }) {
   if (!GEMINI_API_KEY) return null;
@@ -6302,10 +6310,11 @@ async function classifyConstructionDoc({ fileName, buffer, mimeType }) {
     `フォルダ(folder_no): ${folders}`,
     '判定の目安: 入札時の資料=0 / 設計図・特記仕様=1 / 契約書・契約変更=2 / 工程表=3 / ',
     '発注者(局)への届出・提出物・各種報告=4 / 施工計画書=5 / 工事打合せ簿=6 / 施工図・詳細図・完成図=7 / ',
-    '材料承認願・出荷証明・数量=8 / 施工体制台帳・体系図=9 / 工事写真=10 / 協力会社の見積=11 / 会議議事録=12。',
+    '材料承認願・出荷証明・数量=8 / 施工体制台帳・体系図=9 / 工事写真・工事記録・検査関係=10 / 協力会社の見積・作業指示書=11 / ',
+    '会議議事録=12 / KY(危険予知)・新規入場者教育・安全書類=13 / 産業廃棄物(マニフェスト等)=14。',
     'どこにも当てはまらず判断に迷う場合は 2（契約関係）にせず、最も内容に近いものを選ぶこと。',
     '出力JSON:',
-    '- folder_no: 0〜12の整数',
+    '- folder_no: 0〜14の整数',
     '- doc_name: 内容に基づく簡潔な書類名（例: 契約書、総合施工計画書、配筋検査報告書）',
     '- confidence: 判定の確信度 0.0〜1.0',
     '- reason: 判定理由を簡潔に（20字程度）',
@@ -6343,7 +6352,7 @@ async function classifyConstructionDoc({ fileName, buffer, mimeType }) {
   if (!text) return null;
   let p; try { p = JSON.parse(text); } catch { return null; }
   let no = Number(p.folder_no);
-  if (!Number.isInteger(no) || no < 0 || no > 12) no = null;
+  if (!Number.isInteger(no) || no < 0 || no > 14) no = null;
   return {
     folder_no: no,
     doc_name: (p.doc_name || '').trim(),
@@ -6354,11 +6363,13 @@ async function classifyConstructionDoc({ fileName, buffer, mimeType }) {
 
 // 分類結果から、書類整理(保管庫)の格納先 submission_documents を解決（無ければ作成）。
 // 検査チェックリストへの紐づけはしない。同フォルダ・同名の書類があればまとめる。
-async function routeFileToDocument({ projectId, classification, email }) {
+async function routeFileToDocument({ projectId, classification, email, fileName }) {
   const cls = classification;
   const folderNo = (cls && cls.folder_no != null) ? cls.folder_no : 2; // 不明時は 02.契約関係
   const fName = consFolderName(folderNo);
-  const docName = (cls?.doc_name || '').trim() || '未分類資料';
+  // 書類名: AI判定があればそれを、無ければ実ファイル名（拡張子を除く）を書類タイトルとして採用。
+  const baseName = String(fileName || '').replace(/\.[^.\\/]+$/, '').trim();
+  const docName = (cls?.doc_name || '').trim() || baseName || '無題の資料';
   // 同フォルダ・同名の書類があればそこへまとめる
   const { data: existing } = await supabase
     .from('submission_documents').select('*')
@@ -6629,7 +6640,7 @@ async function carryOverBidDocuments({ project, bidId, email }) {
         try { classification = await classifyConstructionDoc({ fileName: item.originalname, buffer: item.buffer, mimeType: item.mimetype }); }
         catch (e) { console.error('carry classify:', e.message); }
       }
-      const doc = await routeFileToDocument({ projectId: project.id, classification, email });
+      const doc = await routeFileToDocument({ projectId: project.id, classification, email, fileName: item.originalname });
       const ref = await storeConstructionFile({
         projectName: updatedProject.project_name || project.project_name,
         categoryNo: doc.folder_no ?? doc.category_no, categoryName: doc.folder_name || doc.category,
@@ -6665,7 +6676,7 @@ app.post('/api/construction/projects/:id/documents/auto-file', requireAuth, requ
         classification = await classifyConstructionDoc({ fileName, buffer: req.file.buffer, mimeType: req.file.mimetype });
       } catch (e) { console.error('auto-file classify:', e.message); }
     }
-    const doc = await routeFileToDocument({ projectId: Number(id), classification, email: req.user.email });
+    const doc = await routeFileToDocument({ projectId: Number(id), classification, email: req.user.email, fileName });
     const ref = await storeConstructionFile({
       projectName: proj.project_name || `project-${id}`,
       categoryNo: doc.folder_no ?? doc.category_no, categoryName: doc.folder_name || doc.category,
