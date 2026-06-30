@@ -6367,14 +6367,10 @@ async function routeFileToDocument({ projectId, classification, email, fileName 
   const cls = classification;
   const folderNo = (cls && cls.folder_no != null) ? cls.folder_no : 2; // 不明時は 02.契約関係
   const fName = consFolderName(folderNo);
-  // 書類名: AI判定があればそれを、無ければ実ファイル名（拡張子を除く）を書類タイトルとして採用。
+  // 書類名は実ファイル名（拡張子を除く）を基本に採用。AI判定はフォルダ振り分けに使う。
   const baseName = String(fileName || '').replace(/\.[^.\\/]+$/, '').trim();
-  const docName = (cls?.doc_name || '').trim() || baseName || '無題の資料';
-  // 同フォルダ・同名の書類があればそこへまとめる
-  const { data: existing } = await supabase
-    .from('submission_documents').select('*')
-    .eq('project_id', projectId).eq('folder_no', folderNo).eq('doc_name', docName).maybeSingle();
-  if (existing) return existing;
+  const docName = baseName || (cls?.doc_name || '').trim() || '無題の資料';
+  // 1書類=1ファイルとする。既存書類へはまとめず、ファイルごとに新規の書類を作成。
   const { data: created, error } = await supabase.from('submission_documents').insert([{
     project_id: projectId, template_id: null,
     category_no: folderNo, category: fName, subcategory: null,
