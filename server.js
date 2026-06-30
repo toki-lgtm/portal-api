@@ -4579,12 +4579,15 @@ async function generateChecklist(project, email) {
     .map((t) => ({
       project_id: project.id,
       template_id: t.id,
-      category_no: t.category_no,
-      category: t.category,
+      // 保管庫フォルダはマスタの folder_no を採用（未設定の旧マスタは category_no で代替）。
+      category_no: t.folder_no ?? t.category_no,
+      category: t.folder_name || t.category,
       subcategory: t.subcategory,
       doc_name: t.doc_name,
       trade: t.trade,
       form_no: t.form_no,
+      folder_no: t.folder_no ?? null,
+      folder_name: t.folder_name || (t.folder_no != null ? consFolderName(t.folder_no) : null),
       status: 'not_started',
       due_date: computeDueDate(t.deadline_code, project),
       created_by: email,
@@ -6261,6 +6264,7 @@ const CONSTRUCTION_FOLDERS = [
   { no: 6, name: '工事打合簿' }, { no: 7, name: '施工図・詳細図・完成図' }, { no: 8, name: '材料承認・数量' },
   { no: 9, name: '施工体制' }, { no: 10, name: '工事写真・工事記録・検査関係' }, { no: 11, name: '協力会社見積・作業指示書' },
   { no: 12, name: '打合議事録' }, { no: 13, name: 'KY・新規・安全書類' }, { no: 14, name: '産廃関係' },
+  { no: 15, name: '入門・立入申請' },
 ];
 function consFolderName(no) {
   const f = CONSTRUCTION_FOLDERS.find((x) => x.no === Number(no));
@@ -6299,7 +6303,7 @@ async function getActiveDocTemplates() {
   return data || [];
 }
 
-// 1ファイルの内容＋ファイル名から、書類整理フォルダ(00〜14)と書類名を判定。
+// 1ファイルの内容＋ファイル名から、書類整理フォルダ(00〜15)と書類名を判定。
 // 検査チェックリストへの紐づけはここでは行わない（別途の手動紐づけ＋日次AI棚卸しで反映）。
 async function classifyConstructionDoc({ fileName, buffer, mimeType }) {
   if (!GEMINI_API_KEY) return null;
@@ -6310,11 +6314,13 @@ async function classifyConstructionDoc({ fileName, buffer, mimeType }) {
     `フォルダ(folder_no): ${folders}`,
     '判定の目安: 入札時の資料=0 / 設計図・特記仕様=1 / 契約書・契約変更=2 / 工程表=3 / ',
     '発注者(局)への届出・提出物・各種報告=4 / 施工計画書=5 / 工事打合せ簿=6 / 施工図・詳細図・完成図=7 / ',
-    '材料承認願・出荷証明・数量=8 / 施工体制台帳・体系図=9 / 工事写真・工事記録・検査関係=10 / 協力会社の見積・作業指示書=11 / ',
-    '会議議事録=12 / KY(危険予知)・新規入場者教育・安全書類=13 / 産業廃棄物(マニフェスト等)=14。',
+    '材料承認願・出荷証明・数量比較・各種保証書=8 / 施工体制台帳・体系図=9 / ',
+    '工事写真・各種試験成績・検査報告・出来形記録=10 / 協力会社の見積・作業指示書=11 / ',
+    '会議議事録=12 / KY(危険予知)・新規入場者教育・安全教育・安全記録=13 / 産業廃棄物(マニフェスト・発生材・アスベスト等)=14 / ',
+    '基地への入門・立入申請(セキュリティ書類)=15。',
     'どこにも当てはまらず判断に迷う場合は 2（契約関係）にせず、最も内容に近いものを選ぶこと。',
     '出力JSON:',
-    '- folder_no: 0〜14の整数',
+    '- folder_no: 0〜15の整数',
     '- doc_name: 内容に基づく簡潔な書類名（例: 契約書、総合施工計画書、配筋検査報告書）',
     '- confidence: 判定の確信度 0.0〜1.0',
     '- reason: 判定理由を簡潔に（20字程度）',
@@ -6352,7 +6358,7 @@ async function classifyConstructionDoc({ fileName, buffer, mimeType }) {
   if (!text) return null;
   let p; try { p = JSON.parse(text); } catch { return null; }
   let no = Number(p.folder_no);
-  if (!Number.isInteger(no) || no < 0 || no > 14) no = null;
+  if (!Number.isInteger(no) || no < 0 || no > 15) no = null;
   return {
     folder_no: no,
     doc_name: (p.doc_name || '').trim(),
