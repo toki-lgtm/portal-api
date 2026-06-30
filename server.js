@@ -4597,6 +4597,30 @@ async function generateChecklist(project, email) {
   return rows.length;
 }
 
+// 検査書類チェックリストを工事へ生成（発注者「完成・完了検査チェックリスト」マスタを版別に複製）。
+// 新設/改修は work_category で選択。既に生成済みなら何もしない。
+async function generateInspectionItems(project) {
+  const edition = (project.work_category === '改修') ? '改修' : '新設';
+  const { data: existing } = await supabase
+    .from('project_inspection_items').select('id').eq('project_id', project.id).limit(1);
+  if (existing && existing.length) return 0;
+  const { data: master, error } = await supabase
+    .from('inspection_checklist_master').select('*')
+    .eq('edition', edition).eq('is_active', true)
+    .order('sort_order', { ascending: true });
+  if (error) throw error;
+  const rows = (master || []).map((m) => ({
+    project_id: project.id, master_id: m.id, edition: m.edition,
+    section: m.section, item_name: m.item_name, note: m.note, sort_order: m.sort_order,
+  }));
+  if (!rows.length) return 0;
+  for (let i = 0; i < rows.length; i += 100) {
+    const { error: e } = await supabase.from('project_inspection_items').insert(rows.slice(i, i + 100));
+    if (e) throw e;
+  }
+  return rows.length;
+}
+
 // 工事案件の更新可能フィールド
 const CONS_FIELDS = [
   'bid_project_id', 'project_name', 'project_code', 'client_org', 'construction_type', 'work_category',
@@ -4614,32 +4638,36 @@ function pickConsFields(body) {
   return out;
 }
 
-// ✅ 工事管理 - ダッシュボードKPI（工事数 / 締切間近 / 期限超過 / 差戻し / 未着手）
+// ✅ 工事管理 - ダッシュボードKPI（工事数 / 検査日超過・間近 / 未確認の検査項目）
 app.get('/api/construction/stats', requireAuth, requireConstructionAccess, async (req, res) => {
   try {
     const today = new Date().toISOString().slice(0, 10);
     const soon = consAddDays(today, 14);
-    const [{ data: projects }, { data: docs }] = await Promise.all([
-      supabase.from('construction_projects').select('id,status').eq('is_active', true),
-      supabase.from('submission_documents').select('project_id,status,due_date'),
+    const [{ data: projects }, { data: items }] = await Promise.all([
+      supabase.from('construction_projects').select('id,status,completion_inspection_date').eq('is_active', true),
+      supabase.from('project_inspection_items').select('project_id,status'),
     ]);
     const activeIds = new Set((projects || []).map((p) => p.id));
+    const liveProjects = (projects || []).filter((p) => p.status !== 'archived' && p.status !== 'completed');
     const activeProjects = (projects || []).filter((p) => p.status !== 'archived').length;
-    let dueSoon = 0, overdue = 0, rejected = 0, notStarted = 0;
-    for (const d of docs || []) {
-      if (!activeIds.has(d.project_id)) continue; // 削除（論理削除）済み工事の書類は集計しない
-      if (d.status === 'rejected') rejected++;
-      if (d.status === 'approved' || d.status === 'na') continue;
-      if (d.status === 'not_started') notStarted++;
-      if (d.due_date) {
-        if (d.due_date < today) overdue++;
-        else if (d.due_date <= soon) dueSoon++;
-      }
+    // 検査日（完成検査予定日）の超過・間近を工事単位で集計
+    let dueSoon = 0, overdue = 0;
+    for (const p of liveProjects) {
+      const d = p.completion_inspection_date;
+      if (!d) continue;
+      if (d < today) overdue++;
+      else if (d <= soon) dueSoon++;
+    }
+    // 未確認の検査項目（pending）総数
+    let pending = 0;
+    for (const it of items || []) {
+      if (!activeIds.has(it.project_id)) continue;
+      if (it.status === 'pending') pending++;
     }
     res.json({
       total_projects: (projects || []).length,
       active_projects: activeProjects,
-      due_soon: dueSoon, overdue, rejected, not_started: notStarted,
+      due_soon: dueSoon, overdue, pending_items: pending,
       role: req.consRole?.role || 'member', // 'admin' のときフロントが削除UIを表示
     });
   } catch (error) {
@@ -4667,12 +4695,13 @@ app.get('/api/construction/projects', requireAuth, requireConstructionAccess, as
     const ids = rows.map((r) => r.id);
     const progress = {};
     if (ids.length) {
-      const { data: docs } = await supabase
-        .from('submission_documents').select('project_id,status').in('project_id', ids);
-      for (const d of docs || []) {
-        const p = progress[d.project_id] || (progress[d.project_id] = { total: 0, done: 0 });
+      // 進捗＝検査書類チェックリストの確認状況（done / na を確認済みとみなす）
+      const { data: items } = await supabase
+        .from('project_inspection_items').select('project_id,status').in('project_id', ids);
+      for (const it of items || []) {
+        const p = progress[it.project_id] || (progress[it.project_id] = { total: 0, done: 0 });
         p.total++;
-        if (d.status === 'submitted' || d.status === 'approved' || d.status === 'na') p.done++;
+        if (it.status === 'done' || it.status === 'na') p.done++;
       }
     }
     const nameMap = await loadStaffNameMap();
@@ -4698,10 +4727,10 @@ app.get('/api/construction/projects/:id', requireAuth, requireConstructionAccess
       .from('construction_projects').select('*').eq('id', id).eq('is_active', true).maybeSingle();
     if (error) throw error;
     if (!project) return res.status(404).json({ error: '工事が見つかりません' });
-    const [{ data: docs }, { data: files }, { data: changes }, { data: changeFiles }, nameMap] = await Promise.all([
+    const [{ data: docs }, { data: files }, { data: changes }, { data: changeFiles }, { data: inspItems }, nameMap] = await Promise.all([
       supabase.from('submission_documents').select('*')
         .eq('project_id', id)
-        .order('category_no', { ascending: true })
+        .order('folder_no', { ascending: true })
         .order('id', { ascending: true }),
       supabase.from('submission_files').select('*')
         .eq('project_id', id).order('created_at', { ascending: true }),
@@ -4710,6 +4739,8 @@ app.get('/api/construction/projects/:id', requireAuth, requireConstructionAccess
         .order('change_no', { ascending: true }),
       supabase.from('construction_design_change_files').select('change_id')
         .eq('project_id', id),
+      supabase.from('project_inspection_items').select('*')
+        .eq('project_id', id).order('sort_order', { ascending: true }),
       loadStaffNameMap(),
     ]);
     // 添付ファイルを書類ごとにまとめ、署名付きの一時URLを付与
@@ -4750,6 +4781,7 @@ app.get('/api/construction/projects/:id', requireAuth, requireConstructionAccess
       bid,
       documents,
       design_changes,
+      inspection_items: inspItems || [],
     });
   } catch (error) {
     console.error('Error (construction detail):', error.message);
@@ -4772,7 +4804,7 @@ app.post('/api/construction/projects', requireAuth, requireConstructionAccess, a
 
     let generated = 0;
     if (req.body?.generate_checklist !== false) {
-      generated = await generateChecklist(data, req.user.email);
+      generated = await generateInspectionItems(data);
     }
     res.json({ ...data, generated_documents: generated });
   } catch (error) {
@@ -4817,9 +4849,8 @@ app.post('/api/construction/projects/from-bid/:bidId', requireAuth, requireConst
       carry = await carryOverBidDocuments({ project: data, bidId: bid.id, email: req.user.email });
     } catch (e) { console.error('carryOverBidDocuments:', e.message); }
 
-    // 必要書類チェックリストを生成（抽出後の工事情報＝契約日等から締切を計算）。
-    // 引き継ぎ時に作成済みのテンプレ書類は generateChecklist 側で重複生成しない。
-    const generated = await generateChecklist(carry.project || data, req.user.email);
+    // 検査書類チェックリストを生成（work_category＝新設/改修で版を選択）。
+    const generated = await generateInspectionItems(carry.project || data);
     res.json({
       ...(carry.project || data),
       generated_documents: generated,
@@ -4877,7 +4908,7 @@ app.delete('/api/construction/projects/:id', requireAuth, requireConstructionAdm
   }
 });
 
-// ✅ 工事管理 - 不足している必要書類を追加生成（テンプレ更新後の補完用）
+// ✅ 工事管理 - 検査書類チェックリストを（未生成なら）生成
 app.post('/api/construction/projects/:id/generate-checklist', requireAuth, requireConstructionAccess, async (req, res) => {
   try {
     const { id } = req.params;
@@ -4885,7 +4916,7 @@ app.post('/api/construction/projects/:id/generate-checklist', requireAuth, requi
       .from('construction_projects').select('*').eq('id', id).eq('is_active', true).maybeSingle();
     if (error) throw error;
     if (!project) return res.status(404).json({ error: '工事が見つかりません' });
-    const generated = await generateChecklist(project, req.user.email);
+    const generated = await generateInspectionItems(project);
     res.json({ ok: true, generated_documents: generated });
   } catch (error) {
     console.error('Error (construction generate-checklist):', error.message);
@@ -5249,6 +5280,7 @@ app.post('/api/construction/projects/:id/apply-checklist-filter', requireAuth, r
 const SUB_DOC_FIELDS = [
   'status', 'due_date', 'submitted_at', 'approved_at', 'assignee_id', 'file_ref', 'note',
   'doc_name', 'category_no', 'category', 'subcategory', 'trade', 'form_no',
+  'folder_no', 'folder_name',
 ];
 function pickSubDocFields(body) {
   const out = {};
@@ -5291,16 +5323,20 @@ app.post('/api/construction/projects/:id/documents', requireAuth, requireConstru
     const { id } = req.params;
     const b = req.body || {};
     if (!b.doc_name) return res.status(400).json({ error: '書類名は必須です' });
-    if (!b.category_no || !b.category) return res.status(400).json({ error: '大分類は必須です' });
+    if (b.folder_no == null || Number.isNaN(Number(b.folder_no))) return res.status(400).json({ error: 'フォルダは必須です' });
     if (b.status && !SUBMISSION_STATUSES.includes(b.status)) {
       return res.status(400).json({ error: '不正なステータスです' });
     }
+    const folderNo = Number(b.folder_no);
+    const fName = consFolderName(folderNo);
     const row = {
       project_id: Number(id),
       template_id: null,
-      category_no: Number(b.category_no),
-      category: b.category,
+      category_no: folderNo,
+      category: fName,
       subcategory: b.subcategory || null,
+      folder_no: folderNo,
+      folder_name: fName,
       doc_name: b.doc_name,
       trade: b.trade || '共通',
       form_no: b.form_no || null,
@@ -5331,6 +5367,73 @@ app.delete('/api/construction/documents/:docId', requireAuth, requireConstructio
     res.json({ ok: true });
   } catch (error) {
     console.error('Error (submission delete):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 工事管理 - 検査チェック項目の更新（人手での✓/対象外、保管庫書類の手動紐づけ）
+const INSPECTION_STATUSES = ['pending', 'done', 'na'];
+app.patch('/api/construction/inspection-items/:itemId', requireAuth, requireConstructionAccess, async (req, res) => {
+  try {
+    const { itemId } = req.params;
+    const b = req.body || {};
+    const payload = { updated_at: new Date().toISOString() };
+    if ('status' in b) {
+      if (!INSPECTION_STATUSES.includes(b.status)) return res.status(400).json({ error: '不正なステータスです' });
+      payload.status = b.status;
+      // 人手で確定したら確認者・時刻を記録（pendingに戻す場合はクリア）
+      if (b.status === 'pending') { payload.checked_by = null; payload.checked_at = null; }
+      else { payload.checked_by = req.user.email; payload.checked_at = new Date().toISOString(); }
+    }
+    if ('linked_document_id' in b) {
+      payload.linked_document_id = b.linked_document_id || null;
+    }
+    if ('note' in b) payload.note = b.note || null;
+    const { data, error } = await supabase
+      .from('project_inspection_items').update(payload).eq('id', itemId).select('*').single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (inspection item update):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 工事管理 - 検査チェックリストのAI棚卸し（1工事・手動実行）
+app.post('/api/construction/projects/:id/inspection-sweep', requireAuth, requireConstructionAccess, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await aiSweepInspectionItems(Number(id));
+    res.json(result);
+  } catch (error) {
+    console.error('Error (inspection sweep):', error.message);
+    res.status(error.status || 500).json({ error: error.message });
+  }
+});
+
+// ✅ 工事管理 - 検査チェックリストのAI棚卸し（全アクティブ工事・Render Cron 用）
+//    保護: ヘッダ x-cron-key が環境変数 CRON_KEY と一致する場合のみ実行。
+app.post('/api/construction/inspection-sweep-all', async (req, res) => {
+  try {
+    const key = req.headers['x-cron-key'];
+    if (!process.env.CRON_KEY || key !== process.env.CRON_KEY) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+    const { data: projects } = await supabase
+      .from('construction_projects').select('id, project_name')
+      .eq('is_active', true).neq('status', 'archived');
+    let totalMatched = 0;
+    const per = [];
+    for (const p of projects || []) {
+      try {
+        const r = await aiSweepInspectionItems(p.id);
+        totalMatched += r.matched || 0;
+        if (r.matched) per.push({ project_id: p.id, project_name: p.project_name, matched: r.matched });
+      } catch (e) { console.error('sweep-all project', p.id, e.message); }
+    }
+    res.json({ projects: (projects || []).length, total_matched: totalMatched, details: per });
+  } catch (error) {
+    console.error('Error (inspection sweep-all):', error.message);
     res.status(500).json({ error: error.message });
   }
 });
@@ -6137,6 +6240,18 @@ const CONSTRUCTION_CATEGORY_NAMES = [
   { no: 7, name: '工事写真' }, { no: 8, name: '検査' }, { no: 9, name: '完成・引渡' },
 ];
 
+// 書類整理（保管庫）の分類 = 実フォルダ体系 00〜12。九州防衛局 建築工事の現場フォルダに準拠。
+const CONSTRUCTION_FOLDERS = [
+  { no: 0, name: '入札時資料' }, { no: 1, name: '設計図書' }, { no: 2, name: '契約関係' },
+  { no: 3, name: '工程表' }, { no: 4, name: '施主提出書類' }, { no: 5, name: '施工計画書' },
+  { no: 6, name: '工事打合簿' }, { no: 7, name: '施工図・詳細図・完成図' }, { no: 8, name: '材料承認・数量' },
+  { no: 9, name: '施工体制' }, { no: 10, name: '工事写真' }, { no: 11, name: '協力会社見積' }, { no: 12, name: '打合議事録' },
+];
+function consFolderName(no) {
+  const f = CONSTRUCTION_FOLDERS.find((x) => x.no === Number(no));
+  return f ? f.name : '施主提出書類';
+}
+
 // drive:<id> もしくはストレージバケットのパスから実バイト列を取得
 async function loadStoredFileBuffer(ref, bucket) {
   if (!ref) return null;
@@ -6169,24 +6284,22 @@ async function getActiveDocTemplates() {
   return data || [];
 }
 
-// 1ファイルの内容＋ファイル名から、必要書類マスタのどれに該当するかを判定
-async function classifyConstructionDoc({ fileName, buffer, mimeType, templates }) {
+// 1ファイルの内容＋ファイル名から、書類整理フォルダ(00〜12)と書類名を判定。
+// 検査チェックリストへの紐づけはここでは行わない（別途の手動紐づけ＋日次AI棚卸しで反映）。
+async function classifyConstructionDoc({ fileName, buffer, mimeType }) {
   if (!GEMINI_API_KEY) return null;
-  const catalog = (templates || [])
-    .map((t) => `${t.category_no}\t${t.doc_name}\t${t.trade || '共通'}`)
-    .join('\n');
-  const catNames = CONSTRUCTION_CATEGORY_NAMES.map((c) => `${c.no}:${c.name}`).join(' / ');
+  const folders = CONSTRUCTION_FOLDERS.map((f) => `${f.no}:${f.name}`).join(' / ');
   const prompt = [
-    'これは日本の公共建築工事（発注者: 九州防衛局）で扱う書類の1つです。',
-    'ファイル名と内容（PDF/画像）から、この書類が「必要書類マスタ」のどれに該当するかを1つだけ判定してください。',
-    `大分類(category_no): ${catNames}`,
-    '必要書類マスタ（タブ区切り: category_no / 書類名 / 工種）:',
-    catalog,
+    'これは日本の公共建築工事（発注者: 九州防衛局）の現場で扱う書類の1つです。',
+    'ファイル名と内容（PDF/画像）から、この書類を「書類整理フォルダ」のどれに収めるべきか1つだけ判定してください。',
+    `フォルダ(folder_no): ${folders}`,
+    '判定の目安: 入札時の資料=0 / 設計図・特記仕様=1 / 契約書・契約変更=2 / 工程表=3 / ',
+    '発注者(局)への届出・提出物・各種報告=4 / 施工計画書=5 / 工事打合せ簿=6 / 施工図・詳細図・完成図=7 / ',
+    '材料承認願・出荷証明・数量=8 / 施工体制台帳・体系図=9 / 工事写真=10 / 協力会社の見積=11 / 会議議事録=12。',
+    'どこにも当てはまらず判断に迷う場合は 2（契約関係）にせず、最も内容に近いものを選ぶこと。',
     '出力JSON:',
-    '- category_no: 1〜9の整数（最も適切な大分類）',
-    '- doc_name: マスタの「書類名」のうち最も一致するものを正確に転記。該当が無ければ内容に基づき簡潔な書類名を記述',
-    '- matched: マスタに一致する書類名があれば true、無ければ false',
-    '- trade: 工種（マスタに合わせる。不明なら「共通」）',
+    '- folder_no: 0〜12の整数',
+    '- doc_name: 内容に基づく簡潔な書類名（例: 契約書、総合施工計画書、配筋検査報告書）',
     '- confidence: 判定の確信度 0.0〜1.0',
     '- reason: 判定理由を簡潔に（20字程度）',
     `ファイル名: ${fileName || '(不明)'}`,
@@ -6204,14 +6317,12 @@ async function classifyConstructionDoc({ fileName, buffer, mimeType, templates }
       responseSchema: {
         type: 'OBJECT',
         properties: {
-          category_no: { type: 'INTEGER' },
+          folder_no: { type: 'INTEGER' },
           doc_name: { type: 'STRING' },
-          matched: { type: 'BOOLEAN' },
-          trade: { type: 'STRING' },
           confidence: { type: 'NUMBER' },
           reason: { type: 'STRING' },
         },
-        required: ['category_no', 'doc_name'],
+        required: ['folder_no', 'doc_name'],
       },
     },
   };
@@ -6224,60 +6335,122 @@ async function classifyConstructionDoc({ fileName, buffer, mimeType, templates }
   const text = json?.candidates?.[0]?.content?.parts?.[0]?.text;
   if (!text) return null;
   let p; try { p = JSON.parse(text); } catch { return null; }
-  let no = Number(p.category_no);
-  if (!Number.isInteger(no) || no < 1 || no > 9) no = null;
+  let no = Number(p.folder_no);
+  if (!Number.isInteger(no) || no < 0 || no > 12) no = null;
   return {
-    category_no: no,
+    folder_no: no,
     doc_name: (p.doc_name || '').trim(),
-    matched: !!p.matched,
-    trade: (p.trade || '共通').trim() || '共通',
     confidence: typeof p.confidence === 'number' ? Math.max(0, Math.min(1, p.confidence)) : null,
     reason: (p.reason || '').trim(),
   };
 }
 
-// 分類結果から、紐付け先の提出書類(submission_documents)を解決（無ければ作成）
+// 分類結果から、書類整理(保管庫)の格納先 submission_documents を解決（無ければ作成）。
+// 検査チェックリストへの紐づけはしない。同フォルダ・同名の書類があればまとめる。
 async function routeFileToDocument({ projectId, classification, email }) {
   const cls = classification;
-  // 1) マスタ一致 → 同テンプレ由来の提出書類があればそれ、無ければテンプレから生成
-  if (cls?.matched && cls.category_no && cls.doc_name) {
-    const { data: tmpl } = await supabase
-      .from('required_doc_templates').select('*')
-      .eq('category_no', cls.category_no).eq('doc_name', cls.doc_name).eq('is_active', true).maybeSingle();
-    if (tmpl) {
-      const { data: existing } = await supabase
-        .from('submission_documents').select('*')
-        .eq('project_id', projectId).eq('template_id', tmpl.id).maybeSingle();
-      if (existing) return existing;
-      const { data: created, error } = await supabase.from('submission_documents').insert([{
-        project_id: projectId, template_id: tmpl.id,
-        category_no: tmpl.category_no, category: tmpl.category, subcategory: tmpl.subcategory,
-        doc_name: tmpl.doc_name, trade: tmpl.trade, form_no: tmpl.form_no,
-        status: 'not_started', created_by: email,
-      }]).select('*').single();
-      if (error) throw error;
-      return created;
-    }
-  }
-  // 2) 同名の既存提出書類（手動追加分など）に一致
-  if (cls?.doc_name) {
-    const { data: byName } = await supabase
-      .from('submission_documents').select('*')
-      .eq('project_id', projectId).eq('doc_name', cls.doc_name).maybeSingle();
-    if (byName) return byName;
-  }
-  // 3) どれにも該当しない → 分類カテゴリ（不明なら1）に新規の提出書類を作成
-  const no = cls?.category_no || 1;
-  const catName = (CONSTRUCTION_CATEGORY_NAMES.find((c) => c.no === no) || {}).name || '契約・設計図書';
+  const folderNo = (cls && cls.folder_no != null) ? cls.folder_no : 2; // 不明時は 02.契約関係
+  const fName = consFolderName(folderNo);
+  const docName = (cls?.doc_name || '').trim() || '未分類資料';
+  // 同フォルダ・同名の書類があればそこへまとめる
+  const { data: existing } = await supabase
+    .from('submission_documents').select('*')
+    .eq('project_id', projectId).eq('folder_no', folderNo).eq('doc_name', docName).maybeSingle();
+  if (existing) return existing;
   const { data: created, error } = await supabase.from('submission_documents').insert([{
     project_id: projectId, template_id: null,
-    category_no: no, category: catName, subcategory: null,
-    doc_name: cls?.doc_name || '分類未確定の資料', trade: cls?.trade || '共通', form_no: null,
+    category_no: folderNo, category: fName, subcategory: null,
+    folder_no: folderNo, folder_name: fName,
+    doc_name: docName, trade: '共通', form_no: null,
     status: 'not_started', created_by: email,
     note: cls ? 'AI自動振り分け' : 'AI判定なし（要確認）',
   }]).select('*').single();
   if (error) throw error;
   return created;
+}
+
+// 検査書類チェックリストのAI棚卸し（1日1回想定／手動実行も可）。
+// 書類整理(保管庫)に格納済みの書類のうち、未達のチェック項目を満たすものをAIが判定して自動✓。
+// 文字列の完全一致ではなく、書類名・フォルダからの内容的な対応をAIに判断させる。誤検出を避け確証ありのみ。
+async function aiSweepInspectionItems(projectId) {
+  if (!GEMINI_API_KEY) return { matched: 0, pending: 0, skipped: 'no_api_key' };
+  const [{ data: items }, { data: docs }, { data: files }] = await Promise.all([
+    supabase.from('project_inspection_items').select('*').eq('project_id', projectId).eq('status', 'pending'),
+    supabase.from('submission_documents').select('id, folder_no, folder_name, doc_name').eq('project_id', projectId),
+    supabase.from('submission_files').select('document_id').eq('project_id', projectId),
+  ]);
+  const pending = items || [];
+  if (!pending.length) return { matched: 0, pending: 0 };
+  const fileDocIds = new Set((files || []).map((f) => f.document_id));
+  const filed = (docs || []).filter((d) => fileDocIds.has(d.id));   // 実ファイルのある書類のみ
+  if (!filed.length) return { matched: 0, pending: pending.length };
+
+  const itemList = pending.map((it) => `${it.id}\t${it.section}\t${it.item_name}`).join('\n');
+  const docList = filed.map((d) => `${d.id}\t${d.folder_no}:${d.folder_name}\t${d.doc_name}`).join('\n');
+  const prompt = [
+    '公共建築工事（発注者: 九州防衛局）の「検査書類チェックリスト」の各項目について、',
+    '工事の「書類整理（保管庫）」に既に格納された書類のうち、その項目を満たすものがあるかを判定してください。',
+    'チェックリスト項目（タブ区切り: item_id / 区分 / 項目名）:',
+    itemList,
+    '保管庫の書類（タブ区切り: document_id / フォルダ / 書類名）:',
+    docList,
+    'ルール:',
+    '- 明らかに該当する保管庫書類が「ある」項目のみ matches に出力する。',
+    '- 確証が持てない・対応が曖昧なものは出力しない（誤検出を避ける）。',
+    '- 1つの項目に複数候補があれば最も適切な1件のみ。',
+    '出力JSON: { "matches": [ { "item_id": 整数, "document_id": 整数, "confidence": 0〜1, "reason": "20字程度" } ] }',
+  ].join('\n');
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+  const body = {
+    contents: [{ parts: [{ text: prompt }] }],
+    generationConfig: {
+      temperature: 0,
+      responseMimeType: 'application/json',
+      responseSchema: {
+        type: 'OBJECT',
+        properties: {
+          matches: {
+            type: 'ARRAY',
+            items: {
+              type: 'OBJECT',
+              properties: {
+                item_id: { type: 'INTEGER' }, document_id: { type: 'INTEGER' },
+                confidence: { type: 'NUMBER' }, reason: { type: 'STRING' },
+              },
+              required: ['item_id', 'document_id'],
+            },
+          },
+        },
+      },
+    },
+  };
+  const resp = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  if (!resp.ok) {
+    const t = await resp.text();
+    const e = new Error(`Gemini API エラー (${resp.status}): ${t.slice(0, 300)}`); e.status = 502; throw e;
+  }
+  const json = await resp.json();
+  const text = json?.candidates?.[0]?.content?.parts?.[0]?.text;
+  let parsed; try { parsed = JSON.parse(text || '{}'); } catch { parsed = {}; }
+  const matches = Array.isArray(parsed.matches) ? parsed.matches : [];
+
+  const pendingIds = new Set(pending.map((p) => p.id));
+  const filedIds = new Set(filed.map((d) => d.id));
+  let matched = 0;
+  const nowIso = new Date().toISOString();
+  for (const m of matches) {
+    const itemId = Number(m.item_id), docId = Number(m.document_id);
+    const conf = typeof m.confidence === 'number' ? m.confidence : 1;
+    if (!pendingIds.has(itemId) || !filedIds.has(docId) || conf < 0.6) continue;
+    const { error } = await supabase.from('project_inspection_items').update({
+      status: 'done', linked_document_id: docId,
+      ai_checked_at: nowIso, ai_confidence: conf, ai_note: (m.reason || 'AI棚卸しで該当書類を確認').slice(0, 200),
+      updated_at: nowIso,
+    }).eq('id', itemId).eq('status', 'pending'); // 既に人手で確定した項目は上書きしない
+    if (!error) matched += 1;
+  }
+  return { matched, pending: pending.length };
 }
 
 // 工事情報の抽出対象を絞る（契約・設計図書系を優先。PDF/画像のみ・合計上限内で最大3件）
@@ -6412,19 +6585,18 @@ async function carryOverBidDocuments({ project, bidId, email }) {
   }
   result.project = updatedProject;
 
-  // 2) 各資料を分類 → 提出書類へ添付
-  const templates = GEMINI_API_KEY ? await getActiveDocTemplates() : [];
+  // 2) 各資料を分類 → 書類整理(保管庫)へ格納
   for (const item of loaded) {
     try {
       let classification = null;
       if (GEMINI_API_KEY && geminiAnalyzable(item.mimetype, item.size)) {
-        try { classification = await classifyConstructionDoc({ fileName: item.originalname, buffer: item.buffer, mimeType: item.mimetype, templates }); }
+        try { classification = await classifyConstructionDoc({ fileName: item.originalname, buffer: item.buffer, mimeType: item.mimetype }); }
         catch (e) { console.error('carry classify:', e.message); }
       }
       const doc = await routeFileToDocument({ projectId: project.id, classification, email });
       const ref = await storeConstructionFile({
         projectName: updatedProject.project_name || project.project_name,
-        categoryNo: doc.category_no, categoryName: doc.category,
+        categoryNo: doc.folder_no ?? doc.category_no, categoryName: doc.folder_name || doc.category,
         fileName: item.originalname, buffer: item.buffer, mimeType: item.mimetype,
       });
       await supabase.from('submission_files').insert([{
@@ -6454,14 +6626,13 @@ app.post('/api/construction/projects/:id/documents/auto-file', requireAuth, requ
     let classification = null;
     if (GEMINI_API_KEY && geminiAnalyzable(req.file.mimetype, req.file.size)) {
       try {
-        const templates = await getActiveDocTemplates();
-        classification = await classifyConstructionDoc({ fileName, buffer: req.file.buffer, mimeType: req.file.mimetype, templates });
+        classification = await classifyConstructionDoc({ fileName, buffer: req.file.buffer, mimeType: req.file.mimetype });
       } catch (e) { console.error('auto-file classify:', e.message); }
     }
     const doc = await routeFileToDocument({ projectId: Number(id), classification, email: req.user.email });
     const ref = await storeConstructionFile({
       projectName: proj.project_name || `project-${id}`,
-      categoryNo: doc.category_no, categoryName: doc.category,
+      categoryNo: doc.folder_no ?? doc.category_no, categoryName: doc.folder_name || doc.category,
       fileName, buffer: req.file.buffer, mimeType: req.file.mimetype,
     });
     const { data: fileRow, error } = await supabase.from('submission_files').insert([{
@@ -6474,7 +6645,7 @@ app.post('/api/construction/projects/:id/documents/auto-file', requireAuth, requ
     const url = await constructionFileSignedUrl(fileRow.file_ref);
     res.json({
       file: { id: fileRow.id, file_name: fileRow.file_name, mime_type: fileRow.mime_type, size_bytes: fileRow.size_bytes, url, source: 'auto', ai_classified: !!classification, ai_confidence: classification?.confidence ?? null },
-      document: { id: doc.id, category_no: doc.category_no, category: doc.category, doc_name: doc.doc_name },
+      document: { id: doc.id, folder_no: doc.folder_no, folder_name: doc.folder_name, doc_name: doc.doc_name },
       classification,
     });
   } catch (error) {
