@@ -5405,8 +5405,10 @@ app.patch('/api/construction/inspection-items/:itemId', requireAuth, requireCons
 app.post('/api/construction/projects/:id/inspection-sweep', requireAuth, requireConstructionAccess, async (req, res) => {
   try {
     const { id } = req.params;
-    const result = await aiSweepInspectionItems(Number(id));
-    // 自動棚卸し(24h)のタイマーもリセット
+    // full=true で全書類を再精査（既定は未照合のみ）
+    const full = req.body?.full === true || req.query?.full === '1';
+    const result = await aiSweepInspectionItems(Number(id), { full });
+    // 自動棚卸しのロックタイマーもリセット
     await supabase.from('construction_projects')
       .update({ last_inspection_sweep_at: new Date().toISOString() }).eq('id', Number(id));
     res.json(result);
@@ -6377,18 +6379,19 @@ async function routeFileToDocument({ projectId, classification, email }) {
 // 検査書類チェックリストのAI棚卸し（1日1回想定／手動実行も可）。
 // 書類整理(保管庫)に格納済みの書類のうち、未達のチェック項目を満たすものをAIが判定して自動✓。
 // 文字列の完全一致ではなく、書類名・フォルダからの内容的な対応をAIに判断させる。誤検出を避け確証ありのみ。
-async function aiSweepInspectionItems(projectId) {
-  if (!GEMINI_API_KEY) return { matched: 0, pending: 0, skipped: 'no_api_key' };
+async function aiSweepInspectionItems(projectId, { full = false } = {}) {
+  if (!GEMINI_API_KEY) return { matched: 0, pending: 0, examined: 0, skipped: 'no_api_key' };
   const [{ data: items }, { data: docs }, { data: files }] = await Promise.all([
     supabase.from('project_inspection_items').select('*').eq('project_id', projectId).eq('status', 'pending'),
-    supabase.from('submission_documents').select('id, folder_no, folder_name, doc_name').eq('project_id', projectId),
+    supabase.from('submission_documents').select('id, folder_no, folder_name, doc_name, inspection_swept_at').eq('project_id', projectId),
     supabase.from('submission_files').select('document_id').eq('project_id', projectId),
   ]);
   const pending = items || [];
-  if (!pending.length) return { matched: 0, pending: 0 };
+  if (!pending.length) return { matched: 0, pending: 0, examined: 0 };
   const fileDocIds = new Set((files || []).map((f) => f.document_id));
-  const filed = (docs || []).filter((d) => fileDocIds.has(d.id));   // 実ファイルのある書類のみ
-  if (!filed.length) return { matched: 0, pending: pending.length };
+  // 実ファイルがあり、かつ未照合（full時は全件）の書類だけを精査対象にする
+  const filed = (docs || []).filter((d) => fileDocIds.has(d.id) && (full || !d.inspection_swept_at));
+  if (!filed.length) return { matched: 0, pending: pending.length, examined: 0 };
 
   const itemList = pending.map((it) => `${it.id}\t${it.section}\t${it.item_name}`).join('\n');
   const docList = filed.map((d) => `${d.id}\t${d.folder_no}:${d.folder_name}\t${d.doc_name}`).join('\n');
@@ -6455,18 +6458,26 @@ async function aiSweepInspectionItems(projectId) {
     }).eq('id', itemId).eq('status', 'pending'); // 既に人手で確定した項目は上書きしない
     if (!error) matched += 1;
   }
-  return { matched, pending: pending.length };
+  // 今回精査した書類を「照合済み」にマーク（次回以降は送らない）
+  const examinedIds = filed.map((d) => d.id);
+  if (examinedIds.length) {
+    await supabase.from('submission_documents')
+      .update({ inspection_swept_at: nowIso }).in('id', examinedIds);
+  }
+  return { matched, pending: pending.length, examined: examinedIds.length };
 }
 
-// 「開いたとき自動棚卸し」: 前回から24h以上経っていれば棚卸しを実行（Render Cron 不要）。
-// 二重実行防止のため、先に最終実行時刻を条件付きUPDATEで奪取し、勝ったリクエストだけ実行する。
+// 「開いたとき自動棚卸し」: 工事詳細を開いたら未照合の書類だけを精査する（Render Cron 不要）。
+// 精査対象は aiSweepInspectionItems 側で「未照合の書類のみ」に絞られるため、ここは
+// 同時アクセスによる二重実行を防ぐ短いロック（直近2分以内なら走らせない）だけを持つ。
+const AUTO_SWEEP_LOCK_MS = 2 * 60 * 1000;
 async function maybeAutoSweepInspection(project) {
   if (!GEMINI_API_KEY || !project?.id) return false;
   const last = project.last_inspection_sweep_at;
-  if (last && (Date.now() - new Date(last).getTime()) < 24 * 3600 * 1000) return false;
-  const cutoffIso = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
+  if (last && (Date.now() - new Date(last).getTime()) < AUTO_SWEEP_LOCK_MS) return false;
+  const cutoffIso = new Date(Date.now() - AUTO_SWEEP_LOCK_MS).toISOString();
   const nowIso = new Date().toISOString();
-  // last_inspection_sweep_at が NULL もしくは 24h より古いときだけ更新（=実行権の奪取）
+  // last_inspection_sweep_at が NULL もしくはロック期間より古いときだけ更新（=実行権の奪取）
   const { data: won } = await supabase
     .from('construction_projects')
     .update({ last_inspection_sweep_at: nowIso })
