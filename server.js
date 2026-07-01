@@ -7436,6 +7436,7 @@ app.post('/api/construction/projects/:id/inspection-tests/bulk', requireAuth, re
     for (const raw of list) {
       const n = normInspectionTest(raw);
       if (!n) continue;
+      if (n.applicable === false) continue; // 対象外（行わない/測定しない）は登録しない
       so += 1;
       rows.push({
         project_id: Number(id),
