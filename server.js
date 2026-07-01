@@ -3,7 +3,7 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import { createClient } from '@supabase/supabase-js';
 import ws from 'ws';
-import { randomUUID as uuidv4 } from 'crypto';
+import { randomUUID as uuidv4, createHash } from 'crypto';
 import jwt from 'jsonwebtoken';
 import multer from 'multer';
 import nodemailer from 'nodemailer';
@@ -186,6 +186,34 @@ async function requireAdmin(req, res, next) {
       return res.status(403).json({ error: 'この操作は管理者のみ可能です' });
     }
     req.perms = perms;
+    next();
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+}
+
+// ✅ WorkScope 端末認証（要 Authorization: Bearer <端末トークン>）
+//    人間のJWTとは別系統。DL時に端末へ1回だけ配った平文トークンの SHA-256 を
+//    workscope_devices.token_hash と突合し、失効していない端末だけ通す。
+const sha256hex = (s) => createHash('sha256').update(String(s)).digest('hex');
+// 社員名から安定した UUID を作る（管理PC代理監視の擬似端末ID用）。同名は常に同一ID。
+const deterministicUuid = (name) => {
+  const h = createHash('sha1').update('ws-central:' + String(name)).digest('hex');
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20, 32)}`;
+};
+async function requireDevice(req, res, next) {
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  if (!token) return res.status(401).json({ error: 'device token required' });
+  try {
+    const { data, error } = await supabase
+      .from('workscope_devices')
+      .select('*')
+      .eq('token_hash', sha256hex(token))
+      .maybeSingle();
+    if (error) throw error;
+    if (!data || data.revoked) return res.status(401).json({ error: 'invalid or revoked device' });
+    req.device = data;
     next();
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -3074,12 +3102,33 @@ app.get('/api/downloads/workscope/file', requireAuth, async (req, res) => {
       }
     } catch (_) { /* 社員一覧に無くてもGoogleアカウント名で続行 */ }
 
-    // zip に src/identity.json を埋め込む（インストーラが氏名/メール入力を省略するため）。
+    // 監視・遠隔操作用の端末を発行する（DLごとに1台）。平文トークンはこの場で
+    // zip に1回だけ埋め込み、サーバはハッシュのみ保持する。失敗しても配布は続行。
+    let agentCfg = null;
+    try {
+      const deviceId = uuidv4();
+      const deviceToken = `${uuidv4()}${uuidv4()}`.replace(/-/g, '');
+      await supabase.from('workscope_devices').insert({
+        id: deviceId,
+        token_hash: sha256hex(deviceToken),
+        staff_id: staffId,
+        employee_name: name,
+        email,
+      });
+      const proto = String(req.headers['x-forwarded-proto'] || req.protocol || 'https').split(',')[0].trim();
+      const portalBase = process.env.PORTAL_API_URL || `${proto}://${req.get('host')}`;
+      agentCfg = { portal_base_url: portalBase, device_id: deviceId, device_token: deviceToken, agent_poll_seconds: 300 };
+    } catch (dErr) {
+      console.error('Error (workscope device mint):', dErr.message);
+    }
+
+    // zip に src/identity.json（氏名/メール）と src/agent_config.json（監視トークン）を埋め込む。
     // 失敗しても元zipをそのまま配る（手入力フォームにフォールバックできる）。
     let outBuf = zipBuf;
     try {
       const zip = await JSZip.loadAsync(zipBuf);
       zip.file('src/identity.json', JSON.stringify({ employee_name: name, email }, null, 2));
+      if (agentCfg) zip.file('src/agent_config.json', JSON.stringify(agentCfg, null, 2));
       outBuf = await zip.generateAsync({ type: 'nodebuffer' });
     } catch (zErr) {
       console.error('Error (workscope identity inject):', zErr.message);
@@ -3299,6 +3348,270 @@ app.get('/api/admin/workscope/downloads', requireAuth, requireAdmin, async (req,
     });
   } catch (error) {
     console.error('Error (workscope downloads admin):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════
+//  WorkScope 監視・遠隔操作（ハートビート + 命令キュー）
+//  端末側（ws_agent.py）は requireDevice、管理者UIは requireAuth+requireAdmin。
+// ══════════════════════════════════════════════════════════════
+
+// ── 端末→サーバ: 生存報告（ハートビート）──────────────────────
+app.post('/api/workscope/agent/heartbeat', requireDevice, async (req, res) => {
+  try {
+    const b = req.body || {};
+    const num = (v) => (v == null || v === '' || isNaN(Number(v)) ? null : Math.trunc(Number(v)));
+    const bool = (v) => (v == null ? null : !!v);
+
+    // 端末台帳の最終接触・版・ホスト名を更新
+    await supabase.from('workscope_devices').update({
+      last_seen_at: new Date().toISOString(),
+      version: b.version || req.device.version || null,
+      hostname: b.hostname || req.device.hostname || null,
+    }).eq('id', req.device.id);
+
+    // 最新状態を upsert（端末1台=1行）
+    await supabase.from('workscope_status').upsert({
+      device_id: req.device.id,
+      ts: new Date().toISOString(),
+      outlook_ok: bool(b.outlook_ok),
+      received_today: num(b.received_today),
+      sent_today: num(b.sent_today),
+      activity_ok: bool(b.activity_ok),
+      keylog_ok: bool(b.keylog_ok),
+      last_send_at: b.last_send_at || null,
+      last_send_date: b.last_send_date || null,
+      agent_version: b.agent_version || null,
+      extra: b.extra || null,
+    }, { onConflict: 'device_id' });
+
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error (workscope heartbeat):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ── 端末→サーバ: 未処理の命令を取得（取得と同時に sent へ）──────
+app.get('/api/workscope/agent/commands', requireDevice, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('workscope_commands')
+      .select('id, cmd, args, created_at')
+      .eq('device_id', req.device.id)
+      .eq('status', 'queued')
+      .order('created_at', { ascending: true });
+    if (error) throw error;
+    const cmds = data || [];
+    if (cmds.length) {
+      await supabase.from('workscope_commands')
+        .update({ status: 'sent', sent_at: new Date().toISOString() })
+        .in('id', cmds.map((c) => c.id));
+    }
+    res.json({ commands: cmds });
+  } catch (error) {
+    console.error('Error (workscope agent commands):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ── 端末→サーバ: 命令の実行結果を報告 ──────────────────────────
+app.post('/api/workscope/agent/commands/:id/result', requireDevice, async (req, res) => {
+  try {
+    const status = req.body?.status === 'error' ? 'error' : 'done';
+    const result = String(req.body?.result || '').slice(0, 2000);
+    const { error } = await supabase.from('workscope_commands')
+      .update({ status, result, done_at: new Date().toISOString() })
+      .eq('id', req.params.id)
+      .eq('device_id', req.device.id); // 自端末の命令のみ更新可
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error (workscope agent result):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ── 管理者: 監視ダッシュボード（端末ごとの最新状態＋赤信号判定）────
+app.get('/api/admin/workscope/status', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const { data: devices, error: dErr } = await supabase
+      .from('workscope_devices')
+      .select('*')
+      .eq('revoked', false)
+      .order('last_seen_at', { ascending: false, nullsFirst: false });
+    if (dErr) throw dErr;
+
+    const { data: statuses } = await supabase.from('workscope_status').select('*');
+    const stMap = new Map((statuses || []).map((s) => [s.device_id, s]));
+
+    const now = Date.now();
+    const ONLINE_MS = 30 * 60 * 1000;   // 30分以内のハートビートで「オンライン」
+    const todayStr = new Date().toISOString().slice(0, 10);
+
+    // 同一人物が複数端末を持つ場合、直近ハートビートの1台を代表にする
+    const seenEmail = new Set();
+    const rows = [];
+    const DATA_FRESH_MS = 26 * 60 * 60 * 1000; // 直近26時間に送信があれば「稼働中」
+    for (const d of (devices || [])) {
+      const s = stMap.get(d.id) || {};
+      const isCentral = (d.source || 'agent') === 'central';
+      const lastSeen = d.last_seen_at ? new Date(d.last_seen_at).getTime() : 0;
+      const lastSend = s.last_send_at ? new Date(s.last_send_at).getTime() : 0;
+      const staleData = !s.last_send_date || String(s.last_send_date) < todayStr;
+
+      // agent端末はハートビート鮮度、central擬似端末は「PCの送信鮮度」でオンライン判定。
+      const online = isCentral
+        ? (lastSend > 0 && (now - lastSend) < DATA_FRESH_MS)
+        : (lastSeen > 0 && (now - lastSeen) < ONLINE_MS);
+
+      const alerts = [];
+      if (isCentral) {
+        if (!lastSend) alerts.push('データ未受信（送信実績なし）');
+        else if (!online) alerts.push('停止の疑い（1日以上データ送信なし）');
+      } else {
+        if (!lastSeen) alerts.push('未接続（一度もハートビートなし）');
+        else if (!online) alerts.push('オフライン（30分以上ハートビートなし）');
+      }
+      if (s.outlook_ok === false) alerts.push('Outlook取得エラー');
+      if (s.keylog_ok === false) alerts.push('キーロガー停止');
+      if (s.activity_ok === false) alerts.push('ActivityWatch応答なし');
+      if (online && s.received_today === 0) alerts.push('本日の受信メール0件');
+      if (staleData) alerts.push('本日分データ未送信');
+
+      const emailKey = String(d.email || '').toLowerCase();
+      const primary = emailKey ? !seenEmail.has(emailKey) : true;
+      if (emailKey) seenEmail.add(emailKey);
+
+      rows.push({
+        device_id: d.id,
+        staff_id: d.staff_id,
+        name: d.employee_name,
+        email: d.email,
+        hostname: d.hostname,
+        version: d.version,
+        source: d.source || 'agent',
+        agent_enabled: d.agent_enabled !== false,
+        last_seen_at: d.last_seen_at,
+        online,
+        primary, // 一覧の既定表示対象（同一人物の最新端末）
+        outlook_ok: s.outlook_ok ?? null,
+        received_today: s.received_today ?? null,
+        sent_today: s.sent_today ?? null,
+        activity_ok: s.activity_ok ?? null,
+        keylog_ok: s.keylog_ok ?? null,
+        last_send_at: s.last_send_at ?? null,
+        last_send_date: s.last_send_date ?? null,
+        agent_version: s.agent_version ?? null,
+        alerts,
+      });
+    }
+
+    res.json({
+      generated_at: new Date().toISOString(),
+      online_count: rows.filter((r) => r.online).length,
+      alert_count: rows.filter((r) => r.alerts.length > 0).length,
+      devices: rows,
+    });
+  } catch (error) {
+    console.error('Error (workscope status admin):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ── 管理者: 端末へ命令を発行（今すぐ送信 / 期間再送 / 点検 等）────
+app.post('/api/admin/workscope/commands', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const { device_id, cmd, args } = req.body || {};
+    const ALLOWED = ['send', 'resend', 'resend_range', 'catchup', 'ping'];
+    if (!device_id || !ALLOWED.includes(cmd)) {
+      return res.status(400).json({ error: 'device_id と正しい cmd を指定してください' });
+    }
+    // 対象端末の実在確認
+    const { data: dev } = await supabase.from('workscope_devices')
+      .select('id').eq('id', device_id).maybeSingle();
+    if (!dev) return res.status(404).json({ error: '端末が見つかりません' });
+
+    const id = uuidv4();
+    const { error } = await supabase.from('workscope_commands').insert({
+      id, device_id, cmd, args: args || {}, status: 'queued', created_by: req.user.email,
+    });
+    if (error) throw error;
+    res.json({ ok: true, id });
+  } catch (error) {
+    console.error('Error (workscope command create):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ── 管理者: 命令の履歴・状態一覧 ──────────────────────────────
+app.get('/api/admin/workscope/commands', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    let q = supabase.from('workscope_commands')
+      .select('id, device_id, cmd, args, status, result, created_by, created_at, sent_at, done_at')
+      .order('created_at', { ascending: false })
+      .limit(100);
+    if (req.query.device_id) q = q.eq('device_id', req.query.device_id);
+    const { data, error } = await q;
+    if (error) throw error;
+    res.json({ commands: data || [] });
+  } catch (error) {
+    console.error('Error (workscope commands admin):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ── 管理PC→サーバ: 既存端末の状態を代理登録（エージェント未導入でも監視できる）──
+//    保護: ヘッダ x-cron-key が環境変数 CRON_KEY と一致する場合のみ。
+//    管理PCの集約処理が _raw から各社員の健康値を読み、まとめて POST する。
+//    これで作られる端末は source='central' / agent_enabled=false（＝監視のみ・遠隔操作不可）。
+app.post('/api/workscope/central/status', async (req, res) => {
+  try {
+    const key = req.headers['x-cron-key'];
+    if (!process.env.CRON_KEY || key !== process.env.CRON_KEY) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+    const list = Array.isArray(req.body?.devices) ? req.body.devices : [];
+    const num = (v) => (v == null || v === '' || isNaN(Number(v)) ? null : Math.trunc(Number(v)));
+    const bool = (v) => (v == null ? null : !!v);
+    let n = 0;
+    for (const d of list) {
+      const name = String(d.employee_name || '').trim();
+      if (!name) continue;
+      const id = deterministicUuid(name);
+
+      // email / staff_id 未指定なら社員名で staff_master を突合
+      let email = d.email || null;
+      let staffId = d.staff_id || null;
+      if (!email || !staffId) {
+        try {
+          const { data: staff } = await supabase
+            .from('staff_master').select('id, email').eq('name', name).maybeSingle();
+          if (staff) { staffId = staffId || staff.id; email = email || staff.email; }
+        } catch (_) { /* 名簿未整備でも続行 */ }
+      }
+
+      // 端末台帳（擬似端末）。revoked は手動失効を尊重して上書きしない。
+      await supabase.from('workscope_devices').upsert({
+        id, token_hash: null, source: 'central', agent_enabled: false,
+        staff_id: staffId, employee_name: name, email,
+        hostname: d.hostname || null, version: d.version || null,
+        last_seen_at: new Date().toISOString(),
+      }, { onConflict: 'id' });
+
+      await supabase.from('workscope_status').upsert({
+        device_id: id, ts: new Date().toISOString(),
+        outlook_ok: bool(d.outlook_ok), received_today: num(d.received_today),
+        sent_today: num(d.sent_today), activity_ok: bool(d.activity_ok),
+        keylog_ok: bool(d.keylog_ok), last_send_at: d.last_send_at || null,
+        last_send_date: d.last_send_date || null,
+      }, { onConflict: 'device_id' });
+      n++;
+    }
+    res.json({ ok: true, updated: n });
+  } catch (error) {
+    console.error('Error (workscope central status):', error.message);
     res.status(500).json({ error: error.message });
   }
 });
