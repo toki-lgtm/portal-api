@@ -7327,6 +7327,40 @@ app.post('/api/construction/projects/:id/inspection-tests/extract', requireAuth,
   }
 });
 
+// ✅ 工事管理 - 保管庫(書類整理)の保存済みファイルから受検・試験を AI 抽出（保存しない・プレビュー専用）
+app.post('/api/construction/projects/:id/inspection-tests/extract-stored', requireAuth, requireConstructionAccess, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const fileIds = Array.isArray(req.body?.file_ids) ? req.body.file_ids.map(Number).filter(Boolean) : [];
+    if (!fileIds.length) return res.status(400).json({ error: '対象ファイルを選択してください' });
+    const { data: project } = await supabase
+      .from('construction_projects').select('id').eq('id', id).eq('is_active', true).maybeSingle();
+    if (!project) return res.status(404).json({ error: '工事が見つかりません' });
+    const { data: rows, error } = await supabase.from('submission_files')
+      .select('id, file_ref, file_name, mime_type, size_bytes')
+      .eq('project_id', id).in('id', fileIds);
+    if (error) throw error;
+    if (!rows || !rows.length) return res.status(404).json({ error: '選択したファイルが見つかりません' });
+    // 保管庫から実バイト列を取得（drive: / バケット両対応）。読み取れる形式のみ採用。
+    const files = [];
+    for (const r of rows) {
+      const mimetype = r.mime_type || guessMimeByName(r.file_name);
+      if (!geminiAnalyzable(mimetype, r.size_bytes)) continue;
+      try {
+        const buffer = await loadStoredFileBuffer(r.file_ref, CONSTRUCTION_BUCKET);
+        if (buffer) files.push({ buffer, mimetype, size: r.size_bytes ?? buffer.length, originalname: r.file_name });
+      } catch (e) { console.error('extract-stored load:', r.file_name, e.message); }
+    }
+    if (!files.length) return res.status(400).json({ error: 'AIで読み取れるファイル（PDF/画像・15MB以内）がありませんでした' });
+    const picked = selectSpecDocsForExtract(files);
+    const items = await extractInspectionTests(picked);
+    res.json({ items, used_files: picked.map((f) => f.originalname) });
+  } catch (error) {
+    console.error('Error (inspection-tests extract-stored):', error.message);
+    res.status(error.status || 500).json({ error: error.message });
+  }
+});
+
 // ✅ 工事管理 - AI抽出した受検・試験を一括登録（確認後）
 app.post('/api/construction/projects/:id/inspection-tests/bulk', requireAuth, requireConstructionAccess, async (req, res) => {
   try {
