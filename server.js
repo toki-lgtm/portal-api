@@ -7295,6 +7295,11 @@ async function extractInspectionTests(files) {
   const resp = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
   if (!resp.ok) {
     const t = await resp.text();
+    // パスワード保護PDF等は Gemini が "The document has no pages." (INVALID_ARGUMENT) を返す。分かりやすく案内する。
+    if (resp.status === 400 && /no pages|INVALID_ARGUMENT/i.test(t)) {
+      const e = new Error('選択したPDFを読み取れませんでした。パスワード保護されたPDF（ファイル名に「PW解除前」等）や破損の可能性があります。閲覧可（パスワード解除済み）のPDFを保管庫に入れて選び直してください。');
+      e.status = 400; throw e;
+    }
     const e = new Error(`Gemini API エラー (${resp.status}): ${t.slice(0, 300)}`); e.status = 502; throw e;
   }
   const json = await resp.json();
