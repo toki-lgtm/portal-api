@@ -5045,7 +5045,7 @@ app.get('/api/construction/projects/:id', requireAuth, requireConstructionAccess
     if (!project) return res.status(404).json({ error: '工事が見つかりません' });
     // 開いたとき自動棚卸し（24h毎）。失敗しても詳細取得は継続。実行した場合は下のクエリで最新が反映される。
     try { await maybeAutoSweepInspection(project); } catch (e) { console.error('auto-sweep:', e.message); }
-    const [{ data: docs }, { data: files }, { data: changes }, { data: changeFiles }, { data: inspItems }, nameMap] = await Promise.all([
+    const [{ data: docs }, { data: files }, { data: changes }, { data: changeFiles }, { data: inspItems }, { data: inspTests }, nameMap] = await Promise.all([
       supabase.from('submission_documents').select('*')
         .eq('project_id', id)
         .order('folder_no', { ascending: true })
@@ -5059,6 +5059,8 @@ app.get('/api/construction/projects/:id', requireAuth, requireConstructionAccess
         .eq('project_id', id),
       supabase.from('project_inspection_items').select('*')
         .eq('project_id', id).order('sort_order', { ascending: true }),
+      supabase.from('project_inspection_tests').select('*')
+        .eq('project_id', id).order('sort_order', { ascending: true }).order('id', { ascending: true }),
       loadStaffNameMap(),
     ]);
     // 添付ファイルを書類ごとにまとめ、署名付きの一時URLを付与
@@ -5100,6 +5102,7 @@ app.get('/api/construction/projects/:id', requireAuth, requireConstructionAccess
       documents,
       design_changes,
       inspection_items: inspItems || [],
+      inspection_tests: inspTests || [],
     });
   } catch (error) {
     console.error('Error (construction detail):', error.message);
@@ -7173,6 +7176,278 @@ app.post('/api/construction/projects/:id/design-changes/extract', requireAuth, r
   } catch (error) {
     console.error('Error (design-changes extract):', error.message);
     res.status(error.status || 500).json({ error: error.message });
+  }
+});
+
+// ============================================================
+// 工事管理 - 受検・試験リスト（特記仕様書からの検査・試験抽出＋管理）  ← migration 047
+//   ・extractInspectionTests : 特記仕様書(PDF/画像)を Gemini で読み取り、
+//       発注者検査・化学物質濃度試験・法定検査・その他試験を配列で抽出（保存しない）
+//   ・POST .../inspection-tests/extract : プレビュー（人が是正するための抽出結果を返す）
+//   ・POST .../inspection-tests/bulk    : 確認済みの抽出結果を一括登録
+//   ・POST .../inspection-tests         : 手動で1件追加
+//   ・PATCH /inspection-tests/:id       : 状態・予定日・実施日・結果・紐づけ等を更新
+//   ・DELETE /inspection-tests/:id      : 削除
+//   既存の書類AI連携（extractConstructionInfo）と同じ Gemini 方式を踏襲。
+// ============================================================
+
+const INSPECTION_TEST_CATEGORIES = ['発注者検査', '化学物質濃度試験', '法定検査', 'その他試験'];
+const INSPECTION_TEST_STATUSES = ['planned', 'requested', 'done', 'passed', 'failed', 'na'];
+
+// 特記仕様書らしいファイルを優先選別（合計上限内で最大6件）
+function selectSpecDocsForExtract(files) {
+  const KW = ['特記', '仕様', '共通仕様', '設計図書'];
+  const cand = (files || []).filter((f) => geminiAnalyzable(f.mimetype, f.size));
+  const scored = cand.map((f) => {
+    const nm = f.originalname || '';
+    let s = 0; for (const k of KW) if (nm.includes(k)) s += 2;
+    return { f, s };
+  }).sort((a, b) => b.s - a.s || (a.f.size || 0) - (b.f.size || 0));
+  const picked = []; let total = 0;
+  for (const { f } of scored) {
+    if (picked.length >= 6) break;
+    if (total + (f.size || 0) > CONS_AI_EXTRACT_TOTAL) continue;
+    picked.push(f); total += (f.size || 0);
+  }
+  if (!picked.length && cand.length) picked.push([...cand].sort((a, b) => (a.size || 0) - (b.size || 0))[0]);
+  return picked;
+}
+
+// 抽出結果の1項目を正規化（不正・空名は除外）
+function normInspectionTest(p) {
+  const name = (p?.name || '').trim();
+  if (!name) return null;
+  const category = INSPECTION_TEST_CATEGORIES.includes((p.category || '').trim()) ? p.category.trim() : 'その他試験';
+  return {
+    category,
+    name,
+    target: (p.target || '').trim() || null,
+    timing: (p.timing || '').trim() || null,
+    basis: (p.basis || '').trim() || null,
+    witness: (p.witness || '').trim() || null,
+    applicable: p.applicable === false ? false : true,
+    confidence: typeof p.confidence === 'number' ? Math.max(0, Math.min(1, p.confidence)) : null,
+    reason: (p.reason || '').trim() || null,
+  };
+}
+
+// 特記仕様書から「受ける検査・実施する試験・測定」を配列で抽出
+async function extractInspectionTests(files) {
+  if (!GEMINI_API_KEY) { const e = new Error('GEMINI_API_KEY が未設定です。'); e.status = 503; throw e; }
+  const prompt = [
+    'これは日本の公共建築工事（発注者: 九州防衛局／官庁営繕）の特記仕様書です。',
+    'この仕様書から「工事中〜完成時に受ける検査」と「実施が求められる試験・測定」を漏れなく抽出してください。',
+    '',
+    '【この仕様書の読み方（重要）】',
+    '・官庁営繕の特記仕様書は選択式で、各項目に「※」「レ」等のチェック印が付いた選択肢が"採用される内容"です。',
+    '・「※行う」「※実施する」「※測定する」「※適用する」等にチェックがある項目 = 実施する（applicable=true）。',
+    '・「※行わない」「※適用しない」「該当なし」にチェックがある項目 = 対象外（applicable=false）。ただし記録として残すため抽出する。',
+    '',
+    '【抽出対象（次のいずれかに該当する項目を全て）】',
+    '1. 発注者(監督官)が行う検査・技術検査（完成検査、中間技術検査、段階確認、部分使用検査、既済部分検査、監督官の立会検査 等）',
+    '2. 化学物質の濃度測定（室内空気中のホルムアルデヒド・トルエン・キシレン・エチルベンゼン・スチレン等の測定）',
+    '3. 法定検査（建築基準法の中間検査・完了検査、特定行政庁・建築主事の検査、消防検査 等）',
+    '4. その他の試験・測定（材料の検査、コンクリート試験、鉄筋ガス圧接部の外観/超音波探傷/引張試験、地盤の載荷試験、六価クロム溶出試験、単位水量測定、タイル接着力試験 等、仕様書が実施を求めるもの）',
+    '',
+    '【各項目の出力（items 配列の各要素）】',
+    '- category: 上記4区分のいずれか。文字列で "発注者検査" / "化学物質濃度試験" / "法定検査" / "その他試験"',
+    '- name: 検査・試験・測定の名称（簡潔に。例: 中間技術検査 / 化学物質の濃度測定 / 圧接部の超音波探傷試験）',
+    '- target: 対象（対象工程・対象室・対象材料・対象物質など。無ければ空文字）',
+    '- timing: 実施時期（工程上のどこか。例: 工事完成時 / 配筋完了後 / 各階。読み取れれば。無ければ空文字）',
+    '- basis: 根拠（特記仕様書の項番号やページ、参照する標準仕様書の条番号。例: 特記12項 / 標準仕様書5.4.10。無ければ空文字）',
+    '- witness: 立会区分。"発注者立会" / "自主" / "特定行政庁" / "消防" のいずれか、判断できなければ空文字',
+    '- applicable: 実施する=true / 対象外(行わない・適用しない)=false（真偽値）',
+    '- confidence: 抽出の確信度 0.0〜1.0（数値）',
+    '- reason: 抽出根拠を短く（どこにどう書かれていたか。20〜40字。無ければ空文字）',
+    '',
+    '読み取れない項目は空文字にする。仕様書に実際に書かれている検査・試験・測定のみ抽出し、推測で項目を創作しないこと。',
+  ].join('\n');
+
+  const parts = [{ text: prompt }];
+  for (const f of files) parts.push({ inlineData: { mimeType: f.mimetype || 'application/pdf', data: f.buffer.toString('base64') } });
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+  const body = {
+    contents: [{ parts }],
+    generationConfig: {
+      temperature: 0,
+      responseMimeType: 'application/json',
+      responseSchema: {
+        type: 'OBJECT',
+        properties: {
+          items: {
+            type: 'ARRAY',
+            items: {
+              type: 'OBJECT',
+              properties: {
+                category: { type: 'STRING' }, name: { type: 'STRING' }, target: { type: 'STRING' },
+                timing: { type: 'STRING' }, basis: { type: 'STRING' }, witness: { type: 'STRING' },
+                applicable: { type: 'BOOLEAN' }, confidence: { type: 'NUMBER' }, reason: { type: 'STRING' },
+              },
+              required: ['category', 'name', 'applicable'],
+            },
+          },
+        },
+      },
+    },
+  };
+
+  const resp = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  if (!resp.ok) {
+    const t = await resp.text();
+    const e = new Error(`Gemini API エラー (${resp.status}): ${t.slice(0, 300)}`); e.status = 502; throw e;
+  }
+  const json = await resp.json();
+  const text = json?.candidates?.[0]?.content?.parts?.[0]?.text;
+  if (!text) throw new Error('Gemini から有効な応答が得られませんでした');
+  let p; try { p = JSON.parse(text); } catch { throw new Error('Gemini 応答の解析に失敗しました'); }
+  const arr = Array.isArray(p?.items) ? p.items : (Array.isArray(p) ? p : []);
+  const out = [];
+  for (const it of arr) { const n = normInspectionTest(it); if (n) out.push(n); }
+  return out;
+}
+
+// ✅ 工事管理 - 特記仕様書から受検・試験を AI 抽出（保存しない・プレビュー専用）
+app.post('/api/construction/projects/:id/inspection-tests/extract', requireAuth, requireConstructionAccess, upload.array('files', 20), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const files = req.files || [];
+    if (!files.length) return res.status(400).json({ error: 'files（特記仕様書）が必要です' });
+    for (const f of files) f.originalname = decodeUploadName(f.originalname);
+    const { data: project } = await supabase
+      .from('construction_projects').select('id').eq('id', id).eq('is_active', true).maybeSingle();
+    if (!project) return res.status(404).json({ error: '工事が見つかりません' });
+    const picked = selectSpecDocsForExtract(files);
+    if (!picked.length) return res.status(400).json({ error: 'AIで読み取れる書類（PDF/画像）が見つかりませんでした。手入力で登録してください。' });
+    const items = await extractInspectionTests(picked);
+    res.json({ items, used_files: picked.map((f) => f.originalname) });
+  } catch (error) {
+    console.error('Error (inspection-tests extract):', error.message);
+    res.status(error.status || 500).json({ error: error.message });
+  }
+});
+
+// ✅ 工事管理 - AI抽出した受検・試験を一括登録（確認後）
+app.post('/api/construction/projects/:id/inspection-tests/bulk', requireAuth, requireConstructionAccess, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const list = Array.isArray(req.body?.items) ? req.body.items : [];
+    if (!list.length) return res.status(400).json({ error: '登録する項目がありません' });
+    const { data: project } = await supabase
+      .from('construction_projects').select('id').eq('id', id).eq('is_active', true).maybeSingle();
+    if (!project) return res.status(404).json({ error: '工事が見つかりません' });
+    // 既存の最大 sort_order の続きから連番を振る
+    const { data: last } = await supabase.from('project_inspection_tests')
+      .select('sort_order').eq('project_id', id).order('sort_order', { ascending: false }).limit(1).maybeSingle();
+    let so = last?.sort_order || 0;
+    const rows = [];
+    for (const raw of list) {
+      const n = normInspectionTest(raw);
+      if (!n) continue;
+      so += 1;
+      rows.push({
+        project_id: Number(id),
+        category: n.category, name: n.name, target: n.target, timing: n.timing,
+        basis: n.basis, witness: n.witness, applicable: n.applicable,
+        status: n.applicable ? 'planned' : 'na',
+        source: 'ai', ai_confidence: n.confidence, ai_reason: n.reason,
+        sort_order: so, created_by: req.user.email,
+      });
+    }
+    if (!rows.length) return res.status(400).json({ error: '有効な項目がありませんでした' });
+    const inserted = [];
+    for (let i = 0; i < rows.length; i += 100) {
+      const { data, error } = await supabase.from('project_inspection_tests').insert(rows.slice(i, i + 100)).select('*');
+      if (error) throw error;
+      inserted.push(...(data || []));
+    }
+    res.json({ inserted: inserted.length, items: inserted });
+  } catch (error) {
+    console.error('Error (inspection-tests bulk):', error.message);
+    res.status(error.status || 500).json({ error: error.message });
+  }
+});
+
+// ✅ 工事管理 - 受検・試験を手動で1件追加
+app.post('/api/construction/projects/:id/inspection-tests', requireAuth, requireConstructionAccess, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const b = req.body || {};
+    const name = (b.name || '').trim();
+    if (!name) return res.status(400).json({ error: '名称は必須です' });
+    const category = INSPECTION_TEST_CATEGORIES.includes((b.category || '').trim()) ? b.category.trim() : 'その他試験';
+    const applicable = b.applicable === false ? false : true;
+    const { data: last } = await supabase.from('project_inspection_tests')
+      .select('sort_order').eq('project_id', id).order('sort_order', { ascending: false }).limit(1).maybeSingle();
+    const row = {
+      project_id: Number(id), category, name,
+      target: (b.target || '').trim() || null,
+      timing: (b.timing || '').trim() || null,
+      basis: (b.basis || '').trim() || null,
+      witness: (b.witness || '').trim() || null,
+      applicable, status: applicable ? 'planned' : 'na',
+      source: 'manual', sort_order: (last?.sort_order || 0) + 1, created_by: req.user.email,
+    };
+    const { data, error } = await supabase.from('project_inspection_tests').insert([row]).select('*').single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (inspection-test add):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 工事管理 - 受検・試験の1件更新（状態・予定日・実施日・結果・紐づけ 等）
+app.patch('/api/construction/inspection-tests/:testId', requireAuth, requireConstructionAccess, async (req, res) => {
+  try {
+    const { testId } = req.params;
+    const b = req.body || {};
+    const payload = { updated_at: new Date().toISOString() };
+    if ('status' in b) {
+      if (!INSPECTION_TEST_STATUSES.includes(b.status)) return res.status(400).json({ error: '不正なステータスです' });
+      payload.status = b.status;
+    }
+    if ('category' in b) {
+      payload.category = INSPECTION_TEST_CATEGORIES.includes((b.category || '').trim()) ? b.category.trim() : 'その他試験';
+    }
+    if ('name' in b) {
+      const nm = (b.name || '').trim();
+      if (!nm) return res.status(400).json({ error: '名称は必須です' });
+      payload.name = nm;
+    }
+    for (const k of ['target', 'timing', 'basis', 'witness', 'result_note']) {
+      if (k in b) payload[k] = (b[k] || '').trim() || null;
+    }
+    if ('applicable' in b) {
+      payload.applicable = b.applicable === false ? false : true;
+      if (payload.applicable === false && !('status' in b)) payload.status = 'na';
+    }
+    for (const k of ['scheduled_date', 'done_date']) {
+      if (k in b) payload[k] = cleanIsoDate(b[k]);
+    }
+    if ('linked_document_id' in b) payload.linked_document_id = b.linked_document_id || null;
+    const { data, error } = await supabase
+      .from('project_inspection_tests').update(payload).eq('id', testId).select('*').single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (inspection-test update):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 工事管理 - 受検・試験の削除
+app.delete('/api/construction/inspection-tests/:testId', requireAuth, requireConstructionAccess, async (req, res) => {
+  try {
+    const { testId } = req.params;
+    const { data, error } = await supabase
+      .from('project_inspection_tests').delete().eq('id', testId).select('id');
+    if (error) throw error;
+    if (!data?.length) return res.status(404).json({ error: '項目が見つかりません' });
+    res.json({ deleted: true });
+  } catch (error) {
+    console.error('Error (inspection-test delete):', error.message);
+    res.status(500).json({ error: error.message });
   }
 });
 
