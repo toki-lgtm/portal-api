@@ -7258,6 +7258,33 @@ function normInspectionTest(p) {
   };
 }
 
+// 受検・試験リスト → 工事写真ツリーへ同期。実施対象(status!=='na')で、まだ写真ノードが
+// 無いものだけを撮影対象として追加する（trade='検査・試験' でまとめる）。冪等。
+async function syncInspectionTestsToPhotoNodes(projectId, email) {
+  const [{ data: tests }, { data: nodes }] = await Promise.all([
+    supabase.from('project_inspection_tests').select('*').eq('project_id', projectId).neq('status', 'na'),
+    supabase.from('construction_photo_nodes').select('inspection_test_id').eq('project_id', projectId).not('inspection_test_id', 'is', null),
+  ]);
+  const have = new Set((nodes || []).map((n) => n.inspection_test_id));
+  const rows = (tests || []).filter((t) => !have.has(t.id)).map((t, i) => ({
+    project_id: Number(projectId), inspection_test_id: t.id, master_id: null,
+    edition: null, trade: '検査・試験', category: t.category,
+    photo_item: t.name, target: t.name, timing: t.timing || '検査・試験時',
+    source: 'manual', required: true, is_active: true,
+    sort_order: 9000 + (t.sort_order || i),
+    note: t.target ? `対象: ${t.target}` : null,
+    created_by: email || null,
+  }));
+  if (!rows.length) return { inserted: 0 };
+  let inserted = 0;
+  for (let i = 0; i < rows.length; i += 200) {
+    const { error } = await supabase.from('construction_photo_nodes').insert(rows.slice(i, i + 200));
+    if (error) throw error;
+    inserted += rows.slice(i, i + 200).length;
+  }
+  return { inserted };
+}
+
 // 特記仕様書から「受ける検査・実施する試験・測定」を配列で抽出
 // project（construction_type / work_category）を渡すと工事区分を踏まえて法定検査の要否を判断する。
 async function extractInspectionTests(files, project) {
@@ -7454,7 +7481,11 @@ app.post('/api/construction/projects/:id/inspection-tests/bulk', requireAuth, re
       if (error) throw error;
       inserted.push(...(data || []));
     }
-    res.json({ inserted: inserted.length, items: inserted });
+    // 実施対象は工事写真ツリーにも撮影対象として追加（失敗しても登録は成立させる）
+    let photoNodesAdded = 0;
+    try { photoNodesAdded = (await syncInspectionTestsToPhotoNodes(id, req.user.email)).inserted; }
+    catch (e) { console.error('photo sync (bulk):', e.message); }
+    res.json({ inserted: inserted.length, items: inserted, photo_nodes_added: photoNodesAdded });
   } catch (error) {
     console.error('Error (inspection-tests bulk):', error.message);
     res.status(error.status || 500).json({ error: error.message });
@@ -7483,6 +7514,10 @@ app.post('/api/construction/projects/:id/inspection-tests', requireAuth, require
     };
     const { data, error } = await supabase.from('project_inspection_tests').insert([row]).select('*').single();
     if (error) throw error;
+    // 実施対象は工事写真ツリーにも追加（対象外は sync 側で除外）
+    if (applicable) {
+      try { await syncInspectionTestsToPhotoNodes(id, req.user.email); } catch (e) { console.error('photo sync (add):', e.message); }
+    }
     res.json(data);
   } catch (error) {
     console.error('Error (inspection-test add):', error.message);
@@ -7540,6 +7575,18 @@ app.delete('/api/construction/inspection-tests/:testId', requireAuth, requireCon
     res.json({ deleted: true });
   } catch (error) {
     console.error('Error (inspection-test delete):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 工事管理 - 受検・試験リストを工事写真ツリーへ同期（撮影対象として追加）
+app.post('/api/construction/projects/:id/inspection-tests/sync-photos', requireAuth, requireConstructionAccess, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const r = await syncInspectionTestsToPhotoNodes(id, req.user.email);
+    res.json(r);
+  } catch (error) {
+    console.error('Error (inspection-tests sync-photos):', error.message);
     res.status(500).json({ error: error.message });
   }
 });
