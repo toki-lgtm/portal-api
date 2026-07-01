@@ -7259,11 +7259,18 @@ function normInspectionTest(p) {
 }
 
 // 特記仕様書から「受ける検査・実施する試験・測定」を配列で抽出
-async function extractInspectionTests(files) {
+// project（construction_type / work_category）を渡すと工事区分を踏まえて法定検査の要否を判断する。
+async function extractInspectionTests(files, project) {
   if (!GEMINI_API_KEY) { const e = new Error('GEMINI_API_KEY が未設定です。'); e.status = 503; throw e; }
+  const kubun = [project?.construction_type, project?.work_category].filter(Boolean).join('・') || '不明';
   const prompt = [
     'これは日本の公共建築工事（発注者: 九州防衛局／官庁営繕）の特記仕様書です。',
     'この仕様書が「実際に実施を求めている検査・試験・測定」だけを抽出してください。過剰抽出を厳に避けること。',
+    `【この工事の区分】${kubun}（この区分を踏まえて法定検査の要否を判断すること）`,
+    '',
+    '【工事内容を勘案して判断する検査（重要）】',
+    '・発注者による「完成検査」（契約に基づく検査職員の完成検査）は、公共工事では特記仕様書に明記が無くても必ず実施される。区分「発注者検査」で applicable=true の1件として必ず含めること（basis 例:「契約に基づく（特記記載なくても実施）」、timing:「工事完成時」）。',
+    '・建築基準法に基づく検査（建築主事・特定行政庁による中間検査・完了検査）は、建築確認を要する工事でのみ発生する。改修工事では通常発生しないため、特記仕様書に明確な記載がない限り計上しないこと。上記の工事区分を勘案して判断する。',
     '',
     '【この仕様書の読み方（重要）】',
     '・官庁営繕の特記仕様書は選択式で、各項目に「※」「●」「レ」等のチェック印が付いた選択肢だけが"採用される内容"です。',
@@ -7356,11 +7363,11 @@ app.post('/api/construction/projects/:id/inspection-tests/extract', requireAuth,
     if (!files.length) return res.status(400).json({ error: 'files（特記仕様書）が必要です' });
     for (const f of files) f.originalname = decodeUploadName(f.originalname);
     const { data: project } = await supabase
-      .from('construction_projects').select('id').eq('id', id).eq('is_active', true).maybeSingle();
+      .from('construction_projects').select('id, construction_type, work_category').eq('id', id).eq('is_active', true).maybeSingle();
     if (!project) return res.status(404).json({ error: '工事が見つかりません' });
     const picked = selectSpecDocsForExtract(files);
     if (!picked.length) return res.status(400).json({ error: 'AIで読み取れる書類（PDF/画像）が見つかりませんでした。手入力で登録してください。' });
-    const items = await extractInspectionTests(picked);
+    const items = await extractInspectionTests(picked, project);
     res.json({ items, used_files: picked.map((f) => f.originalname) });
   } catch (error) {
     console.error('Error (inspection-tests extract):', error.message);
@@ -7375,7 +7382,7 @@ app.post('/api/construction/projects/:id/inspection-tests/extract-stored', requi
     const fileIds = Array.isArray(req.body?.file_ids) ? req.body.file_ids.map(Number).filter(Boolean) : [];
     if (!fileIds.length) return res.status(400).json({ error: '対象ファイルを選択してください' });
     const { data: project } = await supabase
-      .from('construction_projects').select('id').eq('id', id).eq('is_active', true).maybeSingle();
+      .from('construction_projects').select('id, construction_type, work_category').eq('id', id).eq('is_active', true).maybeSingle();
     if (!project) return res.status(404).json({ error: '工事が見つかりません' });
     const { data: rows, error } = await supabase.from('submission_files')
       .select('id, file_ref, file_name, mime_type, size_bytes')
@@ -7404,7 +7411,7 @@ app.post('/api/construction/projects/:id/inspection-tests/extract-stored', requi
       });
     }
     const picked = selectSpecDocsForExtract(files);
-    const items = await extractInspectionTests(picked);
+    const items = await extractInspectionTests(picked, project);
     res.json({ items, used_files: picked.map((f) => f.originalname) });
   } catch (error) {
     console.error('Error (inspection-tests extract-stored):', error.message);
