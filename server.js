@@ -5802,6 +5802,22 @@ function categoryFolderName(no, name) {
 }
 // ファイルを保存し参照文字列を返す（drive:<id> もしくは Supabaseパス）。
 //   保存先: （DRIVE_FOLDER_ID）/工事管理/<工事名>/<NN_大分類名>/
+// PDF がパスワード保護（暗号化）されているか判定。保管庫には暗号化PDFを入れさせない。
+// pdf-lib は暗号化PDFの load で EncryptedPDFError を投げる。PDF以外・破損は false（ここでは弾かない）。
+function isPdfMime(mimeType, fileName) {
+  return mimeType === 'application/pdf' || /\.pdf$/i.test(fileName || '');
+}
+async function isEncryptedPdf(buffer, mimeType, fileName) {
+  if (!buffer || !isPdfMime(mimeType, fileName)) return false;
+  try {
+    await PDFDocument.load(buffer); // 暗号化なら例外を投げる
+    return false;
+  } catch (e) {
+    return /encrypt/i.test(`${e?.name || ''} ${e?.message || ''}`);
+  }
+}
+const ENCRYPTED_PDF_MSG = 'このPDFはパスワード保護されています。保管庫にはパスワードを解除したPDF（ファイル名が「PW解除前」ではなく「閲覧可」等の解除済み版）を入れてください。';
+
 async function storeConstructionFile({ projectName, categoryNo, categoryName, fileName, buffer, mimeType }) {
   if (driveConfigured()) {
     const folderId = await ensureFolderPath([
@@ -5853,6 +5869,9 @@ app.post('/api/construction/documents/:docId/files', requireAuth, requireConstru
   try {
     const { docId } = req.params;
     if (!req.file) return res.status(400).json({ error: 'file フィールドが必要です' });
+    if (await isEncryptedPdf(req.file.buffer, req.file.mimetype, req.file.originalname)) {
+      return res.status(400).json({ error: ENCRYPTED_PDF_MSG });
+    }
     const { data: doc, error: dErr } = await supabase
       .from('submission_documents').select('id, project_id, category_no, category').eq('id', docId).maybeSingle();
     if (dErr) throw dErr;
@@ -6955,6 +6974,11 @@ async function carryOverBidDocuments({ project, bidId, email }) {
   // 2) 各資料を分類 → 書類整理(保管庫)へ格納
   for (const item of loaded) {
     try {
+      // パスワード保護PDFは保管庫に入れない（AI読取も不可のため引継ぎ対象外）
+      if (await isEncryptedPdf(item.buffer, item.mimetype, item.originalname)) {
+        console.warn('carry skip (encrypted pdf):', item.originalname);
+        continue;
+      }
       let classification = null;
       if (GEMINI_API_KEY && geminiAnalyzable(item.mimetype, item.size)) {
         try { classification = await classifyConstructionDoc({ fileName: item.originalname, buffer: item.buffer, mimeType: item.mimetype }); }
@@ -6990,6 +7014,9 @@ app.post('/api/construction/projects/:id/documents/auto-file', requireAuth, requ
     if (!proj) return res.status(404).json({ error: '工事が見つかりません' });
 
     const fileName = decodeUploadName(req.file.originalname);
+    if (await isEncryptedPdf(req.file.buffer, req.file.mimetype, fileName)) {
+      return res.status(400).json({ error: ENCRYPTED_PDF_MSG });
+    }
     let classification = null;
     if (GEMINI_API_KEY && geminiAnalyzable(req.file.mimetype, req.file.size)) {
       try {
@@ -7348,15 +7375,25 @@ app.post('/api/construction/projects/:id/inspection-tests/extract-stored', requi
     if (!rows || !rows.length) return res.status(404).json({ error: '選択したファイルが見つかりません' });
     // 保管庫から実バイト列を取得（drive: / バケット両対応）。読み取れる形式のみ採用。
     const files = [];
+    let skippedEncrypted = 0;
     for (const r of rows) {
       const mimetype = r.mime_type || guessMimeByName(r.file_name);
       if (!geminiAnalyzable(mimetype, r.size_bytes)) continue;
       try {
         const buffer = await loadStoredFileBuffer(r.file_ref, CONSTRUCTION_BUCKET);
-        if (buffer) files.push({ buffer, mimetype, size: r.size_bytes ?? buffer.length, originalname: r.file_name });
+        if (!buffer) continue;
+        // パスワード保護PDFはGeminiが読めないためスキップ（他の正常ファイルで抽出は継続）
+        if (await isEncryptedPdf(buffer, mimetype, r.file_name)) { skippedEncrypted += 1; continue; }
+        files.push({ buffer, mimetype, size: r.size_bytes ?? buffer.length, originalname: r.file_name });
       } catch (e) { console.error('extract-stored load:', r.file_name, e.message); }
     }
-    if (!files.length) return res.status(400).json({ error: 'AIで読み取れるファイル（PDF/画像・15MB以内）がありませんでした' });
+    if (!files.length) {
+      return res.status(400).json({
+        error: skippedEncrypted
+          ? `選択したPDFはパスワード保護されているため読み取れませんでした（${skippedEncrypted}件）。${ENCRYPTED_PDF_MSG}`
+          : 'AIで読み取れるファイル（PDF/画像・15MB以内）がありませんでした',
+      });
+    }
     const picked = selectSpecDocsForExtract(files);
     const items = await extractInspectionTests(picked);
     res.json({ items, used_files: picked.map((f) => f.originalname) });
