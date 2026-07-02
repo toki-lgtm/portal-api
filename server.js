@@ -409,6 +409,7 @@ app.get('/api/apps', requireAuth, async (req, res) => {
       { id: 15, key: 'manual', name: '操作マニュアル', icon: '📖', internal: true, view: 'manual', description: 'ポータルと各アプリの使い方ガイド' },
       { id: 16, key: 'quote_compare', name: '見積比較', icon: '💰', internal: true, view: 'quote-compare', description: '相見積の単価を横並び比較し最安見積を作成（築城方式）' },
       { id: 17, key: 'exam-prep', name: '資格学習', icon: '🎓', internal: true, view: 'exam', description: '資格試験の問題演習（4択・記述）。章別に出題し即採点・弱点復習' },
+      { id: 18, key: 'calendar', name: '会社カレンダー', icon: '📅', internal: true, view: 'calendar', description: '公休日・計画有給休暇の年間カレンダー' },
       // 【凍結 2026-06-17】法令集はメニューから除外（機能・API・データは残置、復活時はこの行を戻す）
       // { id: 13, key: 'regulations', name: '法令集', icon: '📚', internal: true, view: 'regulations', description: '建設・不動産・林業・労務・会社経営の法令を条文単位で検索・閲覧' },
     ];
@@ -427,6 +428,8 @@ app.get('/api/apps', requireAuth, async (req, res) => {
       if (a.key === 'workscope') return true;
       // 操作マニュアルは全社員に常に表示する（読み取り専用の使い方ガイド）。
       if (a.key === 'manual') return true;
+      // 会社カレンダー（公休日）は全社員に常に表示する（閲覧は全員、編集は画面内で admin のみ）。
+      if (a.key === 'calendar') return true;
       if (perms.role === 'admin') return true;
       return !!appPerms[a.key];
     });
@@ -488,6 +491,64 @@ app.post('/api/apps/usage', requireAuth, async (req, res) => {
     res.json({ ok: true, key, use_count: nextCount });
   } catch (error) {
     console.error('Error (app usage POST):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================================
+// 会社カレンダー（公休日・計画有給）  migration 049: company_holidays
+//   kind: 'koushu'=公休日 / 'yukyu'=計画有給休暇
+//   閲覧は全社員（requireAuth）、追加・削除は管理者のみ（requireAdmin）。
+// ============================================================
+
+// ✅ 休日一覧を取得。要認証。
+//    クエリ from / to（'YYYY-MM-DD'）で期間を絞れる。未指定なら全件。
+app.get('/api/calendar/holidays', requireAuth, async (req, res) => {
+  try {
+    let q = supabase.from('company_holidays').select('day, kind, note').order('day', { ascending: true });
+    const from = String(req.query.from || '').trim();
+    const to = String(req.query.to || '').trim();
+    if (from) q = q.gte('day', from);
+    if (to) q = q.lte('day', to);
+    const { data, error } = await q;
+    if (error) throw error;
+    res.json(data || []);
+  } catch (error) {
+    console.error('Error (calendar GET):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 休日を追加/更新（同一日付は上書き）。管理者のみ。
+//    body: { day:'YYYY-MM-DD', kind:'koushu'|'yukyu', note?:string }
+app.post('/api/calendar/holidays', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const day = String(req.body?.day || '').trim();
+    const kind = String(req.body?.kind || '').trim();
+    const note = req.body?.note != null ? String(req.body.note) : null;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return res.status(400).json({ error: 'day は YYYY-MM-DD 形式で指定してください' });
+    if (!['koushu', 'yukyu'].includes(kind)) return res.status(400).json({ error: "kind は 'koushu' か 'yukyu'" });
+    const { error } = await supabase
+      .from('company_holidays')
+      .upsert({ day, kind, note, updated_at: new Date().toISOString() }, { onConflict: 'day' });
+    if (error) throw error;
+    res.json({ ok: true, day, kind });
+  } catch (error) {
+    console.error('Error (calendar POST):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 休日を削除。管理者のみ。
+app.delete('/api/calendar/holidays/:day', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const day = String(req.params.day || '').trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return res.status(400).json({ error: 'day は YYYY-MM-DD 形式で指定してください' });
+    const { error } = await supabase.from('company_holidays').delete().eq('day', day);
+    if (error) throw error;
+    res.json({ ok: true, day });
+  } catch (error) {
+    console.error('Error (calendar DELETE):', error.message);
     res.status(500).json({ error: error.message });
   }
 });
