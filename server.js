@@ -8626,9 +8626,50 @@ function toWareki(dateStr) {
   return `令和${r === 1 ? '元' : r}年${mo}月${d}日`;
 }
 
+// 現場住所から管轄の関係機関（警察・消防・労基署・救急病院）を Google 検索グラウンディングで調べ、
+// 16章 緊急連絡体制へ入れる複数行文字列を返す。調べられない/APIキー無しは null（→呼び出し側で既定文言）。
+// ※ 公式書類のため電話番号は推測させず、成果物側で「着手時に要確認」の注記を併記する。
+async function lookupEmergencyContacts(address) {
+  if (!GEMINI_API_KEY || !address) return null;
+  const prompt = `日本の建設工事現場の住所「${address}」について、Google検索で調べ、この現場を管轄する下記4機関の「正式名称」と「代表電話番号」を特定してください。
+1. 所轄警察署
+2. 管轄消防署（消防本部または消防署）
+3. 所轄労働基準監督署
+4. 最寄りの救急告示病院（救急対応の総合病院）
+電話番号が確認できない項目は tel を空文字にしてください。推測で電話番号を作らないこと。
+出力はJSONのみ（前後に説明やマークダウンを付けない）:
+{"police":{"name":"","tel":""},"fire":{"name":"","tel":""},"labor":{"name":"","tel":""},"hospital":{"name":"","tel":""}}`;
+  try {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+    const body = { contents: [{ parts: [{ text: prompt }] }], tools: [{ google_search: {} }] };
+    const resp = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    if (!resp.ok) { console.error('Warning (seko emergency lookup):', resp.status); return null; }
+    const json = await resp.json();
+    const text = json?.candidates?.[0]?.content?.parts?.map((p) => p?.text || '').join('') || '';
+    const s = text.indexOf('{'); const e = text.lastIndexOf('}');
+    if (s < 0 || e <= s) return null;
+    const d = JSON.parse(text.slice(s, e + 1));
+    const line = (label, o) => {
+      const name = (o?.name || '').trim();
+      if (!name) return null;
+      const tel = (o?.tel || '').trim();
+      return `${label}　${name}${tel ? `　TEL ${tel}` : '　（電話 要確認）'}`;
+    };
+    const lines = [
+      line('所轄警察署', d.police), line('管轄消防署', d.fire),
+      line('労働基準監督署', d.labor), line('救急告示病院', d.hospital),
+    ].filter(Boolean);
+    return lines.length ? lines.join('\n') : null;
+  } catch (err) {
+    console.error('Warning (seko emergency lookup):', err.message);
+    return null;
+  }
+}
+
 // construction_projects 1件 → seko_gen が食う工事マスタJSON（seko_tokens のキー経路に一致）。
 // DB に無い項目（発注機関長・材料仕様・環境データ 等）はエージェント側のローカル override で補完する。
-async function buildSekoMaster(project) {
+// planType='soukatsu' のときだけ 16章 緊急連絡体制の関係機関を現場住所から自動調査する。
+async function buildSekoMaster(project, planType) {
   const ids = [project.site_agent_id, project.chief_engineer_id].filter(Boolean);
   let staffById = {};
   if (ids.length) {
@@ -8638,7 +8679,7 @@ async function buildSekoMaster(project) {
   const chief = staffById[project.chief_engineer_id] || staffById[project.site_agent_id] || '';
   const agent = staffById[project.site_agent_id] || chief || '';
   const amount = project.contract_amount;
-  return {
+  const master = {
     _注記: 'ポータル construction_projects から自動生成した工事マスタ（施工計画書 生成入力）',
     基本情報: {
       工事名: project.project_name || '',
@@ -8659,6 +8700,11 @@ async function buildSekoMaster(project) {
       監理技術者: chief,
     },
   };
+  if (planType === 'soukatsu') {
+    const kankei = await lookupEmergencyContacts(project.location);
+    master.緊急連絡 = { 関係機関: kankei || '（着手時に管轄の労基署・消防・警察・救急病院を記入）' };
+  }
+  return master;
 }
 
 const SEKO_PLAN_LABELS = { soukatsu: '総合施工計画書', koshu: '工種別施工計画書', checklist: '自主検査チェックリスト' };
@@ -8714,7 +8760,7 @@ app.post('/api/construction/projects/:id/seko-plans', requireAuth, requireConstr
     if (pErr) throw pErr;
     if (!project) return res.status(404).json({ error: '工事が見つかりません' });
 
-    const master = await buildSekoMaster(project);
+    const master = await buildSekoMaster(project, planType);
     const title = (SEKO_PLAN_LABELS[planType] || '施工計画書') + (planType !== 'soukatsu' && koshu ? `（${koshu}）` : '');
     const outputName = sekoOutputName(planType, koshu, project.project_name);
 
