@@ -8593,6 +8593,221 @@ app.get('/api/quote-compare/vendors/:id/writeback-download', requireAuth, requir
   }
 });
 
+// ============================================================
+// 施工計画書 生成（ハイブリッド: _queue → seko_agent.py(常駐) → 回収）
+//   Word生成は python-docx + Word COM 依存で Render(Linux) 上では動かせないため、
+//   見積比較(P2/P3)と同じ郵便受け方式を採る。ポータルは工事マスタJSONをジョブとして
+//   共有ドライブ 06.施工計画書\_queue に投入し、このPC常駐エージェントが docx を生成、
+//   ポータルが Drive 経由で回収する。テンプレ35本はエージェントPCのローカルにある。
+// ============================================================
+const SEKO_QUEUE_SEGMENTS = ['06.施工計画書', '_queue'];
+
+// テンプレのトークンに対応する会社定数（受注者ブロック）
+const SEKO_COMPANY = {
+  受注者: '株式会社 中原建設',
+  代表取締役: '中原 康博',
+  本社所在地: '長崎県対馬市峰町吉田186番地1',
+};
+
+// 円(数値) → カンマ区切り文字列。変換不能は null。
+function sekoYenComma(n) {
+  if (n == null || n === '') return null;
+  const v = Math.round(Number(n));
+  return Number.isFinite(v) ? v.toLocaleString('en-US') : null;
+}
+
+// 'YYYY-MM-DD' → '令和X年M月D日'（令和のみ。変換不能は null）。
+function toWareki(dateStr) {
+  const m = String(dateStr || '').match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (!m) return null;
+  const y = Number(m[1]), mo = Number(m[2]), d = Number(m[3]);
+  const r = y - 2018; // 2019年 = 令和1年
+  if (r < 1) return null;
+  return `令和${r === 1 ? '元' : r}年${mo}月${d}日`;
+}
+
+// construction_projects 1件 → seko_gen が食う工事マスタJSON（seko_tokens のキー経路に一致）。
+// DB に無い項目（発注機関長・材料仕様・環境データ 等）はエージェント側のローカル override で補完する。
+async function buildSekoMaster(project) {
+  const ids = [project.site_agent_id, project.chief_engineer_id].filter(Boolean);
+  let staffById = {};
+  if (ids.length) {
+    const { data } = await supabase.from('staff_master').select('id, name').in('id', ids);
+    staffById = Object.fromEntries((data || []).map((s) => [s.id, s.name]));
+  }
+  const chief = staffById[project.chief_engineer_id] || staffById[project.site_agent_id] || '';
+  const agent = staffById[project.site_agent_id] || chief || '';
+  const amount = project.contract_amount;
+  return {
+    _注記: 'ポータル construction_projects から自動生成した工事マスタ（施工計画書 生成入力）',
+    基本情報: {
+      工事名: project.project_name || '',
+      工事場所: project.location || '',
+      工期_自: toWareki(project.start_date) || '',
+      工期_至: toWareki(project.end_date) || '',
+      契約日: toWareki(project.contract_date) || '',
+      請負代金額: sekoYenComma(amount) || '',
+      消費税額: amount != null ? (sekoYenComma(Number(amount) * 10 / 110) || '') : '',
+      契約番号: project.project_code || '',
+    },
+    発注者体制_作成時点: {
+      担当官肩書: '支出負担行為担当官',
+    },
+    受注者体制: {
+      ...SEKO_COMPANY,
+      現場代理人: agent,
+      監理技術者: chief,
+    },
+  };
+}
+
+const SEKO_PLAN_LABELS = { soukatsu: '総合施工計画書', koshu: '工種別施工計画書', checklist: '自主検査チェックリスト' };
+
+// 種別＋工種から成果ファイル名を組み立てる（Windows禁止文字は除去）。
+function sekoOutputName(planType, koshu, projectName) {
+  const base = SEKO_PLAN_LABELS[planType] || '施工計画書';
+  const parts = [base];
+  if (planType !== 'soukatsu' && koshu) parts.push(koshu);
+  if (projectName) parts.push(projectName);
+  return sanitizeDriveSeg(parts.join('_')) + '.docx';
+}
+
+// 最新の成果docxをジョブフォルダから取得（status/download 共用）。template や job.json は除く。
+async function findSekoOutput(folderId) {
+  const kids = await driveListChildren(folderId);
+  return kids.find((k) => /\.docx$/i.test(k.name)) || null;
+}
+
+// ✅ 施工計画書 - 生成ジョブ一覧（工事ごと）。
+app.get('/api/construction/projects/:id/seko-plans', requireAuth, requireConstructionAccess, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('construction_seko_plans')
+      .select('id, plan_type, title, status, message, output_name, job_name, created_at, updated_at, generated_by')
+      .eq('project_id', req.params.id)
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+    res.json({ plans: data || [] });
+  } catch (error) {
+    console.error('Error (seko-plans list):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 施工計画書 - 生成ジョブ投入。工事マスタJSONを組み立て _queue へ。
+//   body: { plan_type: 'soukatsu'|'koshu'|'checklist', koshu?: '04_鉄筋工事' }
+app.post('/api/construction/projects/:id/seko-plans', requireAuth, requireConstructionAccess, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const planType = String(req.body.plan_type || 'soukatsu');
+    const koshu = req.body.koshu ? String(req.body.koshu) : null;
+    if (!['soukatsu', 'koshu', 'checklist'].includes(planType)) {
+      return res.status(400).json({ error: '不正な plan_type です' });
+    }
+    if (planType !== 'soukatsu' && !koshu) {
+      return res.status(400).json({ error: '工種別・自主検査は工種(koshu)の指定が必要です' });
+    }
+    if (!driveConfigured()) return res.status(503).json({ error: '共有ドライブ未設定のためキュー投入できません' });
+
+    const { data: project, error: pErr } = await supabase
+      .from('construction_projects').select('*').eq('id', id).maybeSingle();
+    if (pErr) throw pErr;
+    if (!project) return res.status(404).json({ error: '工事が見つかりません' });
+
+    const master = await buildSekoMaster(project);
+    const title = (SEKO_PLAN_LABELS[planType] || '施工計画書') + (planType !== 'soukatsu' && koshu ? `（${koshu}）` : '');
+    const outputName = sekoOutputName(planType, koshu, project.project_name);
+
+    const ts = new Date().toISOString().replace(/[:.]/g, '').replace('T', '_').slice(0, 15);
+    const jobName = `${id}__${ts}`;
+    const jobFolderId = await ensureFolderPath([...SEKO_QUEUE_SEGMENTS, String(id), jobName], SHARED_DRIVE_ROOT_ID);
+
+    const job = {
+      job_type: 'seko',
+      plan_type: planType,
+      koshu,
+      project_id: Number(id),
+      output_name: outputName,
+      master,
+    };
+    await driveUpload({ name: 'seko_job.json', buffer: Buffer.from(JSON.stringify(job, null, 2), 'utf8'), mimeType: 'application/json', folderId: jobFolderId });
+    await driveUpload({ name: 'status.json', buffer: Buffer.from(JSON.stringify({ status: 'queued', message: '', updated_at: new Date().toISOString() }), 'utf8'), mimeType: 'application/json', folderId: jobFolderId });
+
+    const { data: row, error: iErr } = await supabase
+      .from('construction_seko_plans')
+      .insert({
+        project_id: Number(id), plan_type: planType, title,
+        master_json: master, status: 'queued',
+        job_name: jobName, job_folder_id: jobFolderId, output_name: outputName,
+        generated_by: req.user.email,
+      })
+      .select('id').single();
+    if (iErr) throw iErr;
+
+    res.json({ ok: true, id: row.id, job: jobName });
+  } catch (error) {
+    console.error('Error (seko-plans enqueue):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 施工計画書 - ジョブ状態（画面ポーリング用）。done かつ成果docxが揃えば ready。
+app.get('/api/construction/seko-plans/:planId/status', requireAuth, requireConstructionAccess, async (req, res) => {
+  try {
+    const { data: row, error } = await supabase
+      .from('construction_seko_plans').select('*').eq('id', req.params.planId).maybeSingle();
+    if (error) throw error;
+    if (!row) return res.status(404).json({ error: 'ジョブが見つかりません' });
+    if (!driveConfigured() || !row.job_folder_id) return res.json({ status: row.status, ready: false });
+
+    const status = await readDriveJson(row.job_folder_id, 'status.json');
+    const st = status?.status || row.status || 'queued';
+    const msg = status?.message || '';
+
+    if (st !== 'done') {
+      if (st !== row.status) await supabase.from('construction_seko_plans').update({ status: st, message: msg }).eq('id', row.id);
+      return res.json({ status: st, ready: false, message: msg });
+    }
+
+    const out = await findSekoOutput(row.job_folder_id);
+    if (!out) return res.json({ status: 'done', ready: false, message: '生成ファイルの同期待ち' });
+
+    const patch = { status: 'done', message: msg, output_ref: `drive:${out.id}`, output_name: out.name };
+    await supabase.from('construction_seko_plans').update(patch).eq('id', row.id);
+    res.json({ status: 'done', ready: true, file: out.name });
+  } catch (error) {
+    console.error('Error (seko-plans status):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 施工計画書 - 生成済み docx をダウンロード（Drive から中継）。
+app.get('/api/construction/seko-plans/:planId/download', requireAuth, requireConstructionAccess, async (req, res) => {
+  try {
+    const { data: row, error } = await supabase
+      .from('construction_seko_plans').select('*').eq('id', req.params.planId).maybeSingle();
+    if (error) throw error;
+    if (!row) return res.status(404).json({ error: 'ジョブが見つかりません' });
+    if (!driveConfigured()) return res.status(503).json({ error: '共有ドライブ未設定です' });
+
+    let fileId = row.output_ref && row.output_ref.startsWith('drive:') ? driveIdOf(row.output_ref) : null;
+    let name = row.output_name;
+    if (!fileId && row.job_folder_id) {
+      const out = await findSekoOutput(row.job_folder_id);
+      if (out) { fileId = out.id; name = out.name; }
+    }
+    if (!fileId) return res.status(404).json({ error: '生成済みのファイルがありません' });
+
+    const { buffer } = await driveDownload(fileId);
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
+    res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(name || 'seko.docx')}`);
+    res.send(buffer);
+  } catch (error) {
+    console.error('Error (seko-plans download):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // ✅ 見積比較 - 横並び比較（科目サマリー＋細目マトリクス＋行ごと最安）。P1の主役。
 //   比較は公式数量に各社単価を当てた金額(=単価×|公式数量|)で同一土俵。行ごと min(単価)が最安。
 app.get('/api/quote-compare/projects/:id/comparison', requireAuth, requireQuoteCompareAccess, async (req, res) => {
