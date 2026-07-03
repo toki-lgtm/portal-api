@@ -8649,17 +8649,17 @@ async function lookupEmergencyContacts(address) {
     const s = text.indexOf('{'); const e = text.lastIndexOf('}');
     if (s < 0 || e <= s) return null;
     const d = JSON.parse(text.slice(s, e + 1));
-    const line = (label, o) => {
+    const row = (label, o) => {
       const name = (o?.name || '').trim();
       if (!name) return null;
       const tel = (o?.tel || '').trim();
-      return `${label}　${name}${tel ? `　TEL ${tel}` : '　（電話 要確認）'}`;
+      return { 区分: label, 連絡先: `${name}${tel ? `　TEL ${tel}` : '　（電話 要確認）'}` };
     };
-    const lines = [
-      line('所轄警察署', d.police), line('管轄消防署', d.fire),
-      line('労働基準監督署', d.labor), line('救急告示病院', d.hospital),
+    const rows = [
+      row('所轄警察署', d.police), row('管轄消防署', d.fire),
+      row('労働基準監督署', d.labor), row('救急告示病院', d.hospital),
     ].filter(Boolean);
-    return lines.length ? lines.join('\n') : null;
+    return rows.length ? rows : null;
   } catch (err) {
     console.error('Warning (seko emergency lookup):', err.message);
     return null;
@@ -8702,7 +8702,9 @@ async function buildSekoMaster(project, planType) {
   };
   if (planType === 'soukatsu') {
     const kankei = await lookupEmergencyContacts(project.location);
-    master.緊急連絡 = { 関係機関: kankei || '（着手時に管轄の労基署・消防・警察・救急病院を記入）' };
+    master.緊急連絡 = {
+      関係機関: kankei || [{ 区分: '関係機関', 連絡先: '（着手時に管轄の労基署・消防・警察・救急病院を記入）' }],
+    };
   }
   return master;
 }
@@ -8850,6 +8852,27 @@ app.get('/api/construction/seko-plans/:planId/download', requireAuth, requireCon
     res.send(buffer);
   } catch (error) {
     console.error('Error (seko-plans download):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 施工計画書 - 生成物を削除（DB行＋共有ドライブのジョブフォルダをゴミ箱へ）。
+app.delete('/api/construction/seko-plans/:planId', requireAuth, requireConstructionAccess, async (req, res) => {
+  try {
+    const { data: row, error } = await supabase
+      .from('construction_seko_plans').select('id, job_folder_id').eq('id', req.params.planId).maybeSingle();
+    if (error) throw error;
+    if (!row) return res.status(404).json({ error: 'ジョブが見つかりません' });
+
+    // 成果物・ジョブファイルはフォルダごとゴミ箱へ（失敗しても DB 削除は続行）
+    if (row.job_folder_id && driveConfigured()) {
+      try { await driveTrash(row.job_folder_id); } catch (e) { console.error('seko drive trash:', e.message); }
+    }
+    const { error: dErr } = await supabase.from('construction_seko_plans').delete().eq('id', row.id);
+    if (dErr) throw dErr;
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error (seko-plans delete):', error.message);
     res.status(500).json({ error: error.message });
   }
 });
