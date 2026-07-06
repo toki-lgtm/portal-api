@@ -6636,6 +6636,193 @@ app.delete('/api/construction/photos/:photoId', requireAuth, requireConstruction
 });
 
 // ============================================================
+// 工事管理 - 構造部材マスタ（柱・梁・基礎・杭・壁・鉄骨 等）
+//   構造図の部材リストを機械可読化して工事ごとに保持する（migration 053）。
+//   取込は「図面をローカルで画像化 → Gemini で符号ごとに抽出 → /import へ POST」
+//   （見積比較・施工計画書と同じハイブリッド方式）。登録は source='ai',
+//   confirmed=false → 画面で確認・是正 → confirmed=true で確定。
+//   段階2で construction_photo_nodes へ “符号×階” を展開し撮影漏れ管理に用いる。
+// ============================================================
+
+// 部材種別の正規語彙（表示順もこの順）。未知値は「その他」に寄せる。
+const CONS_MEMBER_TYPES = [
+  '柱', '大梁', '小梁', '地中梁', '基礎', '杭', '壁', 'スラブ',
+  '鉄骨柱', '鉄骨梁', 'ブレース', 'デッキプレート', 'その他',
+];
+function normalizeMemberType(t) {
+  const s = String(t || '').trim();
+  if (!s) return 'その他';
+  if (CONS_MEMBER_TYPES.includes(s)) return s;
+  // ゆらぎ吸収（AI表記の別名）
+  if (/デッキ/.test(s)) return 'デッキプレート';
+  if (/鉄骨.*柱|S造?柱|鉄骨柱/.test(s)) return '鉄骨柱';
+  if (/鉄骨.*梁|鉄骨梁/.test(s)) return '鉄骨梁';
+  if (/ブレース|筋かい|筋違/.test(s)) return 'ブレース';
+  if (/基礎梁|地中梁|フーチング間|FG/.test(s)) return '地中梁';
+  if (/フーチング|独立基礎|べた基礎|基礎/.test(s)) return '基礎';
+  if (/大梁|G/.test(s)) return '大梁';
+  if (/小梁|B/.test(s)) return '小梁';
+  if (/柱/.test(s)) return '柱';
+  if (/梁/.test(s)) return '大梁';
+  if (/壁/.test(s)) return '壁';
+  if (/スラブ|床/.test(s)) return 'スラブ';
+  if (/杭/.test(s)) return '杭';
+  return 'その他';
+}
+// AI(日本語キー)・英語キー どちらの1レコードも共通形へ写像
+function mapStructRecord(r) {
+  const g = (jp, en) => (r[jp] !== undefined ? r[jp] : r[en]) ?? '';
+  const symbol = String(g('符号', 'symbol')).trim();
+  return {
+    member_type: normalizeMemberType(g('部材種別', 'member_type')),
+    symbol,
+    floor: String(g('階', 'floor')).trim() || null,
+    section: String(g('断面', 'section')).trim() || null,
+    main_rebar: String(g('主筋', 'main_rebar')).trim() || null,
+    shear_rebar: String(g('せん断補強筋', 'shear_rebar')).trim() || null,
+    concrete_strength: String(g('コンクリート強度', 'concrete_strength')).trim() || null,
+    note: String(g('備考', 'note')).trim() || null,
+    raw_json: r,
+  };
+}
+
+// ✅ 構造部材 - 一覧（種別・階順に整列して返す）
+app.get('/api/construction/projects/:id/structural-members', requireAuth, requireConstructionAccess, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { data, error } = await supabase
+      .from('construction_structural_members').select('*')
+      .eq('project_id', id)
+      .order('member_type', { ascending: true })
+      .order('sort_order', { ascending: true })
+      .order('symbol', { ascending: true })
+      .order('id', { ascending: true });
+    if (error) throw error;
+    const rows = data || [];
+    // 種別ごとの件数と未確定数（画面の集計バッジ用）
+    const summary = {};
+    for (const t of CONS_MEMBER_TYPES) summary[t] = { total: 0, unconfirmed: 0 };
+    for (const m of rows) {
+      const t = summary[m.member_type] ? m.member_type : 'その他';
+      summary[t].total++; if (!m.confirmed) summary[t].unconfirmed++;
+    }
+    res.json({ members: rows, summary, type_order: CONS_MEMBER_TYPES });
+  } catch (error) {
+    console.error('Error (structural-members list):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 構造部材 - 一括取込（ローカル抽出の結果JSONを受け取り登録）
+//   body: { members:[{符号,部材種別,階,断面,主筋,せん断補強筋,コンクリート強度,備考}...],
+//           source_page?:int, replace_ai?:bool(既定true=未確定のAI行を入替) }
+app.post('/api/construction/projects/:id/structural-members/import', requireAuth, requireConstructionAccess, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const b = req.body || {};
+    const list = Array.isArray(b.members) ? b.members : (Array.isArray(b) ? b : []);
+    if (!list.length) return res.status(400).json({ error: 'members（配列）が空です' });
+    const replaceAi = b.replace_ai !== false;
+    if (replaceAi) {
+      // 確定済み・手動行は保持し、未確定のAI行のみ入れ替える
+      await supabase.from('construction_structural_members')
+        .delete().eq('project_id', id).eq('source', 'ai').eq('confirmed', false);
+    }
+    const now = new Date().toISOString();
+    const rows = list
+      .map(mapStructRecord)
+      .filter(m => m.symbol)                    // 符号なしは捨てる
+      .map((m, i) => ({
+        ...m, project_id: Number(id), source: 'ai',
+        source_page: b.source_page ? Number(b.source_page) : (m.raw_json?.__page ?? null),
+        confirmed: false, sort_order: i, created_by: req.user.email,
+        created_at: now, updated_at: now,
+      }));
+    if (!rows.length) return res.status(400).json({ error: '有効な符号を持つ部材がありません' });
+    // 200件チャンクで投入（写真seedと同方式）
+    let inserted = 0;
+    for (let i = 0; i < rows.length; i += 200) {
+      const { error } = await supabase.from('construction_structural_members').insert(rows.slice(i, i + 200));
+      if (error) throw error;
+      inserted += Math.min(200, rows.length - i);
+    }
+    res.json({ ok: true, inserted, replaced_ai: replaceAi });
+  } catch (error) {
+    console.error('Error (structural-members import):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 構造部材 - 手動追加（1件）
+app.post('/api/construction/projects/:id/structural-members', requireAuth, requireConstructionAccess, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const b = req.body || {};
+    const m = mapStructRecord(b);
+    if (!m.symbol) return res.status(400).json({ error: '符号は必須です' });
+    const { data, error } = await supabase.from('construction_structural_members').insert([{
+      ...m, raw_json: null, project_id: Number(id), source: 'manual',
+      confirmed: true, sort_order: b.sort_order ?? 9999, created_by: req.user.email,
+    }]).select('*').single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (structural-member add):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 構造部材 - 編集／確定トグル
+app.patch('/api/construction/structural-members/:mid', requireAuth, requireConstructionAccess, async (req, res) => {
+  try {
+    const { mid } = req.params;
+    const b = req.body || {};
+    const patch = { updated_at: new Date().toISOString() };
+    if (b.member_type !== undefined) patch.member_type = normalizeMemberType(b.member_type);
+    for (const k of ['symbol', 'floor', 'section', 'main_rebar', 'shear_rebar', 'concrete_strength', 'note', 'sort_order']) {
+      if (b[k] !== undefined) patch[k] = b[k];
+    }
+    if (b.confirmed !== undefined) patch.confirmed = !!b.confirmed;
+    const { data, error } = await supabase
+      .from('construction_structural_members').update(patch).eq('id', mid).select('*').single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (structural-member patch):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 構造部材 - まとめて確定（未確定のAI行を一括 confirmed=true）
+app.post('/api/construction/projects/:id/structural-members/confirm-all', requireAuth, requireConstructionAccess, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { data, error } = await supabase
+      .from('construction_structural_members')
+      .update({ confirmed: true, updated_at: new Date().toISOString() })
+      .eq('project_id', id).eq('confirmed', false).select('id');
+    if (error) throw error;
+    res.json({ ok: true, confirmed: (data || []).length });
+  } catch (error) {
+    console.error('Error (structural-members confirm-all):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 構造部材 - 削除（管理者のみ）
+app.delete('/api/construction/structural-members/:mid', requireAuth, requireConstructionAdmin, async (req, res) => {
+  try {
+    const { mid } = req.params;
+    const { error } = await supabase.from('construction_structural_members').delete().eq('id', mid);
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error (structural-member delete):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================================
 // 工事管理 - 書類のAI解析（Gemini）: 自動振り分け & 工事情報の自動抽出
 //   既存の入札資料AI抽出（extractBidInfo）と同じ Gemini 連携方式を踏襲。
 //   - classifyConstructionDoc : 1ファイルの内容＋ファイル名から「必要書類マスタ」のどれかを判定
