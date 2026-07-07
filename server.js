@@ -6440,10 +6440,25 @@ app.get('/api/construction/projects/:id/photo-nodes', requireAuth, requireConstr
         .from('construction_structural_members')
         .select('id, symbol, floor, section, main_rebar, shear_rebar, section_image_ref')
         .in('id', memberIds);
+      // 断面図の署名URLは「バケットパスをまとめて1回で署名」する（createSignedUrls）。
+      // 部材ごとに createSignedUrl を順次呼ぶと100件超で数十秒かかり一覧が返らない。
+      const refs = [...new Set((members || [])
+        .map((m) => m.section_image_ref)
+        .filter((r) => r && !String(r).startsWith('drive:')))];
+      const urlByRef = new Map();
+      if (refs.length) {
+        const { data: signed } = await supabase.storage
+          .from(CONSTRUCTION_BUCKET).createSignedUrls(refs, 3600);
+        for (const s of (signed || [])) {
+          if (s && !s.error && s.signedUrl) urlByRef.set(s.path, s.signedUrl);
+        }
+      }
       for (const m of (members || [])) {
-        const section_url = m.section_image_ref
-          ? await constructionFileSignedUrl(m.section_image_ref).catch(() => null)
-          : null;
+        const ref = m.section_image_ref;
+        const section_url = !ref ? null
+          : String(ref).startsWith('drive:')
+            ? await constructionFileSignedUrl(ref).catch(() => null)
+            : (urlByRef.get(ref) || null);
         memberMap.set(m.id, {
           section_url,
           member_symbol: m.symbol, member_floor: m.floor,
