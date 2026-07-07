@@ -6699,14 +6699,20 @@ app.get('/api/construction/projects/:id/structural-members', requireAuth, requir
       .order('id', { ascending: true });
     if (error) throw error;
     const rows = data || [];
+    // 断面図の署名URLを付与（参照があるものだけ）
+    const withUrls = await Promise.all(rows.map(async (m) => (
+      m.section_image_ref
+        ? { ...m, section_url: await constructionFileSignedUrl(m.section_image_ref).catch(() => null) }
+        : m
+    )));
     // 種別ごとの件数と未確定数（画面の集計バッジ用）
     const summary = {};
     for (const t of CONS_MEMBER_TYPES) summary[t] = { total: 0, unconfirmed: 0 };
-    for (const m of rows) {
+    for (const m of withUrls) {
       const t = summary[m.member_type] ? m.member_type : 'その他';
       summary[t].total++; if (!m.confirmed) summary[t].unconfirmed++;
     }
-    res.json({ members: rows, summary, type_order: CONS_MEMBER_TYPES });
+    res.json({ members: withUrls, summary, type_order: CONS_MEMBER_TYPES });
   } catch (error) {
     console.error('Error (structural-members list):', error.message);
     res.status(500).json({ error: error.message });
@@ -6779,7 +6785,7 @@ app.patch('/api/construction/structural-members/:mid', requireAuth, requireConst
     const b = req.body || {};
     const patch = { updated_at: new Date().toISOString() };
     if (b.member_type !== undefined) patch.member_type = normalizeMemberType(b.member_type);
-    for (const k of ['symbol', 'floor', 'section', 'main_rebar', 'shear_rebar', 'concrete_strength', 'note', 'sort_order']) {
+    for (const k of ['symbol', 'floor', 'section', 'main_rebar', 'shear_rebar', 'concrete_strength', 'note', 'sort_order', 'section_image_ref']) {
       if (b[k] !== undefined) patch[k] = b[k];
     }
     if (b.confirmed !== undefined) patch.confirmed = !!b.confirmed;
