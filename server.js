@@ -6430,7 +6430,32 @@ app.get('/api/construction/projects/:id/photo-nodes', requireAuth, requireConstr
       if (p.node_id != null) cnt.set(p.node_id, (cnt.get(p.node_id) || 0) + 1);
     }
     const present = Array.from(await constructionPresentTrades(id));
-    const out = (nodes || []).map((n) => ({ ...n, photo_count: cnt.get(n.id) || 0 }));
+    // 構造部材に紐づくノード（躯体検査＝符号別）には、その部材の断面図の署名URLと
+    // 配筋スペック（断面/主筋/帯筋）を添付する。撮影時に電子小黒板へ断面図を焼き込むため。
+    const memberIds = [...new Set((nodes || [])
+      .map((n) => n.structural_member_id).filter((v) => v != null))];
+    const memberMap = new Map();
+    if (memberIds.length) {
+      const { data: members } = await supabase
+        .from('construction_structural_members')
+        .select('id, symbol, floor, section, main_rebar, shear_rebar, section_image_ref')
+        .in('id', memberIds);
+      for (const m of (members || [])) {
+        const section_url = m.section_image_ref
+          ? await constructionFileSignedUrl(m.section_image_ref).catch(() => null)
+          : null;
+        memberMap.set(m.id, {
+          section_url,
+          member_symbol: m.symbol, member_floor: m.floor,
+          member_section: m.section, member_main_rebar: m.main_rebar,
+          member_shear_rebar: m.shear_rebar,
+        });
+      }
+    }
+    const out = (nodes || []).map((n) => ({
+      ...n, photo_count: cnt.get(n.id) || 0,
+      ...(n.structural_member_id != null ? (memberMap.get(n.structural_member_id) || {}) : {}),
+    }));
     res.json({ nodes: out, generated: out.length > 0, present_trades: present });
   } catch (error) {
     console.error('Error (photo-nodes list):', error.message);
