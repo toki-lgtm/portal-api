@@ -6686,6 +6686,66 @@ function mapStructRecord(r) {
   };
 }
 
+// ── 段階2: 構造部材 → 工事写真ツリー展開 ─────────────────────────
+//   RC 躯体部材の各 (符号×階) に「配筋検査」「型枠検査」の撮影ノードを作る。
+//   杭・鉄骨・デッキ・ブレースは配筋/型枠検査に該当しないため対象外
+//   （杭は地業、鉄骨は鉄骨建方/溶接/高力ボルト検査など別体系で管理する）。
+const MEMBER_CHECK_KINDS = {
+  '柱':   ['配筋', '型枠'],
+  '大梁': ['配筋', '型枠'],
+  '小梁': ['配筋', '型枠'],
+  '地中梁': ['配筋', '型枠'],
+  '基礎': ['配筋', '型枠'],
+  '壁':   ['配筋', '型枠'],
+  'スラブ': ['配筋', '型枠'],
+};
+const MEMBER_CHECK_TRADE = '躯体検査（符号別）';
+const memberCheckTiming = (kind) =>
+  kind === '配筋' ? 'コンクリート打設前（配筋検査）' : 'コンクリート打設前（型枠検査）';
+
+// 構造部材 → 工事写真ツリーへ同期。RC躯体部材で、まだ写真ノードが無い
+// (部材×検査種別) だけを撮影対象として追加する（trade='躯体検査（符号別）'でまとめ、
+// category=種別でグループ化）。冪等。opts.onlyConfirmed=true なら確定済み部材のみ展開。
+async function syncStructuralMembersToPhotoNodes(projectId, email, opts = {}) {
+  let q = supabase.from('construction_structural_members').select('*').eq('project_id', projectId);
+  if (opts.onlyConfirmed === true) q = q.eq('confirmed', true);
+  const [{ data: members }, { data: nodes }] = await Promise.all([
+    q.order('member_type', { ascending: true }).order('sort_order', { ascending: true }).order('id', { ascending: true }),
+    supabase.from('construction_photo_nodes')
+      .select('structural_member_id, member_check_kind')
+      .eq('project_id', projectId).not('structural_member_id', 'is', null),
+  ]);
+  const have = new Set((nodes || []).map((n) => `${n.structural_member_id}:${n.member_check_kind}`));
+  const target = (members || []).filter((m) => MEMBER_CHECK_KINDS[m.member_type]);
+  const rows = [];
+  let order = 0;
+  for (const m of target) {
+    // 現場で配筋スペックを見ながら撮れるよう、備考に断面・主筋・帯筋を差し込む
+    const spec = [m.section, m.main_rebar, m.shear_rebar]
+      .map((s) => String(s || '').trim()).filter(Boolean).join(' / ');
+    const label = `${m.symbol}${m.floor ? ' ' + m.floor : ''}`;
+    for (const kind of MEMBER_CHECK_KINDS[m.member_type]) {
+      order++;
+      if (have.has(`${m.id}:${kind}`)) continue;
+      rows.push({
+        project_id: Number(projectId), structural_member_id: m.id, member_check_kind: kind,
+        master_id: null, edition: null, trade: MEMBER_CHECK_TRADE, category: m.member_type,
+        photo_item: `${kind}検査`, target: `${label} ${kind}検査`, timing: memberCheckTiming(kind),
+        source: 'auto', required: true, is_active: true,
+        sort_order: 7000 + order, note: spec || null, created_by: email || null,
+      });
+    }
+  }
+  if (!rows.length) return { inserted: 0, candidates: target.length };
+  let inserted = 0;
+  for (let i = 0; i < rows.length; i += 200) {
+    const { error } = await supabase.from('construction_photo_nodes').insert(rows.slice(i, i + 200));
+    if (error) throw error;
+    inserted += rows.slice(i, i + 200).length;
+  }
+  return { inserted, candidates: target.length };
+}
+
 // ✅ 構造部材 - 一覧（種別・階順に整列して返す）
 app.get('/api/construction/projects/:id/structural-members', requireAuth, requireConstructionAccess, async (req, res) => {
   try {
@@ -6811,6 +6871,19 @@ app.post('/api/construction/projects/:id/structural-members/confirm-all', requir
     res.json({ ok: true, confirmed: (data || []).length });
   } catch (error) {
     console.error('Error (structural-members confirm-all):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 構造部材 - 工事写真ツリーへ展開（配筋・型枠検査を符号×階で生成。冪等）
+//   body.only_confirmed=true で確定済み部材のみを対象にできる（既定=全部材）。
+app.post('/api/construction/projects/:id/structural-members/sync-photos', requireAuth, requireConstructionAccess, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const r = await syncStructuralMembersToPhotoNodes(id, req.user.email, { onlyConfirmed: req.body?.only_confirmed === true });
+    res.json(r);
+  } catch (error) {
+    console.error('Error (structural-members sync-photos):', error.message);
     res.status(500).json({ error: error.message });
   }
 });
