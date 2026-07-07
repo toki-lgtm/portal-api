@@ -410,6 +410,7 @@ app.get('/api/apps', requireAuth, async (req, res) => {
       { id: 16, key: 'quote_compare', name: '見積比較', icon: '💰', internal: true, view: 'quote-compare', description: '相見積の単価を横並び比較し最安見積を作成（築城方式）' },
       { id: 17, key: 'exam-prep', name: '資格学習', icon: '🎓', internal: true, view: 'exam', description: '資格試験の問題演習（4択・記述）。章別に出題し即採点・弱点復習' },
       { id: 18, key: 'calendar', name: '会社カレンダー', icon: '📅', internal: true, view: 'calendar', description: '公休日・計画有給休暇の年間カレンダー' },
+      { id: 19, key: 'iso', name: 'ISO管理', icon: '📋', internal: true, view: 'iso', description: 'ISO 9001/45001/14001 統合マネジメントシステムの文書・記録・審査管理' },
       // 【凍結 2026-06-17】法令集はメニューから除外（機能・API・データは残置、復活時はこの行を戻す）
       // { id: 13, key: 'regulations', name: '法令集', icon: '📚', internal: true, view: 'regulations', description: '建設・不動産・林業・労務・会社経営の法令を条文単位で検索・閲覧' },
     ];
@@ -430,6 +431,8 @@ app.get('/api/apps', requireAuth, async (req, res) => {
       if (a.key === 'manual') return true;
       // 会社カレンダー（公休日）は全社員に常に表示する（閲覧は全員、編集は画面内で admin のみ）。
       if (a.key === 'calendar') return true;
+      // ISO管理は全社員に常に表示する（閲覧は全員、編集は画面内で admin のみ）。
+      if (a.key === 'iso') return true;
       if (perms.role === 'admin') return true;
       return !!appPerms[a.key];
     });
@@ -549,6 +552,128 @@ app.delete('/api/calendar/holidays/:day', requireAuth, requireAdmin, async (req,
     res.json({ ok: true, day });
   } catch (error) {
     console.error('Error (calendar DELETE):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================================
+// ISO管理  migration 056: iso_locations / 057: iso_documents(+revisions)
+//   閲覧は全社員（requireAuth）、追加・編集は管理者のみ（requireAdmin）。
+//   F0: 場所マスタ ＋ 文書記録管理台帳（58分類）＋改訂履歴。
+// ============================================================
+
+// ✅ 場所マスタ（認証範囲の拠点）。要認証。
+app.get('/api/iso/locations', requireAuth, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('iso_locations')
+      .select('id, name, kind, in_scope_q, in_scope_s, in_scope_e, address, sort_order')
+      .order('sort_order', { ascending: true });
+    if (error) throw error;
+    res.json(data || []);
+  } catch (error) {
+    console.error('Error (iso locations GET):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 文書記録管理台帳 一覧。要認証。
+//    クエリ category（分類No）/ q（タイトル・条項の部分一致）で絞れる。
+app.get('/api/iso/documents', requireAuth, async (req, res) => {
+  try {
+    let query = supabase
+      .from('iso_documents')
+      .select('id, category_no, clause, title, version, dept, approver, retention, storage_link, standard, note, is_active, sort_order')
+      .order('sort_order', { ascending: true });
+    const category = String(req.query.category || '').trim();
+    const q = String(req.query.q || '').trim();
+    if (category) query = query.eq('category_no', category);
+    if (q) query = query.or(`title.ilike.%${q}%,clause.ilike.%${q}%`);
+    const { data, error } = await query;
+    if (error) throw error;
+    res.json(data || []);
+  } catch (error) {
+    console.error('Error (iso documents GET):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 台帳の書き込み可能フィールド。
+const ISO_DOC_FIELDS = ['category_no', 'clause', 'title', 'version', 'dept', 'approver', 'retention', 'storage_link', 'standard', 'note', 'is_active', 'sort_order'];
+
+// ✅ 台帳に文書を追加。管理者のみ。
+app.post('/api/iso/documents', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const row = {};
+    for (const f of ISO_DOC_FIELDS) if (req.body[f] !== undefined) row[f] = req.body[f];
+    if (!row.title) return res.status(400).json({ error: 'title は必須です' });
+    if (!row.retention) return res.status(400).json({ error: 'retention は必須です' });
+    const { data, error } = await supabase.from('iso_documents').insert([row]).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (iso documents POST):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 台帳の文書を更新。管理者のみ。
+app.put('/api/iso/documents/:id', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid id' });
+    const patch = { updated_at: new Date().toISOString() };
+    for (const f of ISO_DOC_FIELDS) if (req.body[f] !== undefined) patch[f] = req.body[f];
+    const { data, error } = await supabase.from('iso_documents').update(patch).eq('id', id).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (iso documents PUT):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 文書の改訂履歴を取得。要認証。
+app.get('/api/iso/documents/:id/revisions', requireAuth, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid id' });
+    const { data, error } = await supabase
+      .from('iso_document_revisions')
+      .select('id, rev_date, rev_content, created_by, approved_by, created_at')
+      .eq('document_id', id)
+      .order('rev_date', { ascending: false });
+    if (error) throw error;
+    res.json(data || []);
+  } catch (error) {
+    console.error('Error (iso revisions GET):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 改訂を追加し、文書の版を+1する。管理者のみ。
+//    body: { rev_date, rev_content, created_by?, approved_by? }
+app.post('/api/iso/documents/:id/revisions', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid id' });
+    const rev = {
+      document_id: id,
+      rev_date: req.body?.rev_date || null,
+      rev_content: req.body?.rev_content || null,
+      created_by: req.body?.created_by || null,
+      approved_by: req.body?.approved_by || null,
+    };
+    if (!rev.rev_content) return res.status(400).json({ error: 'rev_content は必須です' });
+    const { data: revRow, error: revErr } = await supabase.from('iso_document_revisions').insert([rev]).select().single();
+    if (revErr) throw revErr;
+    // 版を+1（現在値を取得して更新）
+    const { data: doc } = await supabase.from('iso_documents').select('version').eq('id', id).single();
+    const nextVer = (doc?.version || 1) + 1;
+    await supabase.from('iso_documents').update({ version: nextVer, updated_at: new Date().toISOString() }).eq('id', id);
+    res.json({ ok: true, revision: revRow, version: nextVer });
+  } catch (error) {
+    console.error('Error (iso revisions POST):', error.message);
     res.status(500).json({ error: error.message });
   }
 });
