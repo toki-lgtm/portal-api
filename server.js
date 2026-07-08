@@ -12,7 +12,7 @@ import JSZip from 'jszip';
 import sharp from 'sharp';
 import { parseEstimateFromXlsx } from './bidEstimate.js';
 import { parseBoqFromXlsx, CANONICAL_TRADES, normalizeTrade } from './boqParser.js';
-import { driveUpload, driveDownload, driveThumbnail, driveTrash, driveConfigured, ensureFolderPath, driveListChildren } from './googleDrive.js';
+import { driveUpload, driveDownload, driveThumbnail, driveTrash, driveConfigured, ensureFolderPath, driveListChildren, driveFileMeta, ensureFolder } from './googleDrive.js';
 import { classifyQuote, classNoOf } from './classifyQuote.js';
 import { extractExcelQuote } from './quoteExcelExtract.js';
 
@@ -411,6 +411,7 @@ app.get('/api/apps', requireAuth, async (req, res) => {
       { id: 17, key: 'exam-prep', name: '資格学習', icon: '🎓', internal: true, view: 'exam', description: '資格試験の問題演習（4択・記述）。章別に出題し即採点・弱点復習' },
       { id: 18, key: 'calendar', name: '会社カレンダー', icon: '📅', internal: true, view: 'calendar', description: '公休日・計画有給休暇の年間カレンダー' },
       { id: 19, key: 'iso', name: 'ISO管理', icon: '📋', internal: true, view: 'iso', description: 'ISO 9001/45001/14001 統合マネジメントシステムの文書・記録・審査管理' },
+      { id: 20, key: 'library', name: '資料ライブラリ', icon: '📚', internal: true, view: 'library', description: '社内で共有する参考資料・書籍・雑誌を閲覧（会報誌など）' },
       // 【凍結 2026-06-17】法令集はメニューから除外（機能・API・データは残置、復活時はこの行を戻す）
       // { id: 13, key: 'regulations', name: '法令集', icon: '📚', internal: true, view: 'regulations', description: '建設・不動産・林業・労務・会社経営の法令を条文単位で検索・閲覧' },
     ];
@@ -433,6 +434,8 @@ app.get('/api/apps', requireAuth, async (req, res) => {
       if (a.key === 'calendar') return true;
       // ISO管理は全社員に常に表示する（閲覧は全員、編集は画面内で admin のみ）。
       if (a.key === 'iso') return true;
+      // 資料ライブラリは全社員に常に表示する（閲覧は全員、管理は画面内で admin のみ）。
+      if (a.key === 'library') return true;
       if (perms.role === 'admin') return true;
       return !!appPerms[a.key];
     });
@@ -494,6 +497,160 @@ app.post('/api/apps/usage', requireAuth, async (req, res) => {
     res.json({ ok: true, key, use_count: nextCount });
   } catch (error) {
     console.error('Error (app usage POST):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================================
+// 資料ライブラリ（共有ドライブ 09.資料ライブラリ を直接ブラウズ）
+//   フォルダ=カテゴリ、ファイル=資料。DBテーブルは持たず Drive を正本とする。
+//   閲覧は全社員（requireAuth）、フォルダ作成・アップロード・削除は管理者（requireAdmin）。
+// ============================================================
+const LIBRARY_FOLDER_NAME = '09.資料ライブラリ';
+
+// ライブラリのルートフォルダID（無ければ作成）。共有ドライブ「社内システム」直下。
+async function getLibraryRootId() {
+  return ensureFolderPath([LIBRARY_FOLDER_NAME], SHARED_DRIVE_ROOT_ID);
+}
+
+// 指定IDがライブラリ配下（ルート自身を含む）かを親チェーンで検証する。
+//   任意のDriveフォルダ/ファイルを列挙・削除させないためのガード。
+async function isWithinLibrary(id, rootId) {
+  const root = rootId || (await getLibraryRootId());
+  if (!id) return false;
+  if (id === root) return true;
+  let cur = id;
+  for (let i = 0; i < 15; i++) {
+    const meta = await driveFileMeta(cur, 'id,parents');
+    const parents = (meta && meta.parents) || [];
+    if (parents.includes(root)) return true;
+    if (!parents.length) return false;
+    cur = parents[0];
+  }
+  return false;
+}
+
+// ✅ ライブラリ一覧（フォルダ＋ファイル）。要認証。
+//    query folderId 省略時はライブラリのルート。フォルダは navigable、ファイルは閲覧/DL対象。
+app.get('/api/library/list', requireAuth, async (req, res) => {
+  try {
+    if (!driveConfigured()) return res.status(503).json({ error: '共有ドライブが未設定です' });
+    const root = await getLibraryRootId();
+    const folderId = String(req.query.folderId || '').trim() || root;
+    if (folderId !== root && !(await isWithinLibrary(folderId, root))) {
+      return res.status(403).json({ error: 'ライブラリ外のフォルダは参照できません' });
+    }
+    const children = await driveListChildren(folderId);
+    const items = children
+      .map((c) => ({
+        id: c.id,
+        name: c.name,
+        mimeType: c.mimeType,
+        isFolder: c.mimeType === 'application/vnd.google-apps.folder',
+      }))
+      .sort((a, b) =>
+        a.isFolder === b.isFolder ? a.name.localeCompare(b.name, 'ja') : a.isFolder ? -1 : 1
+      );
+    res.json({ folderId, rootId: root, isRoot: folderId === root, items });
+  } catch (error) {
+    console.error('Error (library list):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 署名トークンで保護されたライブラリファイルの Drive プロキシ配信（?t=）。
+//   認証は requireAuth ではなく短命JWT（?t=）で行う（<a>/新規タブから開けるように）。
+app.get('/api/library-file', async (req, res) => {
+  try {
+    const token = req.query.t;
+    if (!token) return res.status(400).send('missing token');
+    let payload;
+    try { payload = jwt.verify(token, JWT_SECRET); } catch { return res.status(401).send('invalid or expired token'); }
+    if (payload.kind !== 'library' || !payload.fileId) return res.status(400).send('bad token');
+    const { buffer, contentType } = await driveDownload(payload.fileId);
+    res.setHeader('Content-Type', contentType);
+    if (payload.name) {
+      res.setHeader('Content-Disposition', `inline; filename*=UTF-8''${encodeURIComponent(payload.name)}`);
+    }
+    res.setHeader('Cache-Control', 'private, max-age=300');
+    res.send(buffer);
+  } catch (error) {
+    console.error('Error (library-file proxy):', error.message);
+    res.status(error.status || 500).send(error.message);
+  }
+});
+
+// ✅ ライブラリファイルの閲覧用URL発行（短命JWTプロキシ・300秒）。要認証。
+app.get('/api/library/file/:fileId/url', requireAuth, async (req, res) => {
+  try {
+    if (!driveConfigured()) return res.status(503).json({ error: '共有ドライブが未設定です' });
+    const { fileId } = req.params;
+    if (!(await isWithinLibrary(fileId))) return res.status(403).json({ error: 'ライブラリ外のファイルです' });
+    const meta = await driveFileMeta(fileId, 'id,name');
+    const token = jwt.sign({ fileId, kind: 'library', name: meta?.name || '' }, JWT_SECRET, { expiresIn: 300 });
+    const base = process.env.PUBLIC_API_URL || 'https://portal-api-hhlx.onrender.com';
+    res.json({ url: `${base}/api/library-file?t=${encodeURIComponent(token)}`, name: meta?.name || '' });
+  } catch (error) {
+    console.error('Error (library file url):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ ライブラリにフォルダ（カテゴリ）作成。管理者のみ。 body:{ name, parentId? }
+app.post('/api/library/folders', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    if (!driveConfigured()) return res.status(503).json({ error: '共有ドライブが未設定です' });
+    const name = sanitizeDriveSeg(String(req.body?.name || '').trim());
+    if (!name) return res.status(400).json({ error: 'フォルダ名が必要です' });
+    const root = await getLibraryRootId();
+    const parentId = String(req.body?.parentId || '').trim() || root;
+    if (parentId !== root && !(await isWithinLibrary(parentId, root))) {
+      return res.status(403).json({ error: 'ライブラリ外には作成できません' });
+    }
+    const folderId = await ensureFolder(name, parentId);
+    res.json({ id: folderId, name, isFolder: true });
+  } catch (error) {
+    console.error('Error (library folder create):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ ライブラリへファイルをアップロード。管理者のみ。 form: file, folderId?
+app.post('/api/library/upload', requireAuth, requireAdmin, upload.single('file'), async (req, res) => {
+  try {
+    if (!driveConfigured()) return res.status(503).json({ error: '共有ドライブが未設定です' });
+    if (!req.file) return res.status(400).json({ error: 'file フィールドが必要です' });
+    const root = await getLibraryRootId();
+    const folderId = String(req.body?.folderId || '').trim() || root;
+    if (folderId !== root && !(await isWithinLibrary(folderId, root))) {
+      return res.status(403).json({ error: 'ライブラリ外にはアップロードできません' });
+    }
+    const originalName = decodeUploadName(req.file.originalname);
+    const fileId = await driveUpload({
+      name: originalName,
+      buffer: req.file.buffer,
+      mimeType: req.file.mimetype,
+      folderId,
+    });
+    res.json({ id: fileId, name: originalName, isFolder: false });
+  } catch (error) {
+    console.error('Error (library upload):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ ライブラリのファイル/フォルダを削除（ゴミ箱へ）。管理者のみ。
+app.delete('/api/library/:fileId', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    if (!driveConfigured()) return res.status(503).json({ error: '共有ドライブが未設定です' });
+    const { fileId } = req.params;
+    const root = await getLibraryRootId();
+    if (fileId === root) return res.status(400).json({ error: 'ルートは削除できません' });
+    if (!(await isWithinLibrary(fileId, root))) return res.status(403).json({ error: 'ライブラリ外は削除できません' });
+    await driveTrash(fileId);
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error (library delete):', error.message);
     res.status(500).json({ error: error.message });
   }
 });
