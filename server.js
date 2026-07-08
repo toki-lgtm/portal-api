@@ -2243,6 +2243,125 @@ app.delete('/api/iso/alcohol-checks/:id', requireAuth, requireAdmin, async (req,
   }
 });
 
+// ── アルコールチェック 点呼ワンタップ記録 & リマインダー ─────────────
+// 運転者名簿（過去180日に記録のあるdriver＝実運用の対象者）を返すヘルパ。
+async function alcoholRoster() {
+  const since = new Date(Date.now() - 180 * 86400000).toISOString().slice(0, 10);
+  let rows = [], from = 0;
+  while (true) {
+    const { data, error } = await supabase
+      .from('iso_alcohol_checks').select('driver').gte('check_date', since)
+      .order('driver').range(from, from + 999);
+    if (error) throw error;
+    rows = rows.concat(data || []);
+    if (!data || data.length < 1000) break;
+    from += 1000;
+  }
+  return [...new Set(rows.map((r) => r.driver))].sort((a, b) => a.localeCompare(b, 'ja'));
+}
+
+// 確認者候補（施工管理職）。名簿の表記ゆれに備え staff_master から job_type='施工管理' を返す。
+async function sekouConfirmers() {
+  const { data } = await supabase
+    .from('staff_master').select('name, email').eq('job_type', '施工管理').eq('is_active', true).order('name');
+  return data || [];
+}
+
+// ✅ 点呼記録パネル用: 名簿＋指定日・タイミングの記録済み状況を返す。要認証。
+app.get('/api/iso/alcohol-roster', requireAuth, async (req, res) => {
+  try {
+    const date = String(req.query.date || '').trim() || new Date().toISOString().slice(0, 10);
+    const timing = String(req.query.timing || '出発').trim();
+    const [roster, confirmers, done] = await Promise.all([
+      alcoholRoster(),
+      sekouConfirmers(),
+      supabase.from('iso_alcohol_checks').select('driver').eq('check_date', date).eq('timing', timing),
+    ]);
+    const doneSet = new Set((done.data || []).map((r) => r.driver));
+    res.json({
+      date, timing,
+      confirmers: confirmers.map((c) => c.name),
+      drivers: roster.map((d) => ({ driver: d, recorded: doneSet.has(d) })),
+    });
+  } catch (error) {
+    console.error('Error (iso alcohol-roster GET):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 点呼まとめて記録。要認証。未記録の運転者だけ非検知/検知器で一括INSERT（重複は作らない）。
+app.post('/api/iso/alcohol-checks/batch', requireAuth, async (req, res) => {
+  try {
+    const date = String(req.body?.check_date || '').trim() || new Date().toISOString().slice(0, 10);
+    const timing = String(req.body?.timing || '出発').trim();
+    const method = String(req.body?.method || '検知器').trim();
+    const checker = String(req.body?.checker || '').trim();
+    const drivers = Array.isArray(req.body?.drivers) ? req.body.drivers.map((s) => String(s).trim()).filter(Boolean) : [];
+    if (drivers.length === 0) return res.status(400).json({ error: '対象の運転者がいません' });
+    // 既存の重複を除外
+    const { data: exist } = await supabase
+      .from('iso_alcohol_checks').select('driver').eq('check_date', date).eq('timing', timing).in('driver', drivers);
+    const existSet = new Set((exist || []).map((r) => r.driver));
+    const email = String(req.user.email || '').toLowerCase();
+    const rows = drivers.filter((d) => !existSet.has(d)).map((d) => ({
+      check_date: date, driver: d, timing, method, result: '非検知',
+      checker: checker && checker !== d ? checker : null, created_by: email,
+    }));
+    if (rows.length === 0) return res.json({ inserted: 0, skipped: drivers.length });
+    const { error } = await supabase.from('iso_alcohol_checks').insert(rows);
+    if (error) throw error;
+    res.json({ inserted: rows.length, skipped: drivers.length - rows.length });
+  } catch (error) {
+    console.error('Error (iso alcohol-checks batch POST):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ アルコールチェック リマインダー（Render Cron 用）。x-cron-key 保護。
+//    営業日（company_holidays＝公休/計画有給と日曜を除外）に、当日の未記録があれば
+//    施工管理職＋管理者へメール。?timing=出発|帰着 で対象タイミングを指定（既定 出発）。
+app.post('/api/iso/alcohol-reminder', async (req, res) => {
+  try {
+    if (!process.env.CRON_KEY || req.headers['x-cron-key'] !== process.env.CRON_KEY) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+    const date = new Date().toISOString().slice(0, 10);
+    const timing = String(req.query.timing || '出発').trim();
+    // 営業日判定: 日曜 or company_holidays に載る日はスキップ
+    const dow = new Date(date + 'T00:00:00').getDay();
+    const { data: hol } = await supabase.from('company_holidays').select('day').eq('day', date).maybeSingle();
+    if (dow === 0 || hol) return res.json({ skipped: '休業日', date });
+
+    const [roster, done] = await Promise.all([
+      alcoholRoster(),
+      supabase.from('iso_alcohol_checks').select('driver').eq('check_date', date).eq('timing', timing),
+    ]);
+    const doneSet = new Set((done.data || []).map((r) => r.driver));
+    const missing = roster.filter((d) => !doneSet.has(d));
+    if (missing.length === 0) return res.json({ ok: true, date, timing, missing: 0 });
+
+    // 宛先: 施工管理職のメール＋管理者
+    const confirmers = await sekouConfirmers();
+    const { data: admins } = await supabase.from('staff_master').select('email').eq('app_role', 'admin').eq('is_active', true);
+    const to = [...new Set([...confirmers.map((c) => c.email), ...(admins || []).map((a) => a.email)].filter(Boolean))];
+    if (to.length === 0) return res.json({ ok: true, date, timing, missing: missing.length, mailed: 0 });
+
+    const transporter = getMailTransporter();
+    await transporter.sendMail({
+      from: { name: MAIL_FROM_NAME, address: MAIL_FROM },
+      to,
+      subject: `【アルコールチェック】本日${timing}の未記録 ${missing.length}名`,
+      text: `本日（${date}）の${timing}のアルコールチェック記録が ${missing.length}名 未記録です。\n\n`
+        + `点呼後、ポータル「ISO管理 → 定期記入」または「運用記録 → アルコールチェック」から記録してください。\n\n`
+        + `未記録の運転者:\n${missing.map((m) => '・' + m).join('\n')}\n`,
+    });
+    res.json({ ok: true, date, timing, missing: missing.length, mailed: to.length });
+  } catch (error) {
+    console.error('Error (iso alcohol-reminder):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // ── ISO 目標達成計画（075）───────────────────────────────
 app.get('/api/iso/goals', requireAuth, async (req, res) => {
   try {
