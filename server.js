@@ -762,6 +762,86 @@ app.get('/api/iso/locations', requireAuth, async (req, res) => {
   }
 });
 
+// ✅ 定期記入ダッシュボード。毎日/毎月/四半期に記入すべき記録の「済/未」を集計。
+//    新テーブルは持たず、各記録テーブルの当日/当月/当四半期のレコード有無で判定する。要認証。
+app.get('/api/iso/periodic-status', requireAuth, async (req, res) => {
+  try {
+    const now = new Date();
+    const pad = (n) => String(n).padStart(2, '0');
+    const today = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+    const ym = today.slice(0, 7);
+    const monthStart = `${ym}-01`;
+    // 当四半期の開始月（1-3→1, 4-6→4, 7-9→7, 10-12→10）
+    const qStartMonth = Math.floor(now.getMonth() / 3) * 3;
+    const quarterStart = `${now.getFullYear()}-${pad(qStartMonth + 1)}-01`;
+
+    // count専用ヘルパ（head:true で件数のみ取得）
+    const countQ = async (table, build) => {
+      let q = supabase.from(table).select('*', { count: 'exact', head: true });
+      q = build(q);
+      const { count, error } = await q;
+      if (error) throw error;
+      return count || 0;
+    };
+
+    const [
+      alcoholToday, selfStartToday, committeeMonth, envUsageMonth,
+      goalProgMonth, goalTotal, nearMissMonth, selfMonthlyMonth,
+      freonQuarter,
+    ] = await Promise.all([
+      countQ('iso_alcohol_checks', (q) => q.eq('check_date', today)),
+      countQ('iso_self_inspections', (q) => q.eq('inspection_type', '始業時').eq('inspect_date', today)),
+      countQ('iso_safety_committee', (q) => q.gte('meeting_date', monthStart).lte('meeting_date', today)),
+      countQ('iso_env_usage_monthly', (q) => q.eq('ym', ym)),
+      countQ('iso_goal_progress', (q) => q.eq('ym', ym)),
+      countQ('iso_goals', (q) => q),
+      countQ('iso_near_misses', (q) => q.gte('report_date', monthStart).lte('report_date', today)),
+      countQ('iso_self_inspections', (q) => q.eq('inspection_type', '月次').gte('inspect_date', monthStart).lte('inspect_date', today)),
+      countQ('iso_freon_inspections', (q) => q.gte('inspect_date', quarterStart).lte('inspect_date', today)),
+    ]);
+
+    // 校正期限が近い/切れている機器数（60日以内 or 期限切れ）。
+    // next_due_date は iso_calibrations（機器ごとの最新校正）由来のため、最新を取ってから判定。
+    let calAttention = 0;
+    try {
+      const in60 = new Date(now.getTime() + 60 * 86400000).toISOString().slice(0, 10);
+      const { data: cals } = await supabase
+        .from('iso_calibrations')
+        .select('instrument_id, next_due_date')
+        .order('actual_date', { ascending: false });
+      const latest = {};
+      for (const c of cals || []) if (!(c.instrument_id in latest)) latest[c.instrument_id] = c.next_due_date;
+      calAttention = Object.values(latest).filter((d) => d && d <= in60).length;
+    } catch { calAttention = 0; }
+
+    const items = [
+      { key: 'alcohol', label: 'アルコールチェック', freq: 'daily', tab: 'alcohol',
+        done: alcoholToday > 0, count: alcoholToday, unit: '件' },
+      { key: 'self_start', label: '自主検査（始業時）', freq: 'daily', tab: 'self-inspection',
+        done: selfStartToday > 0, count: selfStartToday, unit: '件' },
+      { key: 'committee', label: '安全衛生委員会 議事録', freq: 'monthly', tab: 'committee',
+        done: committeeMonth > 0, count: committeeMonth, unit: '件' },
+      { key: 'env_usage', label: '環境使用量', freq: 'monthly', tab: 'env-usage',
+        done: envUsageMonth > 0, count: envUsageMonth, unit: '件' },
+      { key: 'goal', label: '目標達成計画（進捗評価）', freq: 'monthly', tab: 'goals',
+        done: goalTotal > 0 && goalProgMonth >= goalTotal, count: goalProgMonth, total: goalTotal, unit: '件' },
+      { key: 'self_monthly', label: '自主検査（月次）', freq: 'monthly', tab: 'self-inspection',
+        done: selfMonthlyMonth > 0, count: selfMonthlyMonth, unit: '件' },
+      { key: 'nearmiss', label: 'ヒヤリハット', freq: 'monthly_target', tab: 'nearmiss',
+        done: nearMissMonth >= 30, count: nearMissMonth, target: 30, unit: '件' },
+      { key: 'freon', label: 'フロン簡易点検', freq: 'quarterly', tab: 'freon',
+        done: freonQuarter > 0, count: freonQuarter, unit: '件' },
+      { key: 'calibration', label: '測定機器 校正（期限接近）', freq: 'cycle', tab: 'instruments',
+        done: calAttention === 0, count: calAttention, unit: '台', invert: true },
+    ];
+
+    res.json({ today, ym, quarter_start: quarterStart, items });
+  } catch (error) {
+    console.error('Error (iso periodic-status GET):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // ✅ 文書記録管理台帳 一覧。要認証。
 //    クエリ category（分類No）/ q（タイトル・条項の部分一致）で絞れる。
 app.get('/api/iso/documents', requireAuth, async (req, res) => {
