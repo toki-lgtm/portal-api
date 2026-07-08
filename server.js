@@ -3,7 +3,7 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import { createClient } from '@supabase/supabase-js';
 import ws from 'ws';
-import { randomUUID as uuidv4, createHash } from 'crypto';
+import { randomUUID as uuidv4, createHash, createHmac } from 'crypto';
 import jwt from 'jsonwebtoken';
 import multer from 'multer';
 import nodemailer from 'nodemailer';
@@ -82,7 +82,9 @@ app.use(
         }
   )
 );
-app.use(express.json());
+// express.json は本文をパースするが、LINE Webhook の署名検証には「生のバイト列」が要る。
+// verify フックで rawBody を退避しておく（他ルートには無害・微小オーバーヘッドのみ）。
+app.use(express.json({ verify: (req, res, buf) => { req.rawBody = buf; } }));
 
 // ✅ 認可ミドルウェア: Authorization: Bearer <JWT> を検証し req.user に格納
 function requireAuth(req, res, next) {
@@ -2358,6 +2360,236 @@ app.post('/api/iso/alcohol-reminder', async (req, res) => {
     res.json({ ok: true, date, timing, missing: missing.length, mailed: to.length });
   } catch (error) {
     console.error('Error (iso alcohol-reminder):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================================
+// LINE グループ記録（会社公式アカウントをグループに入れて全発言を蓄積）
+//   ・受信(記録)は通数課金の対象外＝無料。写真は共有ドライブ、本文は line_messages。
+//   ・署名検証: HMAC-SHA256(channel secret, rawBody) を x-line-signature と一致確認。
+//   環境変数: LINE_CHANNEL_ACCESS_TOKEN / LINE_CHANNEL_SECRET
+// ============================================================
+const LINE_CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
+const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET;
+const LINE_RECORD_FOLDER_NAME = process.env.LINE_RECORD_FOLDER_NAME || 'LINEグループ記録';
+
+function lineConfigured() {
+  return Boolean(LINE_CHANNEL_ACCESS_TOKEN && LINE_CHANNEL_SECRET);
+}
+
+// 発言者の表示名キャッシュ（groupId+userId -> name）。プロフィールAPIの叩きすぎを防ぐ。
+const lineNameCache = new Map();
+async function lineGroupMemberName(groupId, userId) {
+  const key = `${groupId}/${userId}`;
+  if (lineNameCache.has(key)) return lineNameCache.get(key);
+  let name = null;
+  try {
+    const res = await fetch(
+      `https://api.line.me/v2/bot/group/${encodeURIComponent(groupId)}/member/${encodeURIComponent(userId)}`,
+      { headers: { Authorization: `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}` } },
+    );
+    if (res.ok) { const d = await res.json(); name = d.displayName || null; }
+  } catch { /* 取得不可でも記録は続ける */ }
+  lineNameCache.set(key, name);
+  return name;
+}
+
+// メッセージ本体（画像/動画/音声/ファイル）のバイナリを取得する。
+async function lineGetContent(messageId) {
+  const res = await fetch(
+    `https://api-data.line.me/v2/bot/message/${encodeURIComponent(messageId)}/content`,
+    { headers: { Authorization: `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}` } },
+  );
+  if (!res.ok) throw new Error(`content取得失敗(${res.status})`);
+  const contentType = res.headers.get('content-type') || 'application/octet-stream';
+  const buffer = Buffer.from(await res.arrayBuffer());
+  return { buffer, contentType };
+}
+
+function lineExt(type, fileName, contentType) {
+  if (fileName && fileName.includes('.')) return '.' + fileName.split('.').pop();
+  if (contentType && contentType.includes('/')) {
+    const sub = contentType.split('/')[1].split(';')[0];
+    const map = { jpeg: '.jpg', png: '.png', mp4: '.mp4', 'x-m4a': '.m4a', mpeg: '.mp3', pdf: '.pdf' };
+    if (map[sub]) return map[sub];
+    if (sub && /^[a-z0-9]+$/.test(sub)) return '.' + sub;
+  }
+  const t = { image: '.jpg', video: '.mp4', audio: '.m4a', file: '.bin' };
+  return t[type] || '.bin';
+}
+
+// 保存先フォルダ: 共有ドライブ root / LINEグループ記録 / YYYY-MM [/ sub]
+//   sub='写真' で写真サブフォルダ、省略でその月フォルダ直下（日次CSVの置き場）。
+async function lineDriveFolder(sentAtIso, sub) {
+  const ym = (sentAtIso || new Date().toISOString()).slice(0, 7); // YYYY-MM
+  const segs = sub ? [LINE_RECORD_FOLDER_NAME, ym, sub] : [LINE_RECORD_FOLDER_NAME, ym];
+  return ensureFolderPath(segs, SHARED_DRIVE_ROOT_ID);
+}
+
+// 1イベントを line_messages に記録する。
+async function handleLineEvent(ev) {
+  const src = ev.source || {};
+  const groupId = src.groupId || src.roomId || null;
+  const userId = src.userId || null;
+  const row = {
+    webhook_event_id: ev.webhookEventId || `${ev.type}_${ev.timestamp || ''}_${userId || ''}`,
+    event_type: ev.type,
+    source_type: src.type || null,
+    group_id: groupId,
+    sender_user_id: userId,
+    sent_at: ev.timestamp ? new Date(ev.timestamp).toISOString() : null,
+    raw: ev,
+  };
+  if (groupId && userId) row.sender_name = await lineGroupMemberName(groupId, userId);
+
+  if (ev.type === 'message') {
+    const m = ev.message || {};
+    row.message_type = m.type;
+    if (m.type === 'text') {
+      row.text = m.text || '';
+    } else if (['image', 'video', 'audio', 'file'].includes(m.type)) {
+      try {
+        const { buffer, contentType } = await lineGetContent(m.id);
+        const stamp = (row.sent_at || '').replace(/[:.]/g, '-').slice(0, 19);
+        const who = row.sender_name || row.sender_user_id || 'unknown';
+        const fname = m.fileName
+          ? decodeUploadName(m.fileName)
+          : `${stamp}_${who}${lineExt(m.type, null, contentType)}`;
+        const folderId = await lineDriveFolder(row.sent_at, '写真');
+        row.drive_file_id = await driveUpload({ name: fname, buffer, mimeType: contentType, folderId });
+        row.file_name = fname;
+        row.text = `[${m.type}] ${fname}`;
+      } catch (e) {
+        row.text = `[${m.type} 保存失敗: ${e.message}]`;
+      }
+    } else if (m.type === 'sticker') {
+      row.sticker_info = `package:${m.packageId} sticker:${m.stickerId}`;
+      row.text = '[スタンプ]';
+    } else if (m.type === 'location') {
+      row.text = `[位置情報] ${m.title || ''} ${m.address || ''} (${m.latitude},${m.longitude})`;
+    } else {
+      row.text = `[${m.type}]`;
+    }
+  } else if (ev.type === 'join') {
+    row.text = `[Bot参加] group=${groupId}`;
+    console.log('LINE join group:', groupId); // ← 将来の催促の宛先(LINE_GROUP_ID)はこの値
+  } else if (ev.type === 'leave') {
+    row.text = '[Bot退出]';
+  } else if (ev.type === 'memberJoined') {
+    row.text = '[メンバー参加]';
+  } else if (ev.type === 'memberLeft') {
+    row.text = '[メンバー退出]';
+  } else {
+    row.text = `[${ev.type}]`;
+  }
+
+  const { error } = await supabase
+    .from('line_messages')
+    .upsert(row, { onConflict: 'webhook_event_id', ignoreDuplicates: true });
+  if (error) console.error('line_messages 保存失敗:', error.message);
+}
+
+// ✅ LINE Webhook 受信口（会社公式アカウントをグループに招待→ここに全発言が届く）。
+//    署名検証で成りすましを防ぐ。先に200を返し、処理は継続（LINEの再送/タイムアウト回避）。
+app.post('/api/line/webhook', async (req, res) => {
+  try {
+    if (!lineConfigured()) return res.status(503).json({ error: 'LINE未設定' });
+    const sig = req.headers['x-line-signature'] || '';
+    const expected = createHmac('sha256', LINE_CHANNEL_SECRET)
+      .update(req.rawBody || Buffer.from(''))
+      .digest('base64');
+    if (!sig || sig !== expected) return res.status(401).json({ error: 'bad signature' });
+    res.sendStatus(200); // 署名OK＝正規のLINE。まず即200。
+    const events = Array.isArray(req.body?.events) ? req.body.events : [];
+    for (const ev of events) {
+      try { await handleLineEvent(ev); }
+      catch (e) { console.error('LINE event処理エラー:', e.message); }
+    }
+  } catch (error) {
+    console.error('Error (line webhook):', error.message);
+    if (!res.headersSent) res.sendStatus(200);
+  }
+});
+
+// ✅ 記録の確認用（管理者）。直近の発言ログを返す。?limit=100 &date=YYYY-MM-DD(JST) &group_id=
+app.get('/api/line/messages', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const limit = Math.min(Number(req.query.limit) || 100, 1000);
+    let q = supabase.from('line_messages')
+      .select('id, event_type, message_type, group_id, sender_name, sender_user_id, text, drive_file_id, file_name, sent_at, created_at')
+      .order('sent_at', { ascending: false, nullsFirst: false })
+      .limit(limit);
+    if (req.query.group_id) q = q.eq('group_id', String(req.query.group_id));
+    if (req.query.date) {
+      const d = String(req.query.date);
+      q = q.gte('sent_at', new Date(`${d}T00:00:00+09:00`).toISOString())
+           .lte('sent_at', new Date(`${d}T23:59:59+09:00`).toISOString());
+    }
+    const { data, error } = await q;
+    if (error) throw error;
+    res.json({ configured: lineConfigured(), count: data.length, messages: data });
+  } catch (error) {
+    console.error('Error (line messages):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 1日ぶんの発言を「構造化CSV」にして共有ドライブへ保存し、保存できたら Supabase の該当行を削除する。
+//    （Supabaseは一時受け皿・恒久保存はGドライブ／写真は残しCSVから参照）。Render Cron 用・x-cron-key保護。
+//    ?date=YYYY-MM-DD(JST) 省略時は「昨日(JST)」＝その日は確定済みなので安全に締めて消せる。
+app.post('/api/line/daily-export', async (req, res) => {
+  try {
+    if (!process.env.CRON_KEY || req.headers['x-cron-key'] !== process.env.CRON_KEY) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+    // 既定は「昨日(JST)」。当日は発言が続くため締めない。
+    const jstMs = Date.now() + 9 * 3600 * 1000;
+    const yesterday = new Date(jstMs - 24 * 3600 * 1000).toISOString().slice(0, 10);
+    const d = String(req.query.date || yesterday);
+    const startZ = new Date(`${d}T00:00:00+09:00`).toISOString();
+    const endZ = new Date(`${d}T23:59:59+09:00`).toISOString();
+
+    const { data, error } = await supabase.from('line_messages')
+      .select('id, sent_at, sender_name, sender_user_id, event_type, message_type, text, file_name, drive_file_id, group_id')
+      .gte('sent_at', startZ).lte('sent_at', endZ)
+      .order('sent_at', { ascending: true });
+    if (error) throw error;
+    if (!data.length) return res.json({ ok: true, date: d, lines: 0, purged: 0, note: '発言なし' });
+
+    // CSV（Excelで文字化けしないよう UTF-8 BOM ＋ CRLF）
+    const esc = (v) => {
+      const s = (v ?? '').toString();
+      return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+    };
+    const head = ['日時(JST)', '発言者', '種別', '本文', '写真ファイル名', '写真リンク', 'userId', 'groupId'];
+    const rows = data.map((r) => {
+      const t = r.sent_at
+        ? new Date(new Date(r.sent_at).getTime() + 9 * 3600 * 1000).toISOString().replace('T', ' ').slice(0, 19)
+        : '';
+      const link = r.drive_file_id ? `https://drive.google.com/file/d/${r.drive_file_id}/view` : '';
+      const kind = r.message_type || r.event_type || '';
+      return [t, r.sender_name || r.sender_user_id || '', kind, r.text || '', r.file_name || '', link, r.sender_user_id || '', r.group_id || '']
+        .map(esc).join(',');
+    });
+    const csv = '﻿' + [head.join(','), ...rows].join('\r\n') + '\r\n';
+
+    const folderId = await lineDriveFolder(startZ);
+    const fileId = await driveUpload({
+      name: `LINEログ_${d}.csv`,
+      buffer: Buffer.from(csv, 'utf8'),
+      mimeType: 'text/csv; charset=utf-8',
+      folderId,
+    });
+
+    // Driveへ確実に保存できた行だけを削除（写真の実体はDriveに残る＝CSVから参照可能）
+    const ids = data.map((r) => r.id);
+    const { error: delErr } = await supabase.from('line_messages').delete().in('id', ids);
+    if (delErr) throw new Error(`Drive保存後の削除に失敗（fileId=${fileId}）: ${delErr.message}`);
+
+    res.json({ ok: true, date: d, lines: data.length, purged: ids.length, fileId });
+  } catch (error) {
+    console.error('Error (line daily-export):', error.message);
     res.status(500).json({ error: error.message });
   }
 });
