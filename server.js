@@ -678,6 +678,293 @@ app.post('/api/iso/documents/:id/revisions', requireAuth, requireAdmin, async (r
   }
 });
 
+// ── ISO 測定機器（058：個体管理＋校正＋貸出）───────────────────
+// ✅ 機器一覧（最新校正・次回期限・貸出状況を付与）。要認証。
+app.get('/api/iso/instruments', requireAuth, async (req, res) => {
+  try {
+    const { data: insts, error: e1 } = await supabase
+      .from('iso_instruments')
+      .select('id, serial_no, name, model, calibration_cycle_months, calibration_method, vendor, is_active, note')
+      .order('serial_no', { ascending: true });
+    if (e1) throw e1;
+    const { data: cals } = await supabase
+      .from('iso_calibrations')
+      .select('instrument_id, actual_date, next_due_date')
+      .order('actual_date', { ascending: false });
+    const { data: loans } = await supabase
+      .from('iso_instrument_loans')
+      .select('id, instrument_id, site_name, borrower, loan_date')
+      .is('return_date', null);
+    const latestCal = {};
+    for (const c of cals || []) if (!latestCal[c.instrument_id]) latestCal[c.instrument_id] = c;
+    const openLoan = {};
+    for (const l of loans || []) if (!openLoan[l.instrument_id]) openLoan[l.instrument_id] = l;
+    const rows = (insts || []).map((it) => ({
+      ...it,
+      last_calibration: latestCal[it.id]?.actual_date || null,
+      next_due_date: latestCal[it.id]?.next_due_date || null,
+      current_loan: openLoan[it.id] || null,
+    }));
+    res.json(rows);
+  } catch (error) {
+    console.error('Error (iso instruments GET):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+const ISO_INST_FIELDS = ['serial_no', 'name', 'model', 'calibration_cycle_months', 'calibration_method', 'vendor', 'is_active', 'note'];
+
+// ✅ 機器を追加。管理者のみ。
+app.post('/api/iso/instruments', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const row = {};
+    for (const f of ISO_INST_FIELDS) if (req.body[f] !== undefined) row[f] = req.body[f];
+    if (!row.name) return res.status(400).json({ error: 'name は必須です' });
+    const { data, error } = await supabase.from('iso_instruments').insert([row]).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (iso instruments POST):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 機器を更新（個体番号の付与・変更を含む）。管理者のみ。
+app.put('/api/iso/instruments/:id', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid id' });
+    const patch = { updated_at: new Date().toISOString() };
+    for (const f of ISO_INST_FIELDS) if (req.body[f] !== undefined) patch[f] = req.body[f];
+    const { data, error } = await supabase.from('iso_instruments').update(patch).eq('id', id).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (iso instruments PUT):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 機器の校正記録・貸出履歴を取得。要認証。
+app.get('/api/iso/instruments/:id/history', requireAuth, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid id' });
+    const { data: calibrations } = await supabase
+      .from('iso_calibrations').select('id, actual_date, next_due_date, assignee, cert_link, note')
+      .eq('instrument_id', id).order('actual_date', { ascending: false });
+    const { data: loans } = await supabase
+      .from('iso_instrument_loans').select('id, site_name, borrower, loan_date, return_date, note')
+      .eq('instrument_id', id).order('loan_date', { ascending: false });
+    res.json({ calibrations: calibrations || [], loans: loans || [] });
+  } catch (error) {
+    console.error('Error (iso instrument history GET):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 校正記録を追加（次回期限=実施日+周期を自動算出）。管理者のみ。
+app.post('/api/iso/instruments/:id/calibrations', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid id' });
+    const actual = String(req.body?.actual_date || '').trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(actual)) return res.status(400).json({ error: 'actual_date は YYYY-MM-DD' });
+    // 周期から次回期限を算出
+    const { data: inst } = await supabase.from('iso_instruments').select('calibration_cycle_months').eq('id', id).single();
+    let nextDue = req.body?.next_due_date || null;
+    if (!nextDue && inst?.calibration_cycle_months) {
+      const d = new Date(actual + 'T00:00:00');
+      d.setMonth(d.getMonth() + inst.calibration_cycle_months);
+      nextDue = d.toISOString().slice(0, 10);
+    }
+    const row = {
+      instrument_id: id,
+      actual_date: actual,
+      next_due_date: nextDue,
+      assignee: req.body?.assignee || null,
+      cert_link: req.body?.cert_link || null,
+      note: req.body?.note || null,
+    };
+    const { data, error } = await supabase.from('iso_calibrations').insert([row]).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (iso calibration POST):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 貸出を登録。管理者のみ。body: { site_name, borrower, loan_date }
+app.post('/api/iso/instruments/:id/loans', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid id' });
+    const loan_date = String(req.body?.loan_date || '').trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(loan_date)) return res.status(400).json({ error: 'loan_date は YYYY-MM-DD' });
+    const row = {
+      instrument_id: id,
+      site_name: req.body?.site_name || null,
+      borrower: req.body?.borrower || null,
+      loan_date,
+      note: req.body?.note || null,
+    };
+    const { data, error } = await supabase.from('iso_instrument_loans').insert([row]).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (iso loan POST):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 返却（貸出に return_date を設定）。管理者のみ。
+app.put('/api/iso/loans/:id/return', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid id' });
+    const return_date = String(req.body?.return_date || new Date().toISOString().slice(0, 10)).trim();
+    const { data, error } = await supabase.from('iso_instrument_loans')
+      .update({ return_date }).eq('id', id).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (iso loan return):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ── ISO リスクアセスメント（059：場所軸）─────────────────────
+// ✅ 一覧。要認証。クエリ location（場所ID）/ dept で絞れる。
+app.get('/api/iso/risk-assessments', requireAuth, async (req, res) => {
+  try {
+    let query = supabase
+      .from('iso_risk_assessments')
+      .select('id, location_id, dept, process, hazard, scene, damage, measures, control_codes, frequency, severity, score, priority_flag, legal_flag, category, review_date')
+      .order('id', { ascending: true });
+    const location = parseInt(req.query.location, 10);
+    const dept = String(req.query.dept || '').trim();
+    if (Number.isInteger(location)) query = query.eq('location_id', location);
+    if (dept) query = query.eq('dept', dept);
+    const { data, error } = await query;
+    if (error) throw error;
+    res.json(data || []);
+  } catch (error) {
+    console.error('Error (iso risk GET):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+const ISO_RA_FIELDS = ['location_id', 'dept', 'process', 'hazard', 'scene', 'damage', 'measures', 'control_codes', 'frequency', 'severity', 'legal_flag', 'category', 'review_date'];
+
+// ✅ 追加。管理者のみ。（score/priority_flag はDB生成列なので送らない）
+app.post('/api/iso/risk-assessments', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const row = {};
+    for (const f of ISO_RA_FIELDS) if (req.body[f] !== undefined) row[f] = req.body[f];
+    if (!row.hazard) return res.status(400).json({ error: 'hazard は必須です' });
+    const { data, error } = await supabase.from('iso_risk_assessments').insert([row]).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (iso risk POST):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 更新。管理者のみ。
+app.put('/api/iso/risk-assessments/:id', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid id' });
+    const patch = { updated_at: new Date().toISOString() };
+    for (const f of ISO_RA_FIELDS) if (req.body[f] !== undefined) patch[f] = req.body[f];
+    const { data, error } = await supabase.from('iso_risk_assessments').update(patch).eq('id', id).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (iso risk PUT):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 削除。管理者のみ。
+app.delete('/api/iso/risk-assessments/:id', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid id' });
+    const { error } = await supabase.from('iso_risk_assessments').delete().eq('id', id);
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error (iso risk DELETE):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ── ISO 年間スケジュール（060）─────────────────────────────
+// ✅ 一覧。要認証。
+app.get('/api/iso/schedule', requireAuth, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('iso_schedule')
+      .select('id, event_type, standard, title, planned_date, planned_note, actual_date, status, note, sort_order')
+      .order('sort_order', { ascending: true });
+    if (error) throw error;
+    res.json(data || []);
+  } catch (error) {
+    console.error('Error (iso schedule GET):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+const ISO_SCH_FIELDS = ['event_type', 'standard', 'title', 'planned_date', 'planned_note', 'actual_date', 'status', 'note', 'sort_order'];
+
+// ✅ 追加。管理者のみ。
+app.post('/api/iso/schedule', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const row = {};
+    for (const f of ISO_SCH_FIELDS) if (req.body[f] !== undefined) row[f] = req.body[f];
+    if (!row.title || !row.event_type) return res.status(400).json({ error: 'event_type と title は必須です' });
+    const { data, error } = await supabase.from('iso_schedule').insert([row]).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (iso schedule POST):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 更新（実施日・ステータス等）。管理者のみ。
+app.put('/api/iso/schedule/:id', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid id' });
+    const patch = { updated_at: new Date().toISOString() };
+    for (const f of ISO_SCH_FIELDS) if (req.body[f] !== undefined) patch[f] = req.body[f];
+    const { data, error } = await supabase.from('iso_schedule').update(patch).eq('id', id).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (iso schedule PUT):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 削除。管理者のみ。
+app.delete('/api/iso/schedule/:id', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid id' });
+    const { error } = await supabase.from('iso_schedule').delete().eq('id', id);
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error (iso schedule DELETE):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // ✅ ポータルTOP用：安全パトロールの状況サマリ（KPIカード＋最近の活動）
 //    既存の inspections / inspection_details / projects を集計して返す。読み取り専用・要認証。
 //    KPI: 今月の点検数 / 完了率(承認済の指摘÷全指摘) / 是正対応中(未承認の指摘) / 承認待ち(submitted)
