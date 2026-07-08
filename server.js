@@ -2853,12 +2853,32 @@ app.post('/api/site-assignments/extract', async (req, res) => {
   }
 });
 
+// 人員配列を保存用に正規化。社員名簿に一致する個人は matched=true を確定する
+// （管理者がピッカーで正しい社員を選んだら「?」が消えるように）。
+async function normalizeMembersForSave(members) {
+  const roster = await loadStaffRoster(supabase);
+  const names = new Set(roster.map((r) => r.name));
+  return (Array.isArray(members) ? members : [])
+    .map((m) => {
+      const name = (m.name || '').trim();
+      const company = (m.company || '').trim();
+      return {
+        name,
+        raw_name: (m.raw_name || '').trim() || name,
+        company,
+        count: Number.isFinite(Number(m.count)) && Number(m.count) > 0 ? Math.round(Number(m.count)) : 1,
+        matched: company ? false : names.has(name),
+      };
+    })
+    .filter((m) => m.name);
+}
+
 // ✅ 現場行の手動追加（管理者）。work_date と site_name 必須。
 app.post('/api/site-assignments', requireAuth, requireAdmin, async (req, res) => {
   try {
     const { work_date, site_name, work_content, members } = req.body || {};
     if (!work_date || !site_name) return res.status(400).json({ error: 'work_date と site_name は必須です' });
-    const mem = Array.isArray(members) ? members : [];
+    const mem = await normalizeMembersForSave(members);
     const { data, error } = await supabase.from('site_assignments').insert({
       work_date, site_name: String(site_name).trim(), work_content: work_content || null,
       members: mem, member_count: sumMembers(mem), source_sender: '手動追加', edited: true,
@@ -2881,7 +2901,7 @@ app.put('/api/site-assignments/:id', requireAuth, requireAdmin, async (req, res)
     if (work_content !== undefined) patch.work_content = work_content || null;
     let aliasRows = [];
     if (members !== undefined) {
-      const mem = Array.isArray(members) ? members : [];
+      const mem = await normalizeMembersForSave(members);
       patch.members = mem;
       patch.member_count = sumMembers(mem);
       // 手修正から対応表を学習: 呼び名(raw_name)と確定氏名(name)が異なる個人だけ登録（協力会社は除外）
