@@ -19,7 +19,7 @@
 import dotenv from 'dotenv';
 import { createClient } from '@supabase/supabase-js';
 import ws from 'ws';
-import { extractSiteAssignments, nextWorkingDay, loadStaffRoster } from '../siteAssignments.js';
+import { extractSiteAssignments, nextWorkingDay, loadStaffRoster, loadNameAliases } from '../siteAssignments.js';
 
 dotenv.config();
 
@@ -53,8 +53,9 @@ async function main() {
   const workDate = await nextWorkingDay(supabase, src);
   console.log(`[lineExtractAssignments] 翌営業日=${workDate}／text発言 ${data.length}件`);
 
-  // 社員名簿を1回だけ取得し、人員名の照合に使う
+  // 社員名簿＋呼び名対応表を1回だけ取得し、人員名の照合に使う
   const roster = await loadStaffRoster(supabase);
+  const aliases = await loadNameAliases(supabase);
 
   // グループ単位で抽出（テスト用など人員報告のないグループは自然に0件になる）
   const byGroup = new Map();
@@ -68,7 +69,7 @@ async function main() {
   for (const [groupLabel, msgs] of byGroup) {
     let assignments = [];
     try {
-      assignments = await extractSiteAssignments(msgs, roster);
+      assignments = await extractSiteAssignments(msgs, roster, aliases);
     } catch (e) {
       console.error(`[lineExtractAssignments] 抽出失敗(グループ「${groupLabel}」):`, e.message);
       continue;

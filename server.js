@@ -16,7 +16,7 @@ import { driveUpload, driveDownload, driveThumbnail, driveTrash, driveConfigured
 import { Readable } from 'stream';
 import { classifyQuote, classNoOf } from './classifyQuote.js';
 import { extractExcelQuote } from './quoteExcelExtract.js';
-import { extractSiteAssignments, nextWorkingDay, sumMembers, loadStaffRoster } from './siteAssignments.js';
+import { extractSiteAssignments, nextWorkingDay, sumMembers, loadStaffRoster, loadNameAliases } from './siteAssignments.js';
 
 dotenv.config();
 
@@ -2726,8 +2726,9 @@ async function runSiteAssignmentExtraction(srcDate) {
   const workDate = await nextWorkingDay(supabase, srcDate);
   if (!msgs || !msgs.length) return { work_date: workDate, source_date: srcDate, sites: 0, total: 0, note: '対象日のtext発言なし' };
 
-  // 社員名簿を1回だけ取得し、人員名の照合に使う
+  // 社員名簿＋呼び名対応表を1回だけ取得し、人員名の照合に使う
   const roster = await loadStaffRoster(supabase);
+  const aliases = await loadNameAliases(supabase);
 
   // グループ単位で抽出（人員報告のないグループは自然に0件）
   const byGroup = new Map();
@@ -2740,7 +2741,7 @@ async function runSiteAssignmentExtraction(srcDate) {
   for (const [groupLabel, list] of byGroup) {
     let assignments = [];
     try {
-      assignments = await extractSiteAssignments(list, roster);
+      assignments = await extractSiteAssignments(list, roster, aliases);
     } catch (e) {
       console.error(`Warning (site-assignments extract, group ${groupLabel}):`, e.message);
       continue;
@@ -2861,13 +2862,32 @@ app.put('/api/site-assignments/:id', requireAuth, requireAdmin, async (req, res)
     const patch = { edited: true, updated_at: new Date().toISOString() };
     if (site_name !== undefined) patch.site_name = String(site_name).trim();
     if (work_content !== undefined) patch.work_content = work_content || null;
+    let aliasRows = [];
     if (members !== undefined) {
       const mem = Array.isArray(members) ? members : [];
       patch.members = mem;
       patch.member_count = sumMembers(mem);
+      // 手修正から対応表を学習: 呼び名(raw_name)と確定氏名(name)が異なる個人だけ登録（協力会社は除外）
+      const seen = {};
+      for (const m of mem) {
+        const raw = (m.raw_name || '').trim();
+        const nm = (m.name || '').trim();
+        if (!(m.company || '').trim() && raw && nm && raw !== nm) {
+          seen[raw] = { alias: raw, full_name: nm, note: '手修正から学習', updated_at: new Date().toISOString() };
+        }
+      }
+      aliasRows = Object.values(seen);
     }
     const { data, error } = await supabase.from('site_assignments').update(patch).eq('id', id).select().single();
     if (error) throw error;
+    // 対応表へ学習（テーブル未適用でも編集は成功させる）
+    if (aliasRows.length) {
+      try {
+        await supabase.from('name_aliases').upsert(aliasRows, { onConflict: 'alias' });
+      } catch (e) {
+        console.error('Warning (name_aliases learn):', e.message);
+      }
+    }
     res.json(data);
   } catch (error) {
     console.error('Error (site-assignments update):', error.message);

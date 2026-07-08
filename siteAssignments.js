@@ -59,10 +59,27 @@ export async function loadStaffRoster(supabase) {
   }
 }
 
+// 呼び名→正式氏名の対応表を取得。抽出後にコード側で確定的に置き換える。
+export async function loadNameAliases(supabase) {
+  try {
+    const { data } = await supabase.from('name_aliases').select('alias, full_name');
+    const map = new Map();
+    for (const r of data || []) {
+      if ((r.alias || '').trim() && (r.full_name || '').trim()) {
+        map.set(r.alias.trim(), r.full_name.trim());
+      }
+    }
+    return map;
+  } catch {
+    return new Map();
+  }
+}
+
 // LINE発言群 → 現場別人員の配列を抽出する。
 //   roster: [{name, furigana}] を渡すと、人員名を社員名簿の正式氏名へ寄せる（曖昧なら元の呼び名のまま）。
+//   aliases: Map<呼び名, 正式氏名>。AI結果より優先してコード側で確定置き換えする。
 //   返り値: [{ site_name, work_content, members:[{name,raw_name,company,count,matched}], member_count, source_sender }]
-export async function extractSiteAssignments(messages, roster = []) {
+export async function extractSiteAssignments(messages, roster = [], aliases = new Map()) {
   if (!GEMINI_API_KEY) {
     const e = new Error('GEMINI_API_KEY が未設定です。Render の環境変数に設定してください。');
     e.status = 503;
@@ -91,8 +108,10 @@ export async function extractSiteAssignments(messages, roster = []) {
     '- members: その現場に入る人員の配列。各要素は次のとおり。',
     '    ・raw_name: 本文中の呼び名をそのまま（例: 弘さん、ヒロミ、北森くん）。',
     '    ・name: 下の「社員名簿」に確実に一致する社員がいれば、その正式氏名に置き換える（matched=true）。',
-    '            略称・下の名前・敬称(さん/くん)・ふりがな(カタカナ)からの推定でも、名簿と1人に特定できれば置き換える。',
-    '            該当者がいない、または候補が複数いて1人に絞れない場合は、置き換えずに raw_name と同じ呼び名を入れ matched=false。',
+    '            姓・下の名前・敬称(さん/くん)を外した漢字表記で、名簿と1人に特定できれば置き換える。',
+    '            ただし、カタカナ/ひらがなだけの通称（例: ヒロミ、りえ、ぶんじゅ）は、名簿に同じ読みの「ふりがな」が登録されている場合のみ置き換える。',
+    '            漢字の当て字・読みの推測だけで別姓の社員に結び付けてはいけない（例: カタカナ「ヒロミ」を、氏名が「廣美」というだけの別人に当てない）。',
+    '            該当者がいない、候補が複数で1人に絞れない、確証がない場合は、置き換えずに raw_name と同じ呼び名を入れ matched=false。',
     '    ・matched: 名簿の社員に確定できたら true、できなければ false。',
     '    ・company: 協力会社なら会社名、社員・個人なら空文字。',
     '    ・count: 個人は 1。協力会社が「◯◯さん5名」「◯◯工業 3名」のように人数付きなら、name/raw_name に会社名・company に会社名・count にその人数。',
@@ -170,13 +189,17 @@ export async function extractSiteAssignments(messages, roster = []) {
     if (!site) continue;
     const members = (Array.isArray(a.members) ? a.members : [])
       .map((m) => {
-        const name = (m.name || '').trim();
-        const raw = (m.raw_name || '').trim() || name;
+        const gName = (m.name || '').trim();
+        const raw = (m.raw_name || '').trim() || gName;
+        const company = (m.company || '').trim();
+        // 対応表が最優先: 呼び名(raw)またはAI判定名(gName)が登録済みなら確定置き換え。
+        // 協力会社は対象外。
+        const aliasHit = !company ? (aliases.get(raw) || aliases.get(gName)) : null;
         return {
-          name: name || raw,
+          name: aliasHit || gName || raw,
           raw_name: raw,
-          matched: !!m.matched,
-          company: (m.company || '').trim(),
+          matched: aliasHit ? true : !!m.matched,
+          company,
           count: Number.isFinite(Number(m.count)) && Number(m.count) > 0 ? Math.round(Number(m.count)) : 1,
         };
       })
