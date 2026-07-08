@@ -1169,6 +1169,74 @@ app.delete('/api/iso/risk-assessments/:id', requireAuth, requireAdmin, async (re
   }
 });
 
+// ── ISO 関連法令規制一覧・順守評価表（096：6.1/9.1）──────────
+// ✅ 一覧。要認証（全社員閲覧可）。クエリ category（区分）で絞れる。
+app.get('/api/iso/laws-regulations', requireAuth, async (req, res) => {
+  try {
+    let query = supabase
+      .from('iso_laws_regulations')
+      .select('id, category, law_type, law_name, requirement, our_compliance, related_equipment, responsible_dept, related_records, compliance_status, sort_order')
+      .order('sort_order', { ascending: true })
+      .order('id', { ascending: true });
+    const category = String(req.query.category || '').trim();
+    if (category) query = query.eq('category', category);
+    const { data, error } = await query;
+    if (error) throw error;
+    res.json(data || []);
+  } catch (error) {
+    console.error('Error (iso laws GET):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+const ISO_LAW_FIELDS = ['category', 'law_type', 'law_name', 'requirement', 'our_compliance', 'related_equipment', 'responsible_dept', 'related_records', 'compliance_status', 'sort_order'];
+
+// ✅ 追加。管理者のみ。
+app.post('/api/iso/laws-regulations', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const row = {};
+    for (const f of ISO_LAW_FIELDS) if (req.body[f] !== undefined) row[f] = req.body[f];
+    if (!row.category) return res.status(400).json({ error: '区分は必須です' });
+    if (!row.law_name) return res.status(400).json({ error: '法令・規制名は必須です' });
+    const { data, error } = await supabase.from('iso_laws_regulations').insert([row]).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (iso laws POST):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 更新。管理者のみ。
+app.put('/api/iso/laws-regulations/:id', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid id' });
+    const patch = { updated_at: new Date().toISOString() };
+    for (const f of ISO_LAW_FIELDS) if (req.body[f] !== undefined) patch[f] = req.body[f];
+    const { data, error } = await supabase.from('iso_laws_regulations').update(patch).eq('id', id).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (iso laws PUT):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 削除。管理者のみ。
+app.delete('/api/iso/laws-regulations/:id', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid id' });
+    const { error } = await supabase.from('iso_laws_regulations').delete().eq('id', id);
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error (iso laws DELETE):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // ── ISO 年間スケジュール（060）─────────────────────────────
 // ✅ 一覧。要認証。
 app.get('/api/iso/schedule', requireAuth, async (req, res) => {
