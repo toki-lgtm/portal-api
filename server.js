@@ -2362,6 +2362,67 @@ app.post('/api/iso/alcohol-reminder', async (req, res) => {
   }
 });
 
+// ✅ 月次の日別記録サマリ（遡り確認・記録漏れ検出用）。要認証。
+//    ?month=YYYY-MM。各日の出発/帰着件数・検知件数・営業日か・完了かを返す。
+app.get('/api/iso/alcohol-summary', requireAuth, async (req, res) => {
+  try {
+    const month = (String(req.query.month || '').trim()) || new Date().toISOString().slice(0, 7);
+    const [y, m] = month.split('-').map(Number);
+    if (!y || !m) return res.status(400).json({ error: 'month は YYYY-MM 形式で指定してください' });
+    const start = `${month}-01`;
+    const lastDay = new Date(y, m, 0).getDate();
+    const end = `${month}-${String(lastDay).padStart(2, '0')}`;
+
+    // 月内の記録をページングで全件取得（1000行上限対策）
+    let recs = [], from = 0;
+    while (true) {
+      const { data, error } = await supabase
+        .from('iso_alcohol_checks').select('check_date, timing, result')
+        .gte('check_date', start).lte('check_date', end).order('check_date').range(from, from + 999);
+      if (error) throw error;
+      recs = recs.concat(data || []);
+      if (!data || data.length < 1000) break;
+      from += 1000;
+    }
+    // 休業日（company_holidays）と名簿人数
+    const [{ data: hols }, roster] = await Promise.all([
+      supabase.from('company_holidays').select('day').gte('day', start).lte('day', end),
+      alcoholRoster(),
+    ]);
+    const holSet = new Set((hols || []).map((h) => h.day));
+    const rosterN = roster.length;
+    const todayStr = new Date().toISOString().slice(0, 10);
+
+    const by = {};
+    for (const r of recs) {
+      const b = (by[r.check_date] ||= { dep: 0, ret: 0, detected: 0 });
+      if (r.timing === '出発') b.dep++; else if (r.timing === '帰着') b.ret++;
+      if (r.result === '検知') b.detected++;
+    }
+    const days = [];
+    for (let d = 1; d <= lastDay; d++) {
+      const date = `${month}-${String(d).padStart(2, '0')}`;
+      const dow = new Date(date + 'T00:00:00').getDay();
+      const isWorkday = dow !== 0 && !holSet.has(date);
+      const b = by[date] || { dep: 0, ret: 0, detected: 0 };
+      const has = b.dep > 0 || b.ret > 0;
+      days.push({
+        date, dow, is_workday: isWorkday,
+        dep: b.dep, ret: b.ret, detected: b.detected,
+        // 状態: 完了(出発帰着とも全員) / 一部 / 未記録 / 休業 / 未到来(未来日)
+        status: !isWorkday ? (has ? 'off_has' : 'off')
+          : date > todayStr ? 'future'
+          : (b.dep >= rosterN && b.ret >= rosterN) ? 'complete'
+          : has ? 'partial' : 'missing',
+      });
+    }
+    res.json({ month, roster: rosterN, days });
+  } catch (error) {
+    console.error('Error (iso alcohol-summary GET):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // ── ISO 目標達成計画（075）───────────────────────────────
 app.get('/api/iso/goals', requireAuth, async (req, res) => {
   try {
