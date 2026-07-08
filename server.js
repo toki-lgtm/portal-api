@@ -586,9 +586,10 @@ app.get('/api/library-file', async (req, res) => {
     const cr = driveRes.headers.get('content-range'); if (cr) res.setHeader('Content-Range', cr);
     res.setHeader('Accept-Ranges', 'bytes');
     res.setHeader('Cache-Control', 'private, max-age=300');
-    if (payload.name) {
-      res.setHeader('Content-Disposition', `inline; filename*=UTF-8''${encodeURIComponent(payload.name)}`);
-    }
+    // dl=1 で添付（ダウンロード保存）、それ以外は inline（ブラウザ内表示）。
+    const disp = req.query.dl ? 'attachment' : 'inline';
+    const fname = payload.name || 'file';
+    res.setHeader('Content-Disposition', `${disp}; filename*=UTF-8''${encodeURIComponent(fname)}`);
 
     if (!driveRes.body) { res.end(); return; }
     const nodeStream = Readable.fromWeb(driveRes.body);
@@ -614,7 +615,9 @@ app.get('/api/library/file/:fileId/url', requireAuth, async (req, res) => {
     const meta = await driveFileMeta(fileId, 'id,name');
     const token = jwt.sign({ fileId, kind: 'library', name: meta?.name || '' }, JWT_SECRET, { expiresIn: 300 });
     const base = process.env.PUBLIC_API_URL || 'https://portal-api-hhlx.onrender.com';
-    res.json({ url: `${base}/api/library-file?t=${encodeURIComponent(token)}`, name: meta?.name || '' });
+    // dl=1 を付けて添付（ダウンロード保存）で配信する。inline表示は端末/ビューア依存で不安定なため。
+    const dl = req.query.dl === '0' ? '' : '&dl=1';
+    res.json({ url: `${base}/api/library-file?t=${encodeURIComponent(token)}${dl}`, name: meta?.name || '' });
   } catch (error) {
     console.error('Error (library file url):', error.message);
     res.status(500).json({ error: error.message });
@@ -1280,6 +1283,1050 @@ app.delete('/api/iso/suppliers/:id', requireAuth, requireAdmin, async (req, res)
     res.json({ ok: true });
   } catch (error) {
     console.error('Error (iso suppliers DELETE):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+
+// ==== ISO管理 F3/F4/F2残 エンドポイント（統括官が統合。063-076）====
+// F3運用サイクル 063-065 endpoints
+// ── ISO 内部監査（063）───────────────────────────────
+// ✅ 一覧（指摘事項を別クエリで取得しaudit_idごとに束ねて付与）。要認証。
+app.get('/api/iso/internal-audits', requireAuth, async (req, res) => {
+  try {
+    const { data: audits, error: e1 } = await supabase
+      .from('iso_internal_audits')
+      .select('id, audit_year, auditor, purpose, criteria, summary, conclusion, leader, approved_date')
+      .order('audit_year', { ascending: false })
+      .order('id', { ascending: false });
+    if (e1) throw e1;
+    const { data: findings } = await supabase
+      .from('iso_audit_findings')
+      .select('id, audit_id, clause, dept, category, finding')
+      .order('id', { ascending: true });
+    const byAudit = {};
+    for (const f of findings || []) (byAudit[f.audit_id] = byAudit[f.audit_id] || []).push(f);
+    const rows = (audits || []).map((a) => ({ ...a, findings: byAudit[a.id] || [] }));
+    res.json(rows);
+  } catch (error) {
+    console.error('Error (iso audits GET):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+const ISO_AUDIT_FIELDS = ['audit_year', 'auditor', 'purpose', 'criteria', 'summary', 'conclusion', 'leader', 'approved_date'];
+
+// ✅ 監査記録を追加。管理者のみ。
+app.post('/api/iso/internal-audits', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const row = {};
+    for (const f of ISO_AUDIT_FIELDS) if (req.body[f] !== undefined) row[f] = req.body[f];
+    const { data, error } = await supabase.from('iso_internal_audits').insert([row]).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (iso audits POST):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 監査記録を更新。管理者のみ。
+app.put('/api/iso/internal-audits/:id', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid id' });
+    const patch = { updated_at: new Date().toISOString() };
+    for (const f of ISO_AUDIT_FIELDS) if (req.body[f] !== undefined) patch[f] = req.body[f];
+    const { data, error } = await supabase.from('iso_internal_audits').update(patch).eq('id', id).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (iso audits PUT):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 指摘事項を追加。管理者のみ。
+app.post('/api/iso/internal-audits/:id/findings', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid id' });
+    const row = {
+      audit_id: id,
+      clause: req.body?.clause || null,
+      dept: req.body?.dept || null,
+      category: req.body?.category || null,
+      finding: req.body?.finding || null,
+    };
+    if (!row.finding) return res.status(400).json({ error: 'finding は必須です' });
+    const { data, error } = await supabase.from('iso_audit_findings').insert([row]).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (iso findings POST):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ── ISO 是正処置（064・ISO10.2 中核ワークフロー）─────────────────
+// ✅ 一覧。要認証。クエリ status で絞れる。
+app.get('/api/iso/corrective-actions', requireAuth, async (req, res) => {
+  try {
+    let query = supabase
+      .from('iso_corrective_actions')
+      .select('id, title, dept, nonconformity, correction, source_type, source_ref, cause, similar_check, plan, result, effectiveness, status, ms_change, planned_date, created_at')
+      .order('created_at', { ascending: false });
+    const status = String(req.query.status || '').trim();
+    if (status) query = query.eq('status', status);
+    const { data, error } = await query;
+    if (error) throw error;
+    res.json(data || []);
+  } catch (error) {
+    console.error('Error (iso corrective GET):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+const ISO_CA_FIELDS = ['title', 'dept', 'nonconformity', 'correction', 'source_type', 'source_ref', 'cause', 'similar_check', 'plan', 'result', 'effectiveness', 'status', 'ms_change', 'planned_date'];
+
+// ✅ 是正処置を起票。管理者のみ。
+app.post('/api/iso/corrective-actions', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const row = {};
+    for (const f of ISO_CA_FIELDS) if (req.body[f] !== undefined) row[f] = req.body[f];
+    if (!row.title) return res.status(400).json({ error: 'title は必須です' });
+    const { data, error } = await supabase.from('iso_corrective_actions').insert([row]).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (iso corrective POST):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 是正処置を更新（status遷移含む）。管理者のみ。
+app.put('/api/iso/corrective-actions/:id', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid id' });
+    const patch = { updated_at: new Date().toISOString() };
+    for (const f of ISO_CA_FIELDS) if (req.body[f] !== undefined) patch[f] = req.body[f];
+    const { data, error } = await supabase.from('iso_corrective_actions').update(patch).eq('id', id).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (iso corrective PUT):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ── ISO マネジメントレビュー（065・ISO9.3）───────────────────
+// ✅ 一覧（インプット/アウトプット項目を別クエリで取得しreview_idごとに束ねて付与）。要認証。
+app.get('/api/iso/mgmt-reviews', requireAuth, async (req, res) => {
+  try {
+    const { data: reviews, error: e1 } = await supabase
+      .from('iso_mgmt_reviews')
+      .select('id, review_date, location, attendees')
+      .order('review_date', { ascending: false });
+    if (e1) throw e1;
+    const { data: items } = await supabase
+      .from('iso_mgmt_review_items')
+      .select('id, review_id, io_type, clause_ref, label, content, sort_order')
+      .order('sort_order', { ascending: true });
+    const byReview = {};
+    for (const i of items || []) (byReview[i.review_id] = byReview[i.review_id] || []).push(i);
+    const rows = (reviews || []).map((r) => ({ ...r, items: byReview[r.id] || [] }));
+    res.json(rows);
+  } catch (error) {
+    console.error('Error (iso mgmt-reviews GET):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+const ISO_REVIEW_FIELDS = ['review_date', 'location', 'attendees'];
+
+// ✅ レビューを追加。管理者のみ。
+app.post('/api/iso/mgmt-reviews', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const row = {};
+    for (const f of ISO_REVIEW_FIELDS) if (req.body[f] !== undefined) row[f] = req.body[f];
+    const { data, error } = await supabase.from('iso_mgmt_reviews').insert([row]).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (iso mgmt-reviews POST):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ レビューを更新。管理者のみ。
+app.put('/api/iso/mgmt-reviews/:id', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid id' });
+    const patch = { updated_at: new Date().toISOString() };
+    for (const f of ISO_REVIEW_FIELDS) if (req.body[f] !== undefined) patch[f] = req.body[f];
+    const { data, error } = await supabase.from('iso_mgmt_reviews').update(patch).eq('id', id).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (iso mgmt-reviews PUT):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ インプット/アウトプット項目を追加。管理者のみ。
+app.post('/api/iso/mgmt-reviews/:id/items', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid id' });
+    const row = {
+      review_id: id,
+      io_type: req.body?.io_type || null,
+      clause_ref: req.body?.clause_ref || null,
+      label: req.body?.label || null,
+      content: req.body?.content || null,
+      sort_order: req.body?.sort_order || 0,
+    };
+    if (!row.content) return res.status(400).json({ error: 'content は必須です' });
+    const { data, error } = await supabase.from('iso_mgmt_review_items').insert([row]).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (iso mgmt-review items POST):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// F3記録 066-068 endpoints
+// ── ISO 事故報告書（066）───────────────────────────────
+// ✅ 一覧。要認証。
+app.get('/api/iso/accidents', requireAuth, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('iso_accidents')
+      .select('id, project_name, ordering_agency, occurred_at, accident_type, victim_affiliation, victim_name, victim_age, victim_gender, symptom, occupation, summary, status, created_by, created_at, updated_at')
+      .order('occurred_at', { ascending: false });
+    if (error) throw error;
+    res.json(data || []);
+  } catch (error) {
+    console.error('Error (iso accidents GET):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+const ISO_ACC_FIELDS = ['project_name', 'ordering_agency', 'occurred_at', 'accident_type', 'victim_affiliation', 'victim_name', 'victim_age', 'victim_gender', 'symptom', 'occupation', 'summary', 'status'];
+
+// ✅ 起票。現場も行うため requireAuth のみ。
+app.post('/api/iso/accidents', requireAuth, async (req, res) => {
+  try {
+    const row = { created_by: String(req.user.email || '').toLowerCase() };
+    for (const f of ISO_ACC_FIELDS) if (req.body[f] !== undefined) row[f] = req.body[f];
+    const { data, error } = await supabase.from('iso_accidents').insert([row]).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (iso accidents POST):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 更新。管理者のみ。
+app.put('/api/iso/accidents/:id', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid id' });
+    const patch = { updated_at: new Date().toISOString() };
+    for (const f of ISO_ACC_FIELDS) if (req.body[f] !== undefined) patch[f] = req.body[f];
+    const { data, error } = await supabase.from('iso_accidents').update(patch).eq('id', id).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (iso accidents PUT):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 削除。管理者のみ（続報も CASCADE で削除）。
+app.delete('/api/iso/accidents/:id', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid id' });
+    const { error } = await supabase.from('iso_accidents').delete().eq('id', id);
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error (iso accidents DELETE):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 続報一覧。要認証。
+app.get('/api/iso/accidents/:id/updates', requireAuth, async (req, res) => {
+  try {
+    const accidentId = parseInt(req.params.id, 10);
+    if (!Number.isInteger(accidentId)) return res.status(400).json({ error: 'invalid id' });
+    const { data, error } = await supabase
+      .from('iso_accident_updates')
+      .select('id, accident_id, report_no, report_date, cause_factors, labor_bureau, police, followup, note, created_at')
+      .eq('accident_id', accidentId)
+      .order('report_no', { ascending: true });
+    if (error) throw error;
+    res.json(data || []);
+  } catch (error) {
+    console.error('Error (iso accident updates GET):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+const ISO_ACC_UPD_FIELDS = ['report_no', 'report_date', 'cause_factors', 'labor_bureau', 'police', 'followup', 'note'];
+
+// ✅ 続報を追加（労基署・警察対応や事後対応の記録）。管理者のみ。
+app.post('/api/iso/accidents/:id/updates', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const accidentId = parseInt(req.params.id, 10);
+    if (!Number.isInteger(accidentId)) return res.status(400).json({ error: 'invalid id' });
+    const row = { accident_id: accidentId };
+    for (const f of ISO_ACC_UPD_FIELDS) if (req.body[f] !== undefined) row[f] = req.body[f];
+    const { data, error } = await supabase.from('iso_accident_updates').insert([row]).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (iso accident updates POST):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ── ISO 苦情記録（067）───────────────────────────────
+// ✅ 一覧。要認証。
+app.get('/api/iso/complaints', requireAuth, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('iso_complaints')
+      .select('id, received_date, receiver, method, project_name, complainant, content, cause, response, prevention, effectiveness, approver, status, created_by, created_at, updated_at')
+      .order('received_date', { ascending: false });
+    if (error) throw error;
+    res.json(data || []);
+  } catch (error) {
+    console.error('Error (iso complaints GET):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+const ISO_CMP_FIELDS = ['received_date', 'receiver', 'method', 'project_name', 'complainant', 'content', 'cause', 'response', 'prevention', 'effectiveness', 'approver', 'status'];
+
+// ✅ 起票。現場も行うため requireAuth のみ。
+app.post('/api/iso/complaints', requireAuth, async (req, res) => {
+  try {
+    const row = { created_by: String(req.user.email || '').toLowerCase() };
+    for (const f of ISO_CMP_FIELDS) if (req.body[f] !== undefined) row[f] = req.body[f];
+    if (!row.content) return res.status(400).json({ error: '内容は必須です' });
+    if (!row.received_date) row.received_date = new Date().toISOString().slice(0, 10);
+    const { data, error } = await supabase.from('iso_complaints').insert([row]).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (iso complaints POST):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 詳細編集（原因・対応・是正効果・状態 等）。管理者のみ。
+app.put('/api/iso/complaints/:id', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid id' });
+    const patch = { updated_at: new Date().toISOString() };
+    for (const f of ISO_CMP_FIELDS) if (req.body[f] !== undefined) patch[f] = req.body[f];
+    const { data, error } = await supabase.from('iso_complaints').update(patch).eq('id', id).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (iso complaints PUT):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 削除。管理者のみ。
+app.delete('/api/iso/complaints/:id', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid id' });
+    const { error } = await supabase.from('iso_complaints').delete().eq('id', id);
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error (iso complaints DELETE):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ── ISO 顧客満足度調査（068）───────────────────────────────
+// ✅ 一覧。要認証。
+app.get('/api/iso/customer-satisfaction', requireAuth, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('iso_customer_satisfaction')
+      .select('id, project_name, source_type, customer, sent_date, received_date, q1_score, q1_comment, q2_score, q2_comment, other_comment, normalized_score, created_by, created_at, updated_at')
+      .order('received_date', { ascending: false });
+    if (error) throw error;
+    res.json(data || []);
+  } catch (error) {
+    console.error('Error (iso csat GET):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+const ISO_CSAT_FIELDS = ['project_name', 'source_type', 'customer', 'sent_date', 'received_date', 'q1_score', 'q1_comment', 'q2_score', 'q2_comment', 'other_comment', 'normalized_score'];
+
+// ✅ 追加。管理者のみ（アンケート回収は事務局が集約入力）。
+app.post('/api/iso/customer-satisfaction', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const row = { created_by: String(req.user.email || '').toLowerCase() };
+    for (const f of ISO_CSAT_FIELDS) if (req.body[f] !== undefined) row[f] = req.body[f];
+    const { data, error } = await supabase.from('iso_customer_satisfaction').insert([row]).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (iso csat POST):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 更新。管理者のみ。
+app.put('/api/iso/customer-satisfaction/:id', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid id' });
+    const patch = { updated_at: new Date().toISOString() };
+    for (const f of ISO_CSAT_FIELDS) if (req.body[f] !== undefined) patch[f] = req.body[f];
+    const { data, error } = await supabase.from('iso_customer_satisfaction').update(patch).eq('id', id).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (iso csat PUT):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 削除。管理者のみ。
+app.delete('/api/iso/customer-satisfaction/:id', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid id' });
+    const { error } = await supabase.from('iso_customer_satisfaction').delete().eq('id', id);
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error (iso csat DELETE):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// F4環境 069-072 endpoints
+// ── ISO14001 環境 月次環境使用量（069）───────────────────────
+// ✅ 一覧。要認証。クエリ fiscal_year / location / category / from,to(ym範囲) で絞れる。
+app.get('/api/iso/env-usage', requireAuth, async (req, res) => {
+  try {
+    let query = supabase
+      .from('iso_env_usage_monthly')
+      .select('id, fiscal_year, location, category, item, vendor, ym, quantity, unit, note')
+      .order('ym', { ascending: false });
+    const fiscalYear = String(req.query.fiscal_year || '').trim();
+    const location = String(req.query.location || '').trim();
+    const category = String(req.query.category || '').trim();
+    const from = String(req.query.from || '').trim();
+    const to = String(req.query.to || '').trim();
+    if (fiscalYear) query = query.eq('fiscal_year', fiscalYear);
+    if (location) query = query.eq('location', location);
+    if (category) query = query.eq('category', category);
+    if (from) query = query.gte('ym', from);
+    if (to) query = query.lte('ym', to);
+    const { data, error } = await query;
+    if (error) throw error;
+    res.json(data || []);
+  } catch (error) {
+    console.error('Error (iso env-usage GET):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+const ISO_ENV_USAGE_FIELDS = ['fiscal_year', 'location', 'category', 'item', 'vendor', 'ym', 'quantity', 'unit', 'note'];
+
+// ✅ 使用量を追加。管理者のみ。
+app.post('/api/iso/env-usage', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const row = {};
+    for (const f of ISO_ENV_USAGE_FIELDS) if (req.body[f] !== undefined) row[f] = req.body[f];
+    if (!row.location) return res.status(400).json({ error: 'location は必須です' });
+    if (!row.category) return res.status(400).json({ error: 'category は必須です' });
+    if (!row.ym || !/^\d{4}-\d{2}$/.test(row.ym)) return res.status(400).json({ error: 'ym は YYYY-MM で必須です' });
+    const { data, error } = await supabase.from('iso_env_usage_monthly').insert([row]).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (iso env-usage POST):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 使用量を更新。管理者のみ。
+app.put('/api/iso/env-usage/:id', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid id' });
+    const patch = { updated_at: new Date().toISOString() };
+    for (const f of ISO_ENV_USAGE_FIELDS) if (req.body[f] !== undefined) patch[f] = req.body[f];
+    const { data, error } = await supabase.from('iso_env_usage_monthly').update(patch).eq('id', id).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (iso env-usage PUT):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 使用量を削除。管理者のみ。
+app.delete('/api/iso/env-usage/:id', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid id' });
+    const { error } = await supabase.from('iso_env_usage_monthly').delete().eq('id', id);
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error (iso env-usage DELETE):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ── ISO14001 環境 エネルギー換算係数（070）─────────────────────
+// ✅ 一覧。要認証（閲覧のみで十分だが将来の年度別追加に備えCRUD実装）。クエリ fiscal_year で絞れる。
+app.get('/api/iso/energy-factors', requireAuth, async (req, res) => {
+  try {
+    let query = supabase
+      .from('iso_energy_factors')
+      .select('id, fiscal_year, fuel_type, unit, heat_value, co2_factor, note')
+      .order('fuel_type', { ascending: true });
+    const fiscalYear = String(req.query.fiscal_year || '').trim();
+    if (fiscalYear) query = query.eq('fiscal_year', fiscalYear);
+    const { data, error } = await query;
+    if (error) throw error;
+    res.json(data || []);
+  } catch (error) {
+    console.error('Error (iso energy-factors GET):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+const ISO_ENERGY_FIELDS = ['fiscal_year', 'fuel_type', 'unit', 'heat_value', 'co2_factor', 'note'];
+
+// ✅ 係数を追加（新しい燃料種・年度改定）。管理者のみ。
+app.post('/api/iso/energy-factors', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const row = {};
+    for (const f of ISO_ENERGY_FIELDS) if (req.body[f] !== undefined) row[f] = req.body[f];
+    if (!row.fuel_type) return res.status(400).json({ error: 'fuel_type は必須です' });
+    if (!row.unit) return res.status(400).json({ error: 'unit は必須です' });
+    if (row.heat_value === undefined || row.heat_value === null) return res.status(400).json({ error: 'heat_value は必須です' });
+    const { data, error } = await supabase.from('iso_energy_factors').insert([row]).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (iso energy-factors POST):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 係数を更新（年度改定時の数値差し替え）。管理者のみ。
+app.put('/api/iso/energy-factors/:id', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid id' });
+    const patch = { updated_at: new Date().toISOString() };
+    for (const f of ISO_ENERGY_FIELDS) if (req.body[f] !== undefined) patch[f] = req.body[f];
+    const { data, error } = await supabase.from('iso_energy_factors').update(patch).eq('id', id).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (iso energy-factors PUT):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ── ISO14001 環境 環境側面（071）───────────────────────────
+// ✅ 一覧。要認証。クエリ category / dept で絞れる。
+app.get('/api/iso/env-aspects', requireAuth, async (req, res) => {
+  try {
+    let query = supabase
+      .from('iso_env_aspects')
+      .select('id, category, dept, process, aspect, impact, policy_flag, legal_flag, stakeholder_flag, hazard_flag, significant, note')
+      .order('significant', { ascending: false })
+      .order('id', { ascending: true });
+    const category = String(req.query.category || '').trim();
+    const dept = String(req.query.dept || '').trim();
+    if (category) query = query.eq('category', category);
+    if (dept) query = query.eq('dept', dept);
+    const { data, error } = await query;
+    if (error) throw error;
+    res.json(data || []);
+  } catch (error) {
+    console.error('Error (iso env-aspects GET):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+const ISO_ASPECT_FIELDS = ['category', 'dept', 'process', 'aspect', 'impact', 'policy_flag', 'legal_flag', 'stakeholder_flag', 'hazard_flag', 'note'];
+
+// ✅ 環境側面を追加。管理者のみ。
+app.post('/api/iso/env-aspects', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const row = {};
+    for (const f of ISO_ASPECT_FIELDS) if (req.body[f] !== undefined) row[f] = req.body[f];
+    if (!row.aspect) return res.status(400).json({ error: 'aspect は必須です' });
+    const { data, error } = await supabase.from('iso_env_aspects').insert([row]).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (iso env-aspects POST):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 環境側面を更新。管理者のみ。
+app.put('/api/iso/env-aspects/:id', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid id' });
+    const patch = { updated_at: new Date().toISOString() };
+    for (const f of ISO_ASPECT_FIELDS) if (req.body[f] !== undefined) patch[f] = req.body[f];
+    const { data, error } = await supabase.from('iso_env_aspects').update(patch).eq('id', id).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (iso env-aspects PUT):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 環境側面を削除。管理者のみ。
+app.delete('/api/iso/env-aspects/:id', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid id' });
+    const { error } = await supabase.from('iso_env_aspects').delete().eq('id', id);
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error (iso env-aspects DELETE):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ── ISO14001 環境 フロン簡易点検（072：機器＋点検）───────────────
+// ✅ 機器一覧。要認証。
+app.get('/api/iso/freon-equipment', requireAuth, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('iso_freon_equipment')
+      .select('id, name, location, unit_no, note')
+      .order('name', { ascending: true });
+    if (error) throw error;
+    res.json(data || []);
+  } catch (error) {
+    console.error('Error (iso freon-equipment GET):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+const ISO_FREON_EQ_FIELDS = ['name', 'location', 'unit_no', 'note'];
+
+// ✅ 機器を追加。管理者のみ。
+app.post('/api/iso/freon-equipment', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const row = {};
+    for (const f of ISO_FREON_EQ_FIELDS) if (req.body[f] !== undefined) row[f] = req.body[f];
+    if (!row.name) return res.status(400).json({ error: 'name は必須です' });
+    const { data, error } = await supabase.from('iso_freon_equipment').insert([row]).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (iso freon-equipment POST):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 機器を更新。管理者のみ。
+app.put('/api/iso/freon-equipment/:id', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid id' });
+    const patch = { updated_at: new Date().toISOString() };
+    for (const f of ISO_FREON_EQ_FIELDS) if (req.body[f] !== undefined) patch[f] = req.body[f];
+    const { data, error } = await supabase.from('iso_freon_equipment').update(patch).eq('id', id).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (iso freon-equipment PUT):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 機器を削除。管理者のみ。
+app.delete('/api/iso/freon-equipment/:id', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid id' });
+    const { error } = await supabase.from('iso_freon_equipment').delete().eq('id', id);
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error (iso freon-equipment DELETE):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 機器の点検履歴を取得（新しい順）。要認証。
+app.get('/api/iso/freon-equipment/:id/inspections', requireAuth, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid id' });
+    const { data, error } = await supabase
+      .from('iso_freon_inspections')
+      .select('id, inspect_date, inspector, check_vibration, check_oil, check_damage, check_frost, response')
+      .eq('equipment_id', id)
+      .order('inspect_date', { ascending: false });
+    if (error) throw error;
+    res.json(data || []);
+  } catch (error) {
+    console.error('Error (iso freon-inspections GET):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+const ISO_FREON_INSP_FIELDS = ['inspect_date', 'inspector', 'check_vibration', 'check_oil', 'check_damage', 'check_frost', 'response'];
+
+// ✅ 点検記録を追加（3か月に1回の簡易点検）。管理者のみ。
+app.post('/api/iso/freon-equipment/:id/inspections', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid id' });
+    const row = { equipment_id: id };
+    for (const f of ISO_FREON_INSP_FIELDS) if (req.body[f] !== undefined) row[f] = req.body[f];
+    if (!row.inspect_date) return res.status(400).json({ error: 'inspect_date は必須です' });
+    const { data, error } = await supabase.from('iso_freon_inspections').insert([row]).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (iso freon-inspections POST):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// F2残 073-076 endpoints
+
+// ── ISO 自主検査（073）───────────────────────────────
+app.get('/api/iso/self-inspections', requireAuth, async (req, res) => {
+  try {
+    let query = supabase
+      .from('iso_self_inspections')
+      .select('id, machine, machine_no, inspection_type, inspect_date, inspector, result, defects, doc_link, created_by')
+      .order('inspect_date', { ascending: false });
+    const machine = String(req.query.machine || '').trim();
+    const type = String(req.query.type || '').trim();
+    if (machine) query = query.eq('machine', machine);
+    if (type) query = query.eq('inspection_type', type);
+    const { data, error } = await query;
+    if (error) throw error;
+    res.json(data || []);
+  } catch (error) {
+    console.error('Error (iso self-inspections GET):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+const ISO_SI_FIELDS = ['machine', 'machine_no', 'inspection_type', 'inspect_date', 'inspector', 'result', 'defects', 'doc_link'];
+
+// ✅ 自主検査を記録。現場も記録するため requireAuth のみ。
+app.post('/api/iso/self-inspections', requireAuth, async (req, res) => {
+  try {
+    const row = { created_by: String(req.user.email || '').toLowerCase() };
+    for (const f of ISO_SI_FIELDS) if (req.body[f] !== undefined) row[f] = req.body[f];
+    if (!row.machine) return res.status(400).json({ error: '機種は必須です' });
+    if (!row.inspection_type) return res.status(400).json({ error: '種別は必須です' });
+    if (!row.inspect_date) row.inspect_date = new Date().toISOString().slice(0, 10);
+    const { data, error } = await supabase.from('iso_self_inspections').insert([row]).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (iso self-inspections POST):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 自主検査を更新。管理者のみ。
+app.put('/api/iso/self-inspections/:id', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid id' });
+    const patch = { updated_at: new Date().toISOString() };
+    for (const f of ISO_SI_FIELDS) if (req.body[f] !== undefined) patch[f] = req.body[f];
+    const { data, error } = await supabase.from('iso_self_inspections').update(patch).eq('id', id).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (iso self-inspections PUT):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 自主検査を削除。管理者のみ。
+app.delete('/api/iso/self-inspections/:id', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid id' });
+    const { error } = await supabase.from('iso_self_inspections').delete().eq('id', id);
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error (iso self-inspections DELETE):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ── ISO アルコールチェック（074）───────────────────────────
+app.get('/api/iso/alcohol-checks', requireAuth, async (req, res) => {
+  try {
+    let query = supabase
+      .from('iso_alcohol_checks')
+      .select('id, check_date, driver, timing, method, result, value, checker, note, created_by')
+      .order('check_date', { ascending: false });
+    const from = String(req.query.from || '').trim();
+    const to = String(req.query.to || '').trim();
+    if (from) query = query.gte('check_date', from);
+    if (to) query = query.lte('check_date', to);
+    const { data, error } = await query;
+    if (error) throw error;
+    res.json(data || []);
+  } catch (error) {
+    console.error('Error (iso alcohol-checks GET):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+const ISO_AL_FIELDS = ['check_date', 'driver', 'timing', 'method', 'result', 'value', 'checker', 'note'];
+
+// ✅ アルコールチェックを記録。現場も記録するため requireAuth のみ。
+app.post('/api/iso/alcohol-checks', requireAuth, async (req, res) => {
+  try {
+    const row = { created_by: String(req.user.email || '').toLowerCase() };
+    for (const f of ISO_AL_FIELDS) if (req.body[f] !== undefined) row[f] = req.body[f];
+    if (!row.driver) return res.status(400).json({ error: '運転者は必須です' });
+    if (!row.check_date) row.check_date = new Date().toISOString().slice(0, 10);
+    const { data, error } = await supabase.from('iso_alcohol_checks').insert([row]).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (iso alcohol-checks POST):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ アルコールチェックを更新。管理者のみ。
+app.put('/api/iso/alcohol-checks/:id', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid id' });
+    const patch = { updated_at: new Date().toISOString() };
+    for (const f of ISO_AL_FIELDS) if (req.body[f] !== undefined) patch[f] = req.body[f];
+    const { data, error } = await supabase.from('iso_alcohol_checks').update(patch).eq('id', id).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (iso alcohol-checks PUT):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ アルコールチェックを削除。管理者のみ。
+app.delete('/api/iso/alcohol-checks/:id', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid id' });
+    const { error } = await supabase.from('iso_alcohol_checks').delete().eq('id', id);
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error (iso alcohol-checks DELETE):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ── ISO 目標達成計画（075）───────────────────────────────
+app.get('/api/iso/goals', requireAuth, async (req, res) => {
+  try {
+    let query = supabase
+      .from('iso_goals')
+      .select('id, fiscal_year, category, title, target, baseline, owner, deadline, eval_method, ms_clause, sort_order')
+      .order('sort_order', { ascending: true });
+    const fy = String(req.query.fiscal_year || '').trim();
+    if (fy) query = query.eq('fiscal_year', fy);
+    const { data, error } = await query;
+    if (error) throw error;
+    res.json(data || []);
+  } catch (error) {
+    console.error('Error (iso goals GET):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+const ISO_GOAL_FIELDS = ['fiscal_year', 'category', 'title', 'target', 'baseline', 'owner', 'deadline', 'eval_method', 'ms_clause', 'sort_order'];
+
+// ✅ 目標を追加。管理者のみ。
+app.post('/api/iso/goals', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const row = {};
+    for (const f of ISO_GOAL_FIELDS) if (req.body[f] !== undefined) row[f] = req.body[f];
+    if (!row.title) return res.status(400).json({ error: 'title は必須です' });
+    if (!row.fiscal_year) return res.status(400).json({ error: 'fiscal_year は必須です' });
+    const { data, error } = await supabase.from('iso_goals').insert([row]).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (iso goals POST):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 目標を更新。管理者のみ。
+app.put('/api/iso/goals/:id', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid id' });
+    const patch = { updated_at: new Date().toISOString() };
+    for (const f of ISO_GOAL_FIELDS) if (req.body[f] !== undefined) patch[f] = req.body[f];
+    const { data, error } = await supabase.from('iso_goals').update(patch).eq('id', id).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (iso goals PUT):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 目標を削除。管理者のみ。
+app.delete('/api/iso/goals/:id', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid id' });
+    const { error } = await supabase.from('iso_goals').delete().eq('id', id);
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error (iso goals DELETE):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 目標の月次進捗を取得。要認証。
+app.get('/api/iso/goals/:id/progress', requireAuth, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid id' });
+    const { data, error } = await supabase
+      .from('iso_goal_progress')
+      .select('id, goal_id, ym, result, evaluation, evaluator, created_at')
+      .eq('goal_id', id)
+      .order('ym', { ascending: true });
+    if (error) throw error;
+    res.json(data || []);
+  } catch (error) {
+    console.error('Error (iso goal progress GET):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 目標の月次進捗を追加。管理者のみ。
+app.post('/api/iso/goals/:id/progress', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid id' });
+    const row = {
+      goal_id: id,
+      ym: req.body?.ym || null,
+      result: req.body?.result || null,
+      evaluation: req.body?.evaluation || null,
+      evaluator: req.body?.evaluator || null,
+    };
+    if (!row.ym) return res.status(400).json({ error: 'ym は必須です' });
+    const { data, error } = await supabase.from('iso_goal_progress').insert([row]).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (iso goal progress POST):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ── ISO 安全衛生委員会（076）───────────────────────────────
+app.get('/api/iso/safety-committee', requireAuth, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('iso_safety_committee')
+      .select('id, meeting_date, location, chair, attendees, accident_count, ky_report, patrol_result, notes, discussion, next_date, summary_by, summary')
+      .order('meeting_date', { ascending: false });
+    if (error) throw error;
+    res.json(data || []);
+  } catch (error) {
+    console.error('Error (iso safety-committee GET):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+const ISO_SC_FIELDS = ['meeting_date', 'location', 'chair', 'attendees', 'accident_count', 'ky_report', 'patrol_result', 'notes', 'discussion', 'next_date', 'summary_by', 'summary'];
+
+// ✅ 議事録を追加。管理者のみ。
+app.post('/api/iso/safety-committee', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const row = {};
+    for (const f of ISO_SC_FIELDS) if (req.body[f] !== undefined) row[f] = req.body[f];
+    if (!row.meeting_date) return res.status(400).json({ error: 'meeting_date は必須です' });
+    const { data, error } = await supabase.from('iso_safety_committee').insert([row]).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (iso safety-committee POST):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 議事録を更新。管理者のみ。
+app.put('/api/iso/safety-committee/:id', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid id' });
+    const patch = { updated_at: new Date().toISOString() };
+    for (const f of ISO_SC_FIELDS) if (req.body[f] !== undefined) patch[f] = req.body[f];
+    const { data, error } = await supabase.from('iso_safety_committee').update(patch).eq('id', id).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (iso safety-committee PUT):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 議事録を削除。管理者のみ。
+app.delete('/api/iso/safety-committee/:id', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid id' });
+    const { error } = await supabase.from('iso_safety_committee').delete().eq('id', id);
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error (iso safety-committee DELETE):', error.message);
     res.status(500).json({ error: error.message });
   }
 });
