@@ -2423,6 +2423,99 @@ app.get('/api/iso/alcohol-summary', requireAuth, async (req, res) => {
   }
 });
 
+// ── ISO 自動ドラフト生成 共通ヘルパー（委員会・目標進捗）──────────
+const ISO_ATTENDEES_DEFAULT = '中原釈統、齋藤友和、原田洋三、原田沙耶華、斎藤徳幸、河内肇、舟木文寿';
+
+// 指定年月の「最終木曜」を YYYY-MM-DD で返す（委員会の開催日ルール）
+function isoLastThursday(year, month) {
+  const last = new Date(year, month, 0).getDate(); // 月末日
+  for (let d = last; d >= 1; d--) {
+    if (new Date(year, month - 1, d).getDay() === 4) {
+      return `${year}-${String(month).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+    }
+  }
+  return `${year}-${String(month).padStart(2, '0')}-${String(last).padStart(2, '0')}`;
+}
+
+// 年度判定（4月始まり）: 'YYYY-MM' → 会計年度文字列 'YYYY'
+function isoFiscalYearOf(month) {
+  const [y, m] = String(month).split('-').map(Number);
+  return String(m >= 4 ? y : y - 1);
+}
+
+// 当月のヒヤリハット報告件数を実データから集計
+async function isoNearMissCount(month) {
+  const [y, m] = String(month).split('-').map(Number);
+  const start = `${month}-01`;
+  const end = `${month}-${String(new Date(y, m, 0).getDate()).padStart(2, '0')}`;
+  const { count } = await supabase
+    .from('iso_near_misses').select('id', { count: 'exact', head: true })
+    .gte('report_date', start).lte('report_date', end);
+  return count || 0;
+}
+
+// 月ごとの季節注意事項（その月に向けた注意）
+const ISO_SEASONAL_NOTES = {
+  1: '冬季の凍結・転倒対策（始業前に足場・通路の凍結を確認）。空気乾燥による火災防止（火気周りの養生・消火器配置）。寒暖差・インフルエンザ等の感染予防。',
+  2: '路面・足場の凍結による転倒防止。強風時の仮設物・シートの飛散対策。花粉初期の視界・体調管理。',
+  3: '年度末の焦りによる基本動作の省略防止。春一番など強風時の高所作業中止。花粉・黄砂による視界不良・体調管理。',
+  4: '新年度・新規入場者への安全教育と危険箇所の周知。新規現場立ち上げ時の足場・開口部養生の点検。気温上昇にともなう初期の熱中症対応。',
+  5: '大型連休前後の気の緩み・体調管理。紫外線・暑熱順化の意識。こまめな水分・塩分補給と休憩の確保。',
+  6: '梅雨期の足元スリップ・転倒防止。雨天作業での漏電・感電対策（接続部の防水・漏電遮断器点検）。視界不良時の合図の複数化と湿度上昇による熱中症。',
+  7: '本格的な熱中症対策（WBGT基準に基づく作業管理・空調服・経口補水液）。集中豪雨・落雷への備え（作業中止基準・避難経路）。強い日差し下の連続作業回避。',
+  8: '猛暑ピークの熱中症予防（作業時間の調整・休憩強化）。夕立・落雷への注意。盆前後の交通安全と気の緩み防止。',
+  9: '残暑の熱中症対策の継続。台風・強風時の仮設物固定と作業中止判断。日没が早まる薄暮時の照明確保。',
+  10: '日没短縮にともなう薄暮時の早めの点灯。空気乾燥による火災防止の入口対策。朝晩の寒暖差による体調管理。',
+  11: '薄暮の早まりに対する投光器の早期点灯。火気使用作業の火災防止。感染症予防と朝方の路面凍結の入口対策。',
+  12: '年末の工期集中による焦りの防止。積雪・凍結による転倒・スリップ対策（スタッドレス確認）。忘年会シーズンの飲酒運転根絶。',
+};
+
+// 委員会議事録のドラフト本文を生成
+function isoCommitteeDraftContent(month, nearMissCount) {
+  const [, m] = String(month).split('-').map(Number);
+  const nextM = (m % 12) + 1;
+  const cnt = nearMissCount;
+  const kyTail = cnt >= 30
+    ? '目標（月30件）を達成しています。引き続き積極的な報告をお願いします。'
+    : '目標（月30件）には届いていません。現場ごとに1日1件を目安に、危険と感じた事例の報告をお願いします。';
+  return {
+    ky_report: `${m}月のヒヤリハット報告は${cnt}件でした。${kyTail}`,
+    patrol_result: `${m}月に実施した巡回点検の結果は「良好」でした。引き続き、定められた基本動作を遵守し、安全な作業環境の維持にご協力ください。`,
+    notes: `${nextM}月に向け、以下の点に注意してください。\n${ISO_SEASONAL_NOTES[nextM] || ''}`,
+    discussion: 'その他: 不良工事報告書の運用を継続（今月は該当なし）。',
+  };
+}
+
+// 目標1本ぶんの月次進捗ドラフトを生成（title で種別判定）
+function isoGoalProgressDraft(goal, nearMissCount, defaultEvaluator) {
+  const t = String(goal.title || '');
+  if (t.includes('労災')) {
+    return {
+      result: `労災件数0件。実施事項の各項は確実に実施された。ヒヤリハット報告は${nearMissCount}件。`,
+      evaluation: '目標達成は評価できる。引き続き積極的なヒヤリハット報告を期待する。',
+      evaluator: defaultEvaluator,
+    };
+  }
+  if (t.includes('くるみん')) {
+    return {
+      result: '（くるみん）実施事項の各項の該当者は無いが、掲示物で従業員に周知できている。（Ｎぴか）ラジオ体操は実施している。テレワーク推進は河内さんのテレワークは福岡勤務時に実施している。',
+      evaluation: '引き続き推進して下さい。',
+      evaluator: defaultEvaluator,
+    };
+  }
+  if (t.includes('施工管理技士')) {
+    return { result: '結果発表なし。', evaluation: null, evaluator: null };
+  }
+  if (t.includes('工事成績評定')) {
+    return {
+      result: '工事成績評定の報告は無し。引き続き、創意工夫を各工事で実施する。',
+      evaluation: '引き続き、創意工夫を積極的に実施すること',
+      evaluator: defaultEvaluator,
+    };
+  }
+  return { result: '', evaluation: '', evaluator: defaultEvaluator };
+}
+
 // ── ISO 目標達成計画（075）───────────────────────────────
 app.get('/api/iso/goals', requireAuth, async (req, res) => {
   try {
@@ -2529,6 +2622,64 @@ app.post('/api/iso/goals/:id/progress', requireAuth, requireAdmin, async (req, r
   }
 });
 
+// ✅ 指定月の全目標ぶんの月次進捗ドラフトを自動生成（保存はしない）。要認証。
+//    ?month=YYYY-MM（既定は当月）。当該年度の目標に対し既定文＋実ヒヤリ件数を入れて返す。
+app.get('/api/iso/goals/progress-draft', requireAuth, async (req, res) => {
+  try {
+    const month = (String(req.query.month || '').trim()) || new Date().toISOString().slice(0, 7);
+    if (!/^\d{4}-\d{2}$/.test(month)) return res.status(400).json({ error: 'month は YYYY-MM 形式で指定してください' });
+    const fy = isoFiscalYearOf(month);
+    const { data: goals, error: gErr } = await supabase
+      .from('iso_goals').select('id, category, title, owner').eq('fiscal_year', fy).order('sort_order');
+    if (gErr) throw gErr;
+    const ids = (goals || []).map((g) => g.id);
+    const [nmCount, exist, lastEval] = await Promise.all([
+      isoNearMissCount(month),
+      ids.length ? supabase.from('iso_goal_progress').select('goal_id').eq('ym', month).in('goal_id', ids)
+        : Promise.resolve({ data: [] }),
+      supabase.from('iso_goal_progress').select('evaluator').not('evaluator', 'is', null).order('ym', { ascending: false }).limit(1).maybeSingle(),
+    ]);
+    const doneSet = new Set((exist.data || []).map((r) => r.goal_id));
+    const defEval = lastEval?.data?.evaluator || '中原主税';
+    const rows = (goals || []).map((g) => {
+      const d = isoGoalProgressDraft(g, nmCount, defEval);
+      return { goal_id: g.id, title: g.title, category: g.category, ym: month, ...d, already_recorded: doneSet.has(g.id) };
+    });
+    res.json({ month, fiscal_year: fy, near_miss_count: nmCount, rows });
+  } catch (error) {
+    console.error('Error (iso goal progress-draft GET):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 月次進捗をまとめて記録。管理者のみ。既存（goal_id, ym）はスキップして重複を作らない。
+app.post('/api/iso/goals/progress-batch', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const src = Array.isArray(req.body?.rows) ? req.body.rows : [];
+    const rows = src
+      .filter((r) => r && Number.isInteger(Number(r.goal_id)) && r.ym)
+      .map((r) => ({
+        goal_id: Number(r.goal_id), ym: String(r.ym),
+        result: r.result || null, evaluation: r.evaluation || null, evaluator: r.evaluator || null,
+      }));
+    if (rows.length === 0) return res.status(400).json({ error: '記録する行がありません' });
+    // 既存の (goal_id, ym) を除外
+    const ids = [...new Set(rows.map((r) => r.goal_id))];
+    const yms = [...new Set(rows.map((r) => r.ym))];
+    const { data: exist } = await supabase
+      .from('iso_goal_progress').select('goal_id, ym').in('goal_id', ids).in('ym', yms);
+    const existSet = new Set((exist || []).map((r) => `${r.goal_id}|${r.ym}`));
+    const fresh = rows.filter((r) => !existSet.has(`${r.goal_id}|${r.ym}`));
+    if (fresh.length === 0) return res.json({ inserted: 0, skipped: rows.length });
+    const { error } = await supabase.from('iso_goal_progress').insert(fresh);
+    if (error) throw error;
+    res.json({ inserted: fresh.length, skipped: rows.length - fresh.length });
+  } catch (error) {
+    console.error('Error (iso goal progress-batch POST):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // ── ISO 安全衛生委員会（076）───────────────────────────────
 app.get('/api/iso/safety-committee', requireAuth, async (req, res) => {
   try {
@@ -2545,6 +2696,51 @@ app.get('/api/iso/safety-committee', requireAuth, async (req, res) => {
 });
 
 const ISO_SC_FIELDS = ['meeting_date', 'location', 'chair', 'attendees', 'accident_count', 'ky_report', 'patrol_result', 'notes', 'discussion', 'next_date', 'summary_by', 'summary'];
+
+// ✅ 指定月の議事録ドラフトを自動生成（保存はしない）。要認証。
+//    ?month=YYYY-MM（既定は当月）。開催日=最終木曜、出席者等は前回踏襲、
+//    KY/巡回/注意事項/その他は季節テンプレ＋実ヒヤリ件数で自動作成。
+app.get('/api/iso/safety-committee/draft', requireAuth, async (req, res) => {
+  try {
+    const month = (String(req.query.month || '').trim()) || new Date().toISOString().slice(0, 7);
+    if (!/^\d{4}-\d{2}$/.test(month)) return res.status(400).json({ error: 'month は YYYY-MM 形式で指定してください' });
+    const [y, m] = month.split('-').map(Number);
+    const meeting_date = isoLastThursday(y, m);
+    const nextM = m === 12 ? 1 : m + 1;
+    const nextY = m === 12 ? y + 1 : y;
+    const next_date = isoLastThursday(nextY, nextM);
+
+    const [nmCount, prev, existRes] = await Promise.all([
+      isoNearMissCount(month),
+      supabase.from('iso_safety_committee').select('location, chair, attendees, summary_by').order('meeting_date', { ascending: false }).limit(1).maybeSingle(),
+      supabase.from('iso_safety_committee').select('id').gte('meeting_date', `${month}-01`).lte('meeting_date', `${month}-31`).limit(1),
+    ]);
+    const base = prev?.data || {};
+    const content = isoCommitteeDraftContent(month, nmCount);
+    res.json({
+      month,
+      already_recorded: !!(existRes.data && existRes.data.length),
+      near_miss_count: nmCount,
+      draft: {
+        meeting_date,
+        location: base.location || 'オンライン',
+        chair: base.chair || '中原釈統',
+        attendees: base.attendees || ISO_ATTENDEES_DEFAULT,
+        accident_count: 0,
+        ky_report: content.ky_report,
+        patrol_result: content.patrol_result,
+        notes: content.notes,
+        discussion: content.discussion,
+        next_date,
+        summary_by: base.summary_by || '',
+        summary: '',
+      },
+    });
+  } catch (error) {
+    console.error('Error (iso safety-committee draft GET):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
 
 // ✅ 議事録を追加。管理者のみ。
 app.post('/api/iso/safety-committee', requireAuth, requireAdmin, async (req, res) => {
