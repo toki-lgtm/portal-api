@@ -1,8 +1,10 @@
 // ============================================================
-// 翌日の現場別人員 抽出スクリプト（Render Cron Job 用）
-//   毎晩20:00(JST)に
-//     node cron/lineExtractAssignments.js
-//   で実行する独立スクリプト。server.js を import しない（Express が起動するため）。
+// 翌日の現場別人員 抽出スクリプト（手動・backfill 用）
+//   ★本番の定期実行は server.js 内蔵スケジューラ（毎晩20:00 JST）が担う。
+//     Render Cron Job の新規登録は不要。このスクリプトは任意日の再抽出・
+//     過去分の埋め戻し（backfill）を手元やワンショットで回すためのもの。
+//     例) node cron/lineExtractAssignments.js 2026-07-08
+//   server.js を import しない独立スクリプト（Express が起動するため）。
 //
 // 役割:
 //   当日(JST)のグループLINE発言(text)を line_messages から読み、

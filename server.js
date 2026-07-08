@@ -15489,6 +15489,37 @@ app.get('/api/doboku/records/:id/reviews', requireAuth, requireExamAccess, requi
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ============================================================
+// 翌日の現場別人員: 毎晩20:00(JST)に自動抽出（サーバー内蔵スケジューラ）
+//   portal-api の Web サービスは LINE webhook 常時受信のため 24h 起動している。
+//   これを利用し、Render の Cron Job を新規登録せずにサーバー内部で抽出を回す。
+//   5分ごとに JST時刻を確認し、20時台に入ったら「その日ぶん」を1回だけ実行する
+//   （lastAssignmentRunDate でその日の二重実行を防ぐ）。手動/backfill は
+//   cron/lineExtractAssignments.js や POST /api/site-assignments/extract で可能。
+// ============================================================
+let lastAssignmentRunDate = null;
+function startSiteAssignmentScheduler() {
+  const TICK_MS = 5 * 60 * 1000; // 5分ごと
+  setInterval(async () => {
+    try {
+      const jst = new Date(Date.now() + 9 * 3600 * 1000);
+      const hour = jst.getUTCHours();               // JST基準にずらした値なので getUTCHours = JST時
+      const today = jst.toISOString().slice(0, 10);  // JSTの日付
+      if (hour === 20 && lastAssignmentRunDate !== today) {
+        lastAssignmentRunDate = today;
+        console.log('[site-assignments] 20:00(JST) 自動抽出を開始');
+        const r = await runSiteAssignmentExtraction(today);
+        console.log(`[site-assignments] 完了: 作業日${r.work_date} ${r.sites}現場 延べ${r.total}名`);
+      }
+    } catch (e) {
+      console.error('[site-assignments] 自動抽出エラー:', e.message);
+    }
+  }, TICK_MS);
+  console.log('🕗 翌日の人員配置: 毎晩20:00(JST)の自動抽出スケジューラを起動しました');
+}
+
 app.listen(PORT, () => {
   console.log(`✅ Portal API running on http://localhost:${PORT}`);
+  // 本番(Render)のみ起動。ローカル開発では回さない（二重抽出・不要なAPI消費を防ぐ）
+  if (process.env.NODE_ENV === 'production') startSiteAssignmentScheduler();
 });
