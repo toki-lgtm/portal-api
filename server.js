@@ -16,6 +16,7 @@ import { driveUpload, driveDownload, driveThumbnail, driveTrash, driveConfigured
 import { Readable } from 'stream';
 import { classifyQuote, classNoOf } from './classifyQuote.js';
 import { extractExcelQuote } from './quoteExcelExtract.js';
+import { extractSiteAssignments, nextWorkingDay, sumMembers } from './siteAssignments.js';
 
 dotenv.config();
 
@@ -415,6 +416,7 @@ app.get('/api/apps', requireAuth, async (req, res) => {
       { id: 18, key: 'calendar', name: '会社カレンダー', icon: '📅', internal: true, view: 'calendar', description: '公休日・計画有給休暇の年間カレンダー' },
       { id: 19, key: 'iso', name: 'ISO管理', icon: '📋', internal: true, view: 'iso', description: 'ISO 9001/45001/14001 統合マネジメントシステムの文書・記録・審査管理' },
       { id: 20, key: 'library', name: '資料ライブラリ', icon: '📚', internal: true, view: 'library', description: '社内で共有する参考資料・書籍・雑誌を閲覧（会報誌など）' },
+      { id: 21, key: 'site-assignments', name: '翌日の人員配置', icon: '👷', internal: true, view: 'site-assignments', description: 'グループLINEの夜の報告から翌営業日の現場別人員を自動集計' },
       // 【凍結 2026-06-17】法令集はメニューから除外（機能・API・データは残置、復活時はこの行を戻す）
       // { id: 13, key: 'regulations', name: '法令集', icon: '📚', internal: true, view: 'regulations', description: '建設・不動産・林業・労務・会社経営の法令を条文単位で検索・閲覧' },
     ];
@@ -439,6 +441,8 @@ app.get('/api/apps', requireAuth, async (req, res) => {
       if (a.key === 'iso') return true;
       // 資料ライブラリは全社員に常に表示する（閲覧は全員、管理は画面内で admin のみ）。
       if (a.key === 'library') return true;
+      // 翌日の人員配置は全社員に常に表示する（閲覧は全員、編集・再抽出は画面内で admin のみ）。
+      if (a.key === 'site-assignments') return true;
       if (perms.role === 'admin') return true;
       return !!appPerms[a.key];
     });
@@ -2697,6 +2701,185 @@ app.post('/api/line/daily-export', async (req, res) => {
     res.json({ ok: true, date: d, lines: data.length, purged: ids.length, groups });
   } catch (error) {
     console.error('Error (line daily-export):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================================
+// 翌日の現場別人員（LINE投稿→Gemini抽出）
+//   line_messages(当日のtext) → Gemini → site_assignments(翌営業日ぶん)
+// ============================================================
+
+// 指定した投稿日(JST)のグループLINE発言から現場別人員を抽出して洗い替え保存する共通処理。
+//   手修正(edited=true)の行は保護（消さない）。
+async function runSiteAssignmentExtraction(srcDate) {
+  const startZ = new Date(`${srcDate}T00:00:00+09:00`).toISOString();
+  const endZ = new Date(`${srcDate}T23:59:59+09:00`).toISOString();
+
+  const { data: msgs, error } = await supabase.from('line_messages')
+    .select('sent_at, sender_name, message_type, text, group_id, group_name')
+    .eq('message_type', 'text')
+    .gte('sent_at', startZ).lte('sent_at', endZ)
+    .order('sent_at', { ascending: true });
+  if (error) throw error;
+
+  const workDate = await nextWorkingDay(supabase, srcDate);
+  if (!msgs || !msgs.length) return { work_date: workDate, source_date: srcDate, sites: 0, total: 0, note: '対象日のtext発言なし' };
+
+  // グループ単位で抽出（人員報告のないグループは自然に0件）
+  const byGroup = new Map();
+  for (const r of msgs) {
+    const key = r.group_name || r.group_id || '未分類';
+    if (!byGroup.has(key)) byGroup.set(key, []);
+    byGroup.get(key).push(r);
+  }
+  const rows = [];
+  for (const [groupLabel, list] of byGroup) {
+    let assignments = [];
+    try {
+      assignments = await extractSiteAssignments(list);
+    } catch (e) {
+      console.error(`Warning (site-assignments extract, group ${groupLabel}):`, e.message);
+      continue;
+    }
+    for (const a of assignments) {
+      const srcMsg = list.find((m) => (m.sender_name || '') === a.source_sender);
+      rows.push({
+        work_date: workDate,
+        site_name: a.site_name,
+        work_content: a.work_content || null,
+        members: a.members || [],
+        member_count: a.member_count || 0,
+        group_name: groupLabel,
+        source_sender: a.source_sender || null,
+        source_date: srcDate,
+        raw_text: srcMsg?.text || null,
+        edited: false,
+      });
+    }
+  }
+
+  const { error: delErr } = await supabase
+    .from('site_assignments').delete()
+    .eq('work_date', workDate).eq('edited', false);
+  if (delErr) throw delErr;
+  if (rows.length) {
+    const { error: insErr } = await supabase.from('site_assignments').insert(rows);
+    if (insErr) throw insErr;
+  }
+  const total = rows.reduce((acc, r) => acc + (r.member_count || 0), 0);
+  return { work_date: workDate, source_date: srcDate, sites: rows.length, total };
+}
+
+// ✅ 翌日の現場別人員 一覧。要認証（全社員閲覧可）。
+//    ?date=YYYY-MM-DD（作業日）省略時は「登録がある直近の作業日（本日以降を優先）」。
+app.get('/api/site-assignments', requireAuth, async (req, res) => {
+  try {
+    // 登録のある作業日の一覧（新しい順・最大60件）
+    const { data: dateRows, error: dErr } = await supabase
+      .from('site_assignments').select('work_date').order('work_date', { ascending: false }).limit(2000);
+    if (dErr) throw dErr;
+    const dates = [...new Set((dateRows || []).map((r) => r.work_date))];
+
+    const today = new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10);
+    let date = String(req.query.date || '').trim();
+    if (!date) {
+      // 本日以降で最も近い作業日 → 無ければ最新
+      const upcoming = dates.filter((d) => d >= today).sort();
+      date = upcoming[0] || dates[0] || today;
+    }
+
+    const { data: rows, error } = await supabase
+      .from('site_assignments').select('*')
+      .eq('work_date', date)
+      .order('site_name', { ascending: true });
+    if (error) throw error;
+
+    const total = (rows || []).reduce((acc, r) => acc + (r.member_count || 0), 0);
+    res.json({ work_date: date, dates: dates.slice(0, 60), assignments: rows || [], total, site_count: (rows || []).length });
+  } catch (error) {
+    // migration 097 未適用（テーブル未作成）でもカードを壊さず空表示にする
+    if (error?.code === '42P01' || /does not exist|relation .* does not/i.test(error?.message || '')) {
+      const today = new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10);
+      return res.json({ work_date: today, dates: [], assignments: [], total: 0, site_count: 0 });
+    }
+    console.error('Error (site-assignments list):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 抽出の実行。Render Cron(x-cron-key) または 管理者(Bearer) が叩ける。
+//    ?date=YYYY-MM-DD（投稿日）省略時は「本日(JST)」。翌営業日ぶんを洗い替え保存。
+app.post('/api/site-assignments/extract', async (req, res) => {
+  try {
+    const cronOk = process.env.CRON_KEY && req.headers['x-cron-key'] === process.env.CRON_KEY;
+    if (!cronOk) {
+      // cronキーが無ければ管理者認証を要求
+      await new Promise((resolve, reject) =>
+        requireAuth(req, res, (e) => (e ? reject(e) : resolve())));
+      await new Promise((resolve, reject) =>
+        requireAdmin(req, res, (e) => (e ? reject(e) : resolve())));
+      if (res.headersSent) return; // ミドルウェアが401/403を返した場合
+    }
+    const jstToday = new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10);
+    const srcDate = String(req.query.date || jstToday);
+    const result = await runSiteAssignmentExtraction(srcDate);
+    res.json({ ok: true, ...result });
+  } catch (error) {
+    if (res.headersSent) return;
+    console.error('Error (site-assignments extract):', error.message);
+    res.status(error.status || 500).json({ error: error.message });
+  }
+});
+
+// ✅ 現場行の手動追加（管理者）。work_date と site_name 必須。
+app.post('/api/site-assignments', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const { work_date, site_name, work_content, members } = req.body || {};
+    if (!work_date || !site_name) return res.status(400).json({ error: 'work_date と site_name は必須です' });
+    const mem = Array.isArray(members) ? members : [];
+    const { data, error } = await supabase.from('site_assignments').insert({
+      work_date, site_name: String(site_name).trim(), work_content: work_content || null,
+      members: mem, member_count: sumMembers(mem), source_sender: '手動追加', edited: true,
+    }).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (site-assignments add):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 現場行の編集（管理者）。edited=true を立てて再抽出から保護する。
+app.put('/api/site-assignments/:id', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const id = req.params.id;
+    const { site_name, work_content, members } = req.body || {};
+    const patch = { edited: true, updated_at: new Date().toISOString() };
+    if (site_name !== undefined) patch.site_name = String(site_name).trim();
+    if (work_content !== undefined) patch.work_content = work_content || null;
+    if (members !== undefined) {
+      const mem = Array.isArray(members) ? members : [];
+      patch.members = mem;
+      patch.member_count = sumMembers(mem);
+    }
+    const { data, error } = await supabase.from('site_assignments').update(patch).eq('id', id).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (site-assignments update):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 現場行の削除（管理者）。
+app.delete('/api/site-assignments/:id', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const { error } = await supabase.from('site_assignments').delete().eq('id', req.params.id);
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error (site-assignments delete):', error.message);
     res.status(500).json({ error: error.message });
   }
 });
