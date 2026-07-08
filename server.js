@@ -2428,7 +2428,7 @@ app.get('/api/iso/goals', requireAuth, async (req, res) => {
   try {
     let query = supabase
       .from('iso_goals')
-      .select('id, fiscal_year, category, title, target, baseline, owner, deadline, eval_method, ms_clause, sort_order')
+      .select('id, fiscal_year, category, title, target, baseline, owner, deadline, eval_method, ms_clause, action_items, resources, sort_order')
       .order('sort_order', { ascending: true });
     const fy = String(req.query.fiscal_year || '').trim();
     if (fy) query = query.eq('fiscal_year', fy);
@@ -2441,7 +2441,7 @@ app.get('/api/iso/goals', requireAuth, async (req, res) => {
   }
 });
 
-const ISO_GOAL_FIELDS = ['fiscal_year', 'category', 'title', 'target', 'baseline', 'owner', 'deadline', 'eval_method', 'ms_clause', 'sort_order'];
+const ISO_GOAL_FIELDS = ['fiscal_year', 'category', 'title', 'target', 'baseline', 'owner', 'deadline', 'eval_method', 'ms_clause', 'action_items', 'resources', 'sort_order'];
 
 // ✅ 目標を追加。管理者のみ。
 app.post('/api/iso/goals', requireAuth, requireAdmin, async (req, res) => {
