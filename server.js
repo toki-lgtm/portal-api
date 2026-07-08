@@ -2453,9 +2453,10 @@ async function handleLineEvent(ev) {
         const { buffer, contentType } = await lineGetContent(m.id);
         const stamp = (row.sent_at || '').replace(/[:.]/g, '-').slice(0, 19);
         const who = row.sender_name || row.sender_user_id || 'unknown';
+        // 同一秒に複数枚届くと同名衝突するため、LINEのメッセージID(m.id・globally unique)で必ず一意化する。
         const fname = m.fileName
-          ? decodeUploadName(m.fileName)
-          : `${stamp}_${who}${lineExt(m.type, null, contentType)}`;
+          ? `${stamp}_${who}_${decodeUploadName(m.fileName)}`
+          : `${stamp}_${who}_${m.id}${lineExt(m.type, null, contentType)}`;
         const folderId = await lineDriveFolder(row.sent_at, '写真');
         row.drive_file_id = await driveUpload({ name: fname, buffer, mimeType: contentType, folderId });
         row.file_name = fname;
