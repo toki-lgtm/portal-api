@@ -16,7 +16,7 @@ import { driveUpload, driveDownload, driveThumbnail, driveTrash, driveConfigured
 import { Readable } from 'stream';
 import { classifyQuote, classNoOf } from './classifyQuote.js';
 import { extractExcelQuote } from './quoteExcelExtract.js';
-import { extractSiteAssignments, nextWorkingDay, sumMembers } from './siteAssignments.js';
+import { extractSiteAssignments, nextWorkingDay, sumMembers, loadStaffRoster } from './siteAssignments.js';
 
 dotenv.config();
 
@@ -2726,6 +2726,9 @@ async function runSiteAssignmentExtraction(srcDate) {
   const workDate = await nextWorkingDay(supabase, srcDate);
   if (!msgs || !msgs.length) return { work_date: workDate, source_date: srcDate, sites: 0, total: 0, note: '対象日のtext発言なし' };
 
+  // 社員名簿を1回だけ取得し、人員名の照合に使う
+  const roster = await loadStaffRoster(supabase);
+
   // グループ単位で抽出（人員報告のないグループは自然に0件）
   const byGroup = new Map();
   for (const r of msgs) {
@@ -2737,7 +2740,7 @@ async function runSiteAssignmentExtraction(srcDate) {
   for (const [groupLabel, list] of byGroup) {
     let assignments = [];
     try {
-      assignments = await extractSiteAssignments(list);
+      assignments = await extractSiteAssignments(list, roster);
     } catch (e) {
       console.error(`Warning (site-assignments extract, group ${groupLabel}):`, e.message);
       continue;

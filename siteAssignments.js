@@ -43,9 +43,26 @@ export function sumMembers(members) {
   }, 0);
 }
 
+// 社員名簿（在籍者の氏名＋ふりがな）を取得。名前照合の照合元に使う。
+//   supabase を引数で受け取り、モジュールを server.js 非依存に保つ。
+export async function loadStaffRoster(supabase) {
+  try {
+    const { data } = await supabase
+      .from('staff_master')
+      .select('name, furigana')
+      .eq('is_active', true);
+    return (data || [])
+      .filter((r) => (r.name || '').trim())
+      .map((r) => ({ name: r.name.trim(), furigana: (r.furigana || '').trim() }));
+  } catch {
+    return [];
+  }
+}
+
 // LINE発言群 → 現場別人員の配列を抽出する。
-//   返り値: [{ site_name, work_content, members:[{name,company,count}], member_count, source_sender }]
-export async function extractSiteAssignments(messages) {
+//   roster: [{name, furigana}] を渡すと、人員名を社員名簿の正式氏名へ寄せる（曖昧なら元の呼び名のまま）。
+//   返り値: [{ site_name, work_content, members:[{name,raw_name,company,count,matched}], member_count, source_sender }]
+export async function extractSiteAssignments(messages, roster = []) {
   if (!GEMINI_API_KEY) {
     const e = new Error('GEMINI_API_KEY が未設定です。Render の環境変数に設定してください。');
     e.status = 503;
@@ -53,6 +70,11 @@ export async function extractSiteAssignments(messages) {
   }
   const input = buildAssignmentInput(messages);
   if (!input.trim()) return [];
+
+  // 名簿ブロック（氏名（ふりがな）を列挙）。照合の手掛かりにする。
+  const rosterBlock = (roster || [])
+    .map((r) => (r.furigana ? `${r.name}（${r.furigana}）` : r.name))
+    .join('\n');
 
   const prompt = [
     'これは日本の建設会社の社内LINEグループで、各現場監督が「翌営業日の作業予定と人員配置」を報告した発言の集まりです。',
@@ -66,12 +88,21 @@ export async function extractSiteAssignments(messages) {
     '- 挨拶（お疲れ様です等）、雑談、写真だけの投稿、無関係な連絡は無視してください。',
     '- site_name: 現場名（例: 目達原（6）、国道382号共同溝(その2)、関商店 など本文の表記のまま）。',
     '- work_content: その現場の作業内容を簡潔に（本文の要約でよい）。',
-    '- members: その現場に入る人員の配列。',
-    '    ・個人名は name にそのまま入れ（敬称も本文のまま）、count は 1、company は空文字。',
-    '    ・協力会社が「◯◯さん5名」「◯◯工業 3名」のように人数付きなら、name に会社名、company に会社名、count にその人数。',
+    '- members: その現場に入る人員の配列。各要素は次のとおり。',
+    '    ・raw_name: 本文中の呼び名をそのまま（例: 弘さん、ヒロミ、北森くん）。',
+    '    ・name: 下の「社員名簿」に確実に一致する社員がいれば、その正式氏名に置き換える（matched=true）。',
+    '            略称・下の名前・敬称(さん/くん)・ふりがな(カタカナ)からの推定でも、名簿と1人に特定できれば置き換える。',
+    '            該当者がいない、または候補が複数いて1人に絞れない場合は、置き換えずに raw_name と同じ呼び名を入れ matched=false。',
+    '    ・matched: 名簿の社員に確定できたら true、できなければ false。',
+    '    ・company: 協力会社なら会社名、社員・個人なら空文字。',
+    '    ・count: 個人は 1。協力会社が「◯◯さん5名」「◯◯工業 3名」のように人数付きなら、name/raw_name に会社名・company に会社名・count にその人数。',
+    '- 協力会社（会社名）は社員名簿と照合しない（matched=false のまま）。',
     '- member_count: その現場に入る合計人数（個人名の数＋協力会社の人数の合計）。',
-    '- source_sender: その現場を報告した【名前】。',
+    '- source_sender: その現場を報告した【名前】（これも名簿に一致すれば正式氏名に）。',
     '- 本文に書かれていない人を推測で足さないでください。読み取れない項目は空文字/空配列にしてください。',
+    '',
+    '# 社員名簿（氏名（ふりがな）。人員名の照合に使う。ここに無ければ置き換えない）',
+    rosterBlock || '（名簿なし）',
   ].join('\n');
 
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
@@ -96,6 +127,8 @@ export async function extractSiteAssignments(messages) {
                     type: 'OBJECT',
                     properties: {
                       name: { type: 'STRING' },
+                      raw_name: { type: 'STRING' },
+                      matched: { type: 'BOOLEAN' },
                       company: { type: 'STRING' },
                       count: { type: 'INTEGER' },
                     },
@@ -136,11 +169,17 @@ export async function extractSiteAssignments(messages) {
     const site = (a.site_name || '').trim();
     if (!site) continue;
     const members = (Array.isArray(a.members) ? a.members : [])
-      .map((m) => ({
-        name: (m.name || '').trim(),
-        company: (m.company || '').trim(),
-        count: Number.isFinite(Number(m.count)) && Number(m.count) > 0 ? Math.round(Number(m.count)) : 1,
-      }))
+      .map((m) => {
+        const name = (m.name || '').trim();
+        const raw = (m.raw_name || '').trim() || name;
+        return {
+          name: name || raw,
+          raw_name: raw,
+          matched: !!m.matched,
+          company: (m.company || '').trim(),
+          count: Number.isFinite(Number(m.count)) && Number(m.count) > 0 ? Math.round(Number(m.count)) : 1,
+        };
+      })
       .filter((m) => m.name);
     const declared = Number(a.member_count);
     const member_count = Number.isFinite(declared) && declared > 0 ? Math.round(declared) : sumMembers(members);
