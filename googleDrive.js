@@ -300,6 +300,21 @@ export async function driveDownload(fileId) {
   return { buffer, contentType };
 }
 
+// 大容量ファイル向け：本体をメモリに溜めず、Drive のレスポンス（fetch Response）を
+// そのまま返す。呼び出し側が res.body をクライアントへストリーム転送する。
+//   range を渡すと Drive へ Range ヘッダを転送し、部分取得（206）に対応する。
+//   → PDFビューア等が必要な範囲だけ取得でき、Render のメモリを圧迫しない。
+export async function driveStreamMedia(fileId, { range } = {}) {
+  const token = await getAccessToken();
+  const headers = { Authorization: `Bearer ${token}` };
+  if (range) headers.Range = range;
+  const res = await fetch(
+    `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?alt=media&supportsAllDrives=true`,
+    { headers },
+  );
+  return res; // 呼び出し側で res.ok / res.status / res.headers / res.body を扱う
+}
+
 // fileId の「軽量サムネイル」を取得して { buffer, contentType } を返す。
 // Drive が自動生成する thumbnailLink を size px（長辺）でリサイズ取得する。
 // 一覧表示などフル解像度が不要な場面用（2.6MB → 数十KB に軽量化）。

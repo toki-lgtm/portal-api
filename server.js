@@ -12,7 +12,8 @@ import JSZip from 'jszip';
 import sharp from 'sharp';
 import { parseEstimateFromXlsx } from './bidEstimate.js';
 import { parseBoqFromXlsx, CANONICAL_TRADES, normalizeTrade } from './boqParser.js';
-import { driveUpload, driveDownload, driveThumbnail, driveTrash, driveConfigured, ensureFolderPath, driveListChildren, driveFileMeta, ensureFolder } from './googleDrive.js';
+import { driveUpload, driveDownload, driveThumbnail, driveTrash, driveConfigured, ensureFolderPath, driveListChildren, driveFileMeta, ensureFolder, driveStreamMedia } from './googleDrive.js';
+import { Readable } from 'stream';
 import { classifyQuote, classNoOf } from './classifyQuote.js';
 import { extractExcelQuote } from './quoteExcelExtract.js';
 
@@ -560,6 +561,9 @@ app.get('/api/library/list', requireAuth, async (req, res) => {
 
 // 署名トークンで保護されたライブラリファイルの Drive プロキシ配信（?t=）。
 //   認証は requireAuth ではなく短命JWT（?t=）で行う（<a>/新規タブから開けるように）。
+//   ★大容量PDF（数百MB）対策: 本体をメモリに溜めず Drive→クライアントへストリーム転送する。
+//     Range ヘッダを Drive へ転送し部分取得(206)に対応 → PDFビューアが必要な範囲だけ取得でき、
+//     Render 無料枠（メモリ512MB）でも 502（OOM/タイムアウト）にならない。
 app.get('/api/library-file', async (req, res) => {
   try {
     const token = req.query.t;
@@ -567,16 +571,37 @@ app.get('/api/library-file', async (req, res) => {
     let payload;
     try { payload = jwt.verify(token, JWT_SECRET); } catch { return res.status(401).send('invalid or expired token'); }
     if (payload.kind !== 'library' || !payload.fileId) return res.status(400).send('bad token');
-    const { buffer, contentType } = await driveDownload(payload.fileId);
-    res.setHeader('Content-Type', contentType);
+
+    const driveRes = await driveStreamMedia(payload.fileId, { range: req.headers.range });
+    if (!driveRes.ok && driveRes.status !== 206) {
+      const text = await driveRes.text().catch(() => '');
+      return res.status(driveRes.status === 404 ? 404 : 502).send(text || 'Drive 取得に失敗しました');
+    }
+
+    // Drive のレスポンスヘッダを必要分だけ引き継ぐ（Content-Length/Range 等）。
+    res.status(driveRes.status); // 200 全体 / 206 部分
+    const ct = driveRes.headers.get('content-type') || 'application/octet-stream';
+    res.setHeader('Content-Type', ct);
+    const cl = driveRes.headers.get('content-length'); if (cl) res.setHeader('Content-Length', cl);
+    const cr = driveRes.headers.get('content-range'); if (cr) res.setHeader('Content-Range', cr);
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('Cache-Control', 'private, max-age=300');
     if (payload.name) {
       res.setHeader('Content-Disposition', `inline; filename*=UTF-8''${encodeURIComponent(payload.name)}`);
     }
-    res.setHeader('Cache-Control', 'private, max-age=300');
-    res.send(buffer);
+
+    if (!driveRes.body) { res.end(); return; }
+    const nodeStream = Readable.fromWeb(driveRes.body);
+    // クライアント切断時にアップストリームを止める（無駄な転送・メモリ保持の防止）。
+    res.on('close', () => nodeStream.destroy());
+    nodeStream.on('error', (e) => {
+      console.error('Error (library-file stream):', e.message);
+      if (!res.headersSent) res.status(502).end(); else res.destroy();
+    });
+    nodeStream.pipe(res);
   } catch (error) {
     console.error('Error (library-file proxy):', error.message);
-    res.status(error.status || 500).send(error.message);
+    if (!res.headersSent) res.status(error.status || 500).send(error.message);
   }
 });
 
