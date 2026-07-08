@@ -2395,6 +2395,29 @@ async function lineGroupMemberName(groupId, userId) {
   return name;
 }
 
+// グループ名キャッシュ（groupId -> name）。getGroupSummaryで解決（未認証アカウントでも可）。
+//   複数人トーク(room)には名前が無いので null のまま（group_id にフォールバック）。
+const lineGroupNameCache = new Map();
+async function lineGroupName(groupId, sourceType) {
+  if (!groupId || sourceType !== 'group') return null;
+  if (lineGroupNameCache.has(groupId)) return lineGroupNameCache.get(groupId);
+  let name = null;
+  try {
+    const res = await fetch(
+      `https://api.line.me/v2/bot/group/${encodeURIComponent(groupId)}/summary`,
+      { headers: { Authorization: `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}` } },
+    );
+    if (res.ok) { const d = await res.json(); name = d.groupName || null; }
+  } catch { /* 取れなくても記録は続ける */ }
+  lineGroupNameCache.set(groupId, name);
+  return name;
+}
+
+// フォルダ名に使えない文字を除去し、長すぎを防ぐ。
+function sanitizeFolder(s) {
+  return String(s || '').replace(/[\/\\:*?"<>|]/g, '_').replace(/\s+/g, ' ').trim().slice(0, 80);
+}
+
 // メッセージ本体（画像/動画/音声/ファイル）のバイナリを取得する。
 async function lineGetContent(messageId) {
   const res = await fetch(
@@ -2419,11 +2442,13 @@ function lineExt(type, fileName, contentType) {
   return t[type] || '.bin';
 }
 
-// 保存先フォルダ: 共有ドライブ root / LINEグループ記録 / YYYY-MM [/ sub]
+// 保存先フォルダ: 共有ドライブ root / LINEグループ記録 / <グループ名> / YYYY-MM [/ sub]
+//   グループごとにフォルダを分けるので、複数の社内グループが混ざらない。
 //   sub='写真' で写真サブフォルダ、省略でその月フォルダ直下（日次CSVの置き場）。
-async function lineDriveFolder(sentAtIso, sub) {
+async function lineDriveFolder(groupLabel, sentAtIso, sub) {
   const ym = (sentAtIso || new Date().toISOString()).slice(0, 7); // YYYY-MM
-  const segs = sub ? [LINE_RECORD_FOLDER_NAME, ym, sub] : [LINE_RECORD_FOLDER_NAME, ym];
+  const g = sanitizeFolder(groupLabel) || '未分類';
+  const segs = sub ? [LINE_RECORD_FOLDER_NAME, g, ym, sub] : [LINE_RECORD_FOLDER_NAME, g, ym];
   return ensureFolderPath(segs, SHARED_DRIVE_ROOT_ID);
 }
 
@@ -2442,6 +2467,7 @@ async function handleLineEvent(ev) {
     raw: ev,
   };
   if (groupId && userId) row.sender_name = await lineGroupMemberName(groupId, userId);
+  row.group_name = await lineGroupName(groupId, src.type); // どのグループかを人が読める形で保存
 
   if (ev.type === 'message') {
     const m = ev.message || {};
@@ -2457,7 +2483,7 @@ async function handleLineEvent(ev) {
         const fname = m.fileName
           ? `${stamp}_${who}_${decodeUploadName(m.fileName)}`
           : `${stamp}_${who}_${m.id}${lineExt(m.type, null, contentType)}`;
-        const folderId = await lineDriveFolder(row.sent_at, '写真');
+        const folderId = await lineDriveFolder(row.group_name || row.group_id, row.sent_at, '写真');
         row.drive_file_id = await driveUpload({ name: fname, buffer, mimeType: contentType, folderId });
         row.file_name = fname;
         row.text = `[${m.type}] ${fname}`;
@@ -2518,7 +2544,7 @@ app.get('/api/line/messages', requireAuth, requireAdmin, async (req, res) => {
   try {
     const limit = Math.min(Number(req.query.limit) || 100, 1000);
     let q = supabase.from('line_messages')
-      .select('id, event_type, message_type, group_id, sender_name, sender_user_id, text, drive_file_id, file_name, sent_at, created_at')
+      .select('id, event_type, message_type, group_id, group_name, sender_name, sender_user_id, text, drive_file_id, file_name, sent_at, created_at')
       .order('sent_at', { ascending: false, nullsFirst: false })
       .limit(limit);
     if (req.query.group_id) q = q.eq('group_id', String(req.query.group_id));
@@ -2552,43 +2578,55 @@ app.post('/api/line/daily-export', async (req, res) => {
     const endZ = new Date(`${d}T23:59:59+09:00`).toISOString();
 
     const { data, error } = await supabase.from('line_messages')
-      .select('id, sent_at, sender_name, sender_user_id, event_type, message_type, text, file_name, drive_file_id, group_id')
+      .select('id, sent_at, sender_name, sender_user_id, event_type, message_type, text, file_name, drive_file_id, group_id, group_name')
       .gte('sent_at', startZ).lte('sent_at', endZ)
       .order('sent_at', { ascending: true });
     if (error) throw error;
-    if (!data.length) return res.json({ ok: true, date: d, lines: 0, purged: 0, note: '発言なし' });
+    if (!data.length) return res.json({ ok: true, date: d, lines: 0, purged: 0, groups: [], note: '発言なし' });
 
     // CSV（Excelで文字化けしないよう UTF-8 BOM ＋ CRLF）
     const esc = (v) => {
       const s = (v ?? '').toString();
       return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
     };
-    const head = ['日時(JST)', '発言者', '種別', '本文', '写真ファイル名', '写真リンク', 'userId', 'groupId'];
-    const rows = data.map((r) => {
-      const t = r.sent_at
-        ? new Date(new Date(r.sent_at).getTime() + 9 * 3600 * 1000).toISOString().replace('T', ' ').slice(0, 19)
-        : '';
-      const link = r.drive_file_id ? `https://drive.google.com/file/d/${r.drive_file_id}/view` : '';
-      const kind = r.message_type || r.event_type || '';
-      return [t, r.sender_name || r.sender_user_id || '', kind, r.text || '', r.file_name || '', link, r.sender_user_id || '', r.group_id || '']
-        .map(esc).join(',');
-    });
-    const csv = '﻿' + [head.join(','), ...rows].join('\r\n') + '\r\n';
+    const head = ['日時(JST)', 'グループ', '発言者', '種別', '本文', '写真ファイル名', '写真リンク', 'userId', 'groupId'];
 
-    const folderId = await lineDriveFolder(startZ);
-    const fileId = await driveUpload({
-      name: `LINEログ_${d}.csv`,
-      buffer: Buffer.from(csv, 'utf8'),
-      mimeType: 'text/csv; charset=utf-8',
-      folderId,
-    });
+    // グループ(group_name→無ければgroup_id)ごとに分けて、それぞれ別CSV・別フォルダへ。
+    const byGroup = new Map();
+    for (const r of data) {
+      const label = r.group_name || r.group_id || '未分類';
+      if (!byGroup.has(label)) byGroup.set(label, []);
+      byGroup.get(label).push(r);
+    }
 
-    // Driveへ確実に保存できた行だけを削除（写真の実体はDriveに残る＝CSVから参照可能）
+    const groups = [];
+    for (const [label, rows] of byGroup) {
+      const lines = rows.map((r) => {
+        const t = r.sent_at
+          ? new Date(new Date(r.sent_at).getTime() + 9 * 3600 * 1000).toISOString().replace('T', ' ').slice(0, 19)
+          : '';
+        const link = r.drive_file_id ? `https://drive.google.com/file/d/${r.drive_file_id}/view` : '';
+        const kind = r.message_type || r.event_type || '';
+        return [t, label, r.sender_name || r.sender_user_id || '', kind, r.text || '', r.file_name || '', link, r.sender_user_id || '', r.group_id || '']
+          .map(esc).join(',');
+      });
+      const csv = '﻿' + [head.join(','), ...lines].join('\r\n') + '\r\n';
+      const folderId = await lineDriveFolder(label, startZ);
+      const fileId = await driveUpload({
+        name: `LINEログ_${sanitizeFolder(label) || '未分類'}_${d}.csv`,
+        buffer: Buffer.from(csv, 'utf8'),
+        mimeType: 'text/csv; charset=utf-8',
+        folderId,
+      });
+      groups.push({ group: label, lines: rows.length, fileId });
+    }
+
+    // 全グループのCSV保存に成功したので、対象行を削除（写真の実体はDriveに残る＝CSVから参照可能）
     const ids = data.map((r) => r.id);
     const { error: delErr } = await supabase.from('line_messages').delete().in('id', ids);
-    if (delErr) throw new Error(`Drive保存後の削除に失敗（fileId=${fileId}）: ${delErr.message}`);
+    if (delErr) throw new Error(`Drive保存後の削除に失敗: ${delErr.message}`);
 
-    res.json({ ok: true, date: d, lines: data.length, purged: ids.length, fileId });
+    res.json({ ok: true, date: d, lines: data.length, purged: ids.length, groups });
   } catch (error) {
     console.error('Error (line daily-export):', error.message);
     res.status(500).json({ error: error.message });
