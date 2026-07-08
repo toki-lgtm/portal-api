@@ -1122,6 +1122,143 @@ app.delete('/api/iso/schedule/:id', requireAuth, requireAdmin, async (req, res) 
   }
 });
 
+// ── ISO ヒヤリハット（061）───────────────────────────────
+// ✅ 一覧。要認証。クエリ from/to（YYYY-MM-DD）で期間を絞れる。
+app.get('/api/iso/near-misses', requireAuth, async (req, res) => {
+  try {
+    let query = supabase
+      .from('iso_near_misses')
+      .select('id, report_date, reporter, site_name, category, content, cause, measure')
+      .order('report_date', { ascending: false });
+    const from = String(req.query.from || '').trim();
+    const to = String(req.query.to || '').trim();
+    if (from) query = query.gte('report_date', from);
+    if (to) query = query.lte('report_date', to);
+    const { data, error } = await query;
+    if (error) throw error;
+    res.json(data || []);
+  } catch (error) {
+    console.error('Error (iso near-misses GET):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+const ISO_NM_FIELDS = ['report_date', 'reporter', 'site_name', 'category', 'content', 'cause', 'measure'];
+
+// ✅ ヒヤリハットを報告。全社員が可（requireAuthのみ）。
+app.post('/api/iso/near-misses', requireAuth, async (req, res) => {
+  try {
+    const row = { created_by: String(req.user.email || '').toLowerCase() };
+    for (const f of ISO_NM_FIELDS) if (req.body[f] !== undefined) row[f] = req.body[f];
+    if (!row.content) return res.status(400).json({ error: '内容は必須です' });
+    if (!row.report_date) row.report_date = new Date().toISOString().slice(0, 10);
+    const { data, error } = await supabase.from('iso_near_misses').insert([row]).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (iso near-misses POST):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ ヒヤリハットを更新。管理者のみ。
+app.put('/api/iso/near-misses/:id', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid id' });
+    const patch = { updated_at: new Date().toISOString() };
+    for (const f of ISO_NM_FIELDS) if (req.body[f] !== undefined) patch[f] = req.body[f];
+    const { data, error } = await supabase.from('iso_near_misses').update(patch).eq('id', id).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (iso near-misses PUT):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ ヒヤリハットを削除。管理者のみ。
+app.delete('/api/iso/near-misses/:id', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid id' });
+    const { error } = await supabase.from('iso_near_misses').delete().eq('id', id);
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error (iso near-misses DELETE):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ── ISO 供給者評価（062）───────────────────────────────
+// ✅ 一覧。要認証。クエリ category で絞れる。
+app.get('/api/iso/suppliers', requireAuth, async (req, res) => {
+  try {
+    let query = supabase
+      .from('iso_supplier_evaluations')
+      .select('id, supplier_name, trade_category, main_item, transaction_type, criteria, result, reason, evaluator, evaluation_date, note')
+      .order('trade_category', { ascending: true })
+      .order('supplier_name', { ascending: true });
+    const category = String(req.query.category || '').trim();
+    if (category) query = query.eq('trade_category', category);
+    const { data, error } = await query;
+    if (error) throw error;
+    res.json(data || []);
+  } catch (error) {
+    console.error('Error (iso suppliers GET):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+const ISO_SUP_FIELDS = ['supplier_name', 'trade_category', 'main_item', 'transaction_type', 'criteria', 'result', 'reason', 'evaluator', 'evaluation_date', 'note'];
+
+// ✅ 供給者評価を追加。管理者のみ。
+app.post('/api/iso/suppliers', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const row = {};
+    for (const f of ISO_SUP_FIELDS) if (req.body[f] !== undefined) row[f] = req.body[f];
+    if (!row.supplier_name) return res.status(400).json({ error: '供給者名は必須です' });
+    if (!row.trade_category) return res.status(400).json({ error: '取引区分は必須です' });
+    const { data, error } = await supabase.from('iso_supplier_evaluations').insert([row]).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (iso suppliers POST):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 供給者評価を更新。管理者のみ。
+app.put('/api/iso/suppliers/:id', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid id' });
+    const patch = { updated_at: new Date().toISOString() };
+    for (const f of ISO_SUP_FIELDS) if (req.body[f] !== undefined) patch[f] = req.body[f];
+    const { data, error } = await supabase.from('iso_supplier_evaluations').update(patch).eq('id', id).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (iso suppliers PUT):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 供給者評価を削除。管理者のみ。
+app.delete('/api/iso/suppliers/:id', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid id' });
+    const { error } = await supabase.from('iso_supplier_evaluations').delete().eq('id', id);
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error (iso suppliers DELETE):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // ✅ ポータルTOP用：安全パトロールの状況サマリ（KPIカード＋最近の活動）
 //    既存の inspections / inspection_details / projects を集計して返す。読み取り専用・要認証。
 //    KPI: 今月の点検数 / 完了率(承認済の指摘÷全指摘) / 是正対応中(未承認の指摘) / 承認待ち(submitted)
