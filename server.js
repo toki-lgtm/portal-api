@@ -2812,6 +2812,23 @@ app.get('/api/site-assignments', requireAuth, async (req, res) => {
   }
 });
 
+// ✅ 人員編集の氏名ピッカー用: 在籍社員の氏名リスト（管理者）。
+//    /:id より前・GET なので他ルートと衝突しない。
+app.get('/api/site-assignments/staff', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('staff_master')
+      .select('id, name, furigana, department, job_type')
+      .eq('is_active', true)
+      .order('name', { ascending: true });
+    if (error) throw error;
+    res.json((data || []).filter((r) => (r.name || '').trim()));
+  } catch (error) {
+    console.error('Error (site-assignments staff):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // ✅ 抽出の実行。Render Cron(x-cron-key) または 管理者(Bearer) が叩ける。
 //    ?date=YYYY-MM-DD（投稿日）省略時は「本日(JST)」。翌営業日ぶんを洗い替え保存。
 app.post('/api/site-assignments/extract', async (req, res) => {
