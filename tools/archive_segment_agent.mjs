@@ -123,7 +123,12 @@ function buildLocalIndex() {
   return map;
 }
 
-const isValidDate = (s) => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s);
+// YYYY-MM-DD 形式かつ月日が実在範囲（"2021-00-00" のような年のみ推定を弾く）。
+const isValidDate = (s) => {
+  if (typeof s !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(s)) return false;
+  const [, m, d] = s.split('-').map(Number);
+  return m >= 1 && m <= 12 && d >= 1 && d <= 31;
+};
 const normTitle = (s) => String(s || '').replace(/[\s　・（）()「」]/g, '').toLowerCase();
 
 // python(pdf_chunk.py) を呼ぶ。ranges 省略で page_count のみ、指定で範囲PDFを切り出す。
@@ -180,7 +185,8 @@ async function indexPdf(t, localIdx) {
       let segs;
       try {
         let attempt = 0;
-        for (;;) { try { segs = await extractChunk(buf, `r_${s}_${e}.pdf`); break; } catch (err) { if (isTruncErr(err) || ++attempt >= 2) throw err; await sleep(3000); } }
+        // truncation は即 subdivide（外側catch）。503等の一時障害は指数バックオフで最大6回。
+        for (;;) { try { segs = await extractChunk(buf, `r_${s}_${e}.pdf`); break; } catch (err) { if (isTruncErr(err) || ++attempt >= 6) throw err; await sleep(Math.min(30000, 2000 * 2 ** (attempt - 1))); } }
       } catch (err) {
         try { fs.unlinkSync(files[0].file); } catch {}
         if (isTruncErr(err) && e > s) { const mid = Math.floor((s + e) / 2); queue.unshift([mid + 1, e]); queue.unshift([s, mid]); continue; }
@@ -234,13 +240,16 @@ async function indexPdf(t, localIdx) {
 
 // 親＋子を DB へ（親 upsert→id 取得→子を置換）
 async function writeToDb(t, parent, segments) {
-  const { data: prow, error: perr } = await sb.from('archive_document_index').upsert(parent, { onConflict: 'drive_file_id' }).select('id').single();
+  // キャッシュ由来の不正日付（旧ロジックが通した "YYYY-MM-00" 等）もここで無害化する。
+  const safeDate = (d) => (isValidDate(d) ? d : null);
+  const parentRow = { ...parent, doc_date: safeDate(parent.doc_date) };
+  const { data: prow, error: perr } = await sb.from('archive_document_index').upsert(parentRow, { onConflict: 'drive_file_id' }).select('id').single();
   if (perr) throw perr;
   const docId = prow.id;
   await sb.from('archive_document_segments').delete().eq('drive_file_id', t.fileId);
   const rows = segments.map((s, i) => ({
     document_id: docId, drive_file_id: t.fileId, scope: SCOPE, kouji_folder_id: t.koujiFolderId, kouji_name: t.koujiName, file_name: t.fileName,
-    seg_index: i, doc_type: s.doc_type, title: s.title, doc_date: s.doc_date, date_text: null,
+    seg_index: i, doc_type: s.doc_type, title: s.title, doc_date: safeDate(s.doc_date), date_text: null,
     client_name: s.client_name, fiscal_year: null, work_type: s.work_type,
     page_start: s.page_start, page_end: s.page_end, body_text: s.body_text, summary: s.summary, keywords: s.keywords, model: MODEL,
   }));
