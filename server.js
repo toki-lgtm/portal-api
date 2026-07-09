@@ -770,32 +770,46 @@ app.get('/api/archive/file/:fileId/url', requireAuth, async (req, res) => {
 });
 
 // ============================================================
-// 過去工事アーカイブ AI索引 横断検索（migration 100: archive_document_index）
-//   ローカル索引エージェント（tools/archive_index_agent.mjs）が Gemini で抽出した
-//   書類種別/日付/要約/発注者/年度/工種を DB 索引化。ここは閲覧・検索のみ。
-//   ヒット行の drive_file_id は既存 /api/archive/file/:fileId/url でそのまま開ける。
+// 過去工事アーカイブ AI索引 横断検索（migration 100/101: index＋segments）
+//   ローカルの索引エージェント（tools/archive_segment_agent.mjs）が Gemini で
+//   PDFを「書類単位」に分解し、本文全文・ページ範囲・種別/日付/発注者を抽出。
+//   利用者は普段この本文データを読み、原本PDFは page_start〜page_end の該当ページのみ参照する。
+//   検索・詳細は archive_document_segments（書類単位）を主対象にする。
 // ============================================================
 
 // PostgREST の or() を壊す文字を除去（%_ はワイルドカードとして活かす）
 const sanitizeLike = (s) => String(s || '').replace(/[,()*]/g, ' ').trim();
 
-// ✅ 索引の横断検索。要認証。scope=kouji/jinji, q=フリーワード, 各種フィルタ。
+// マッチ箇所を中心に本文スニペットを切り出す（検索結果プレビュー用）。
+function makeSnippet(body, q, len = 220) {
+  const text = String(body || '').replace(/\s+/g, ' ').trim();
+  if (!text) return '';
+  if (q) {
+    const i = text.toLowerCase().indexOf(q.toLowerCase());
+    if (i >= 0) {
+      const start = Math.max(0, i - 60);
+      return (start > 0 ? '…' : '') + text.slice(start, start + len) + (start + len < text.length ? '…' : '');
+    }
+  }
+  return text.slice(0, len) + (text.length > len ? '…' : '');
+}
+
+// ✅ 書類（セグメント）の横断検索。要認証。q=フリーワード（本文も対象）＋各種フィルタ。
 app.get('/api/archive/search', requireAuth, async (req, res) => {
   try {
     const scope = archiveScope(req.query.scope);
     if (!(await ensureArchiveAccess(req, res, scope))) return;
 
     let query = supabase
-      .from('archive_document_index')
-      .select('id,drive_file_id,kouji_folder_id,kouji_name,file_name,file_size,doc_type,doc_date,date_text,summary,client_name,fiscal_year,work_type,keywords')
-      .eq('scope', scope)
-      .eq('status', 'indexed');
+      .from('archive_document_segments')
+      .select('id,document_id,drive_file_id,kouji_folder_id,kouji_name,file_name,seg_index,doc_type,title,doc_date,client_name,work_type,page_start,page_end,summary,keywords,body_text')
+      .eq('scope', scope);
 
     const q = sanitizeLike(req.query.q);
     if (q) {
       const like = `%${q}%`;
       query = query.or(
-        ['summary', 'keywords', 'file_name', 'kouji_name', 'client_name', 'doc_type', 'date_text', 'work_type', 'fiscal_year']
+        ['body_text', 'title', 'summary', 'keywords', 'doc_type', 'kouji_name', 'client_name']
           .map((c) => `${c}.ilike.${like}`).join(',')
       );
     }
@@ -805,18 +819,39 @@ app.get('/api/archive/search', requireAuth, async (req, res) => {
     if (docType) query = query.ilike('doc_type', `%${docType}%`);
     const client = sanitizeLike(req.query.client);
     if (client) query = query.ilike('client_name', `%${client}%`);
-    const year = sanitizeLike(req.query.year);
-    if (year) query = query.ilike('fiscal_year', `%${year}%`);
 
-    const limit = Math.min(parseInt(req.query.limit, 10) || 200, 500);
-    // 日付降順（NULLは末尾）。件名でも安定ソート。
+    const limit = Math.min(parseInt(req.query.limit, 10) || 100, 300);
     query = query.order('doc_date', { ascending: false, nullsFirst: false }).order('id', { ascending: false }).limit(limit);
 
     const { data, error } = await query;
     if (error) throw error;
-    res.json({ scope, count: data.length, items: data });
+    // 本文はスニペットに縮約して返す（詳細は /segment/:id）。
+    const items = data.map((r) => {
+      const { body_text, ...rest } = r;
+      return { ...rest, snippet: makeSnippet(body_text, q) };
+    });
+    res.json({ scope, count: items.length, items });
   } catch (error) {
     console.error('Error (archive search):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 書類1件の本文全文＋メタ（データを読む画面用）。要認証。
+app.get('/api/archive/segment/:id', requireAuth, async (req, res) => {
+  try {
+    const scope = archiveScope(req.query.scope);
+    if (!(await ensureArchiveAccess(req, res, scope))) return;
+    const { data, error } = await supabase
+      .from('archive_document_segments')
+      .select('*')
+      .eq('id', req.params.id)
+      .eq('scope', scope)
+      .single();
+    if (error || !data) return res.status(404).json({ error: '書類が見つかりません' });
+    res.json({ item: data });
+  } catch (error) {
+    console.error('Error (archive segment):', error.message);
     res.status(500).json({ error: error.message });
   }
 });
@@ -828,17 +863,15 @@ app.get('/api/archive/facets', requireAuth, async (req, res) => {
     if (!(await ensureArchiveAccess(req, res, scope))) return;
 
     const { data, error } = await supabase
-      .from('archive_document_index')
-      .select('kouji_folder_id,kouji_name,doc_type,client_name,fiscal_year')
+      .from('archive_document_segments')
+      .select('kouji_folder_id,kouji_name,doc_type,client_name')
       .eq('scope', scope)
-      .eq('status', 'indexed')
-      .limit(5000);
+      .limit(20000);
     if (error) throw error;
 
-    const koujiMap = new Map();   // id -> {id,name,count}
-    const docTypeMap = new Map(); // 種別 -> count（「/」分割）
-    const clientMap = new Map();  // 発注者 -> count
-    const yearMap = new Map();    // 年度 -> count
+    const koujiMap = new Map();
+    const docTypeMap = new Map();
+    const clientMap = new Map();
     for (const r of data) {
       if (r.kouji_folder_id) {
         const cur = koujiMap.get(r.kouji_folder_id) || { id: r.kouji_folder_id, name: r.kouji_name || '(名称不明)', count: 0 };
@@ -848,7 +881,6 @@ app.get('/api/archive/facets', requireAuth, async (req, res) => {
         docTypeMap.set(t, (docTypeMap.get(t) || 0) + 1);
       }
       if (r.client_name) clientMap.set(r.client_name, (clientMap.get(r.client_name) || 0) + 1);
-      if (r.fiscal_year) yearMap.set(r.fiscal_year, (yearMap.get(r.fiscal_year) || 0) + 1);
     }
     res.json({
       scope,
@@ -856,7 +888,6 @@ app.get('/api/archive/facets', requireAuth, async (req, res) => {
       kouji: [...koujiMap.values()].sort((a, b) => a.name.localeCompare(b.name, 'ja')),
       docTypes: [...docTypeMap.entries()].map(([name, count]) => ({ name, count })).sort((a, b) => b.count - a.count),
       clients: [...clientMap.entries()].map(([name, count]) => ({ name, count })).sort((a, b) => b.count - a.count),
-      years: [...yearMap.entries()].map(([name, count]) => ({ name, count })).sort((a, b) => b.name.localeCompare(a.name, 'ja')),
     });
   } catch (error) {
     console.error('Error (archive facets):', error.message);

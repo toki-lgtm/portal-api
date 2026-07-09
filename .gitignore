@@ -6,3 +6,4 @@ node_modules/
 # 索引エージェントの一時ファイル（ローカル専用・再生成可）
 tools/_index_checkpoint_*.json
 tools/_index_run_*.log
+_seg_checkpoint_*.json
