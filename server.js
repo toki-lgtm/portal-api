@@ -417,6 +417,7 @@ app.get('/api/apps', requireAuth, async (req, res) => {
       { id: 19, key: 'iso', name: 'ISO管理', icon: '📋', internal: true, view: 'iso', description: 'ISO 9001/45001/14001 統合マネジメントシステムの文書・記録・審査管理' },
       { id: 20, key: 'library', name: '資料ライブラリ', icon: '📚', internal: true, view: 'library', description: '社内で共有する参考資料・書籍・雑誌を閲覧（会報誌など）' },
       { id: 21, key: 'site-assignments', name: '翌日の人員配置', icon: '👷', internal: true, view: 'site-assignments', description: 'グループLINEの夜の報告から翌営業日の現場別人員を自動集計' },
+      { id: 22, key: 'archive', name: '過去工事アーカイブ', icon: '🗄️', internal: true, view: 'archive', description: '過去の工事書類をスキャンして工事別に保管・閲覧（人事資料は管理者限定）' },
       // 【凍結 2026-06-17】法令集はメニューから除外（機能・API・データは残置、復活時はこの行を戻す）
       // { id: 13, key: 'regulations', name: '法令集', icon: '📚', internal: true, view: 'regulations', description: '建設・不動産・林業・労務・会社経営の法令を条文単位で検索・閲覧' },
     ];
@@ -443,6 +444,8 @@ app.get('/api/apps', requireAuth, async (req, res) => {
       if (a.key === 'library') return true;
       // 翌日の人員配置は全社員に常に表示する（閲覧は全員、編集・再抽出は画面内で admin のみ）。
       if (a.key === 'site-assignments') return true;
+      // 過去工事アーカイブは全社員に表示（工事資料は全員閲覧。人事タブ・人事資料は画面内＆API双方で admin のみ）。
+      if (a.key === 'archive') return true;
       if (perms.role === 'admin') return true;
       return !!appPerms[a.key];
     });
@@ -685,6 +688,83 @@ app.delete('/api/library/:fileId', requireAuth, requireAdmin, async (req, res) =
     res.json({ ok: true });
   } catch (error) {
     console.error('Error (library delete):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================================
+// 過去工事アーカイブ / 人事アーカイブ（共有ドライブを直接ブラウズ）
+//   scope=kouji → 10.過去工事アーカイブ（全社員が閲覧可）
+//   scope=jinji → 11.人事アーカイブ（従業員カード・資格者証等・個人情報。管理者限定）
+//   資料ライブラリと同じ「Drive を正本・DBは持たない」方式。閲覧＝元データ参照。
+//   ストリーム配信は既存の /api/library-file（kind:'library' 署名トークン）を再利用する。
+// ============================================================
+const ARCHIVE_ROOTS = {
+  kouji: { name: '10.過去工事アーカイブ', adminOnly: false, label: '過去工事アーカイブ' },
+  jinji: { name: '11.人事アーカイブ', adminOnly: true, label: '人事アーカイブ' },
+};
+const archiveScope = (q) => (String(q || '').trim() === 'jinji' ? 'jinji' : 'kouji');
+async function getArchiveRootId(scope) {
+  return ensureFolderPath([ARCHIVE_ROOTS[scope].name], SHARED_DRIVE_ROOT_ID);
+}
+// 人事スコープは管理者のみ。許可されなければ res を返して false。
+async function ensureArchiveAccess(req, res, scope) {
+  if (!ARCHIVE_ROOTS[scope].adminOnly) return true;
+  const perms = await resolvePermissions(req.user?.email);
+  if (perms.role !== 'admin') {
+    res.status(403).json({ error: 'この資料は管理者のみ閲覧できます' });
+    return false;
+  }
+  return true;
+}
+
+// ✅ アーカイブ一覧（フォルダ＋ファイル）。要認証。scope=kouji/jinji, folderId 省略時はルート。
+app.get('/api/archive/list', requireAuth, async (req, res) => {
+  try {
+    if (!driveConfigured()) return res.status(503).json({ error: '共有ドライブが未設定です' });
+    const scope = archiveScope(req.query.scope);
+    if (!(await ensureArchiveAccess(req, res, scope))) return;
+    const root = await getArchiveRootId(scope);
+    const folderId = String(req.query.folderId || '').trim() || root;
+    if (folderId !== root && !(await isWithinLibrary(folderId, root))) {
+      return res.status(403).json({ error: 'アーカイブ外のフォルダは参照できません' });
+    }
+    const children = await driveListChildren(folderId);
+    const items = children
+      .map((c) => ({
+        id: c.id,
+        name: c.name,
+        mimeType: c.mimeType,
+        isFolder: c.mimeType === 'application/vnd.google-apps.folder',
+      }))
+      .sort((a, b) =>
+        a.isFolder === b.isFolder ? a.name.localeCompare(b.name, 'ja') : a.isFolder ? -1 : 1
+      );
+    res.json({ scope, folderId, rootId: root, isRoot: folderId === root, items });
+  } catch (error) {
+    console.error('Error (archive list):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ アーカイブファイルの閲覧/DL用URL発行（既存 library-file プロキシを再利用）。要認証。
+app.get('/api/archive/file/:fileId/url', requireAuth, async (req, res) => {
+  try {
+    if (!driveConfigured()) return res.status(503).json({ error: '共有ドライブが未設定です' });
+    const scope = archiveScope(req.query.scope);
+    if (!(await ensureArchiveAccess(req, res, scope))) return;
+    const { fileId } = req.params;
+    const root = await getArchiveRootId(scope);
+    if (!(await isWithinLibrary(fileId, root))) {
+      return res.status(403).json({ error: 'アーカイブ外のファイルです' });
+    }
+    const meta = await driveFileMeta(fileId, 'id,name');
+    const token = jwt.sign({ fileId, kind: 'library', name: meta?.name || '' }, JWT_SECRET, { expiresIn: 300 });
+    const base = process.env.PUBLIC_API_URL || 'https://portal-api-hhlx.onrender.com';
+    const dl = req.query.dl === '0' ? '' : '&dl=1';
+    res.json({ url: `${base}/api/library-file?t=${encodeURIComponent(token)}${dl}`, name: meta?.name || '' });
+  } catch (error) {
+    console.error('Error (archive file url):', error.message);
     res.status(500).json({ error: error.message });
   }
 });
