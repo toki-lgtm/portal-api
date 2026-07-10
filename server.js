@@ -418,6 +418,7 @@ app.get('/api/apps', requireAuth, async (req, res) => {
       { id: 20, key: 'library', name: '資料ライブラリ', icon: '📚', internal: true, view: 'library', description: '社内で共有する参考資料・書籍・雑誌を閲覧（会報誌など）' },
       { id: 21, key: 'site-assignments', name: '翌日の人員配置', icon: '👷', internal: true, view: 'site-assignments', description: 'グループLINEの夜の報告から翌営業日の現場別人員を自動集計' },
       { id: 22, key: 'archive', name: '過去工事アーカイブ', icon: '🗄️', internal: true, view: 'archive', description: '過去の工事書類をスキャンして工事別に保管・閲覧（人事資料は管理者限定）' },
+      { id: 23, key: 'post-office', name: '郵便局 年間指名', icon: '📮', internal: true, view: 'post-office', description: '日本郵便の年間事前指名（対馬エリア小規模修繕）の案件・月次一覧表を管理' },
       // 【凍結 2026-06-17】法令集はメニューから除外（機能・API・データは残置、復活時はこの行を戻す）
       // { id: 13, key: 'regulations', name: '法令集', icon: '📚', internal: true, view: 'regulations', description: '建設・不動産・林業・労務・会社経営の法令を条文単位で検索・閲覧' },
     ];
@@ -15879,6 +15880,350 @@ function startSiteAssignmentScheduler() {
   }, TICK_MS);
   console.log('🕗 翌日の人員配置: 毎晩20:00(JST)の自動抽出スケジューラを起動しました');
 }
+
+// ============================================================
+// 郵便局 年間指名（post-office）Phase 1
+// 日本郵便の年間事前指名（対馬エリア小規模修繕）の案件管理。
+// 様式1-6の1行＝post_office_cases の1レコード。営業日数は company_holidays で算出。
+// ============================================================
+const POST_OFFICE_STATUSES = [
+  'estimate_drafting', 'surveyed', 'done_no_estimate', 'estimate_submitted',
+  'contracted', 'completed', 'canceled', 'on_hold', 'stopped', 'closed',
+];
+
+// 更新可能フィールド（様式1-6の入力列に対応）
+const PO_FIELDS = [
+  'fiscal_year', 'seq_no', 'area', 'company', 'status',
+  'eizen_recv_no', 'estimate_no', 'response_type', 'category',
+  'facility_name', 'requester_org', 'requester_name', 'is_pre_movein', 'is_policy_work', 'work_content',
+  'request_recv_date', 'first_contact_date', 'survey_designated_date', 'survey_done_date', 'estimate_submit_date',
+  'contract_date', 'contract_amount', 'contract_contact_date',
+  'work_start_date', 'work_done_date', 'completion_docs_date',
+  'invoice_date', 'payment_date',
+  'contract_number', 'eizen_mgmt_no', 'office_number', 'assessed_amount', 'completion_deadline',
+  'estimate_delay_reason', 'classification_code', 'completion_delay_reason',
+  'drive_folder_url', 'assignee_id', 'remarks',
+];
+function pickPoFields(body) {
+  const out = {};
+  for (const k of PO_FIELDS) {
+    if (!(k in body)) continue;
+    let v = body[k];
+    if (v === '' || v === undefined) v = null;
+    out[k] = v;
+  }
+  return out;
+}
+
+// 権限: staff_app_permissions.app_key='post-office'（globalAdmin は無条件 admin）
+async function resolvePostOfficeRole(email) {
+  const perms = await resolvePermissions(email);
+  if (perms.role === 'admin') return { role: 'admin', access: true, staffId: perms.staffId, globalAdmin: true };
+  let level = null;
+  if (perms.staffId) {
+    const { data } = await supabase
+      .from('staff_app_permissions').select('access_level')
+      .eq('staff_id', perms.staffId).eq('app_key', 'post-office').maybeSingle();
+    level = data?.access_level || null;
+  }
+  const role = level === 'admin' ? 'admin' : level ? 'member' : 'none';
+  return { role, access: role !== 'none', staffId: perms.staffId, globalAdmin: false };
+}
+async function requirePostOfficeAccess(req, res, next) {
+  try {
+    const r = await resolvePostOfficeRole(req.user.email);
+    if (!r.access) return res.status(403).json({ error: '郵便局 年間指名へのアクセス権がありません' });
+    req.poRole = r; next();
+  } catch (e) { res.status(500).json({ error: e.message }); }
+}
+async function requirePostOfficeAdmin(req, res, next) {
+  try {
+    const r = await resolvePostOfficeRole(req.user.email);
+    if (r.role !== 'admin') return res.status(403).json({ error: 'この操作は管理者のみ可能です' });
+    req.poRole = r; next();
+  } catch (e) { res.status(500).json({ error: e.message }); }
+}
+
+// 現在の日本郵便年度（10月始まり）。例: 2026-07 → 2025 年度。
+function poCurrentFiscalYear() {
+  const t = jstToday();
+  const y = Number(t.slice(0, 4)), m = Number(t.slice(5, 7));
+  return m >= 10 ? y : y - 1;
+}
+// 会社カレンダー（公休/計画有給）＋土日を非営業日とする集合を返す。
+async function poLoadNonBusinessSet() {
+  const { data } = await supabase.from('company_holidays').select('day');
+  return new Set((data || []).map((r) => r.day));
+}
+// a の翌日〜b までの営業日数（土日・非営業日を除外）。same-day は 0。null は算出不能。
+function poBusinessDaysBetween(a, b, holidaySet) {
+  if (!a || !b) return null;
+  const start = new Date(a + 'T00:00:00'), end = new Date(b + 'T00:00:00');
+  if (isNaN(start) || isNaN(end)) return null;
+  if (end < start) return null;
+  let count = 0;
+  const d = new Date(start);
+  while (true) {
+    d.setDate(d.getDate() + 1);
+    if (d > end) break;
+    const wd = d.getDay();
+    const iso = d.toISOString().slice(0, 10);
+    if (wd !== 0 && wd !== 6 && !holidaySet.has(iso)) count++;
+  }
+  return count;
+}
+// 契約日＋4ヶ月後の「20日」を完成期限として算出（工期確認ルール）。
+function poCompletionDeadline(contractDate) {
+  if (!contractDate) return null;
+  const d = new Date(contractDate + 'T00:00:00');
+  if (isNaN(d)) return null;
+  d.setMonth(d.getMonth() + 4);
+  d.setDate(20);
+  return d.toISOString().slice(0, 10);
+}
+// 種別・区分（自動）: 一般 / 社宅緊急 / 社宅以外緊急
+function poTypeCategory(c) {
+  if (c.response_type !== '緊急') return '一般';
+  return c.category === '社宅' ? '社宅緊急' : '社宅以外緊急';
+}
+// 案件の派生値（営業日数・起算日・完成期限の目安）を算出して付与。
+function poDeriveCase(c, holidaySet) {
+  const typeCategory = poTypeCategory(c);
+  const contactBiz = poBusinessDaysBetween(c.request_recv_date, c.first_contact_date, holidaySet);
+  // 見積提出の起算日: 社宅以外の緊急＝工事完了日、それ以外＝最終調査完了日
+  const estimateStart = typeCategory === '社宅以外緊急' ? c.work_done_date : c.survey_done_date;
+  const estimateBiz = poBusinessDaysBetween(estimateStart, c.estimate_submit_date, holidaySet);
+  return {
+    ...c,
+    type_category: typeCategory,
+    contact_bizdays: contactBiz,
+    estimate_start_date: estimateStart || null,
+    estimate_bizdays: estimateBiz,
+    completion_deadline_calc: poCompletionDeadline(c.contract_date),
+  };
+}
+
+// ✅ 郵便局 - ダッシュボードKPI
+app.get('/api/post-office/stats', requireAuth, requirePostOfficeAccess, async (req, res) => {
+  try {
+    const fy = Number(req.query.fiscal_year) || poCurrentFiscalYear();
+    const today = jstToday();
+    const [{ data: cases }, holidaySet] = await Promise.all([
+      supabase.from('post_office_cases').select('*').eq('is_active', true).eq('fiscal_year', fy),
+      poLoadNonBusinessSet(),
+    ]);
+    const rows = cases || [];
+    const byStatus = {};
+    for (const s of POST_OFFICE_STATUSES) byStatus[s] = 0;
+    let estimateOverdue = 0, deadlineOverdue = 0;
+    for (const c0 of rows) {
+      const c = poDeriveCase(c0, holidaySet);
+      byStatus[c.status] = (byStatus[c.status] || 0) + 1;
+      // 見積未提出で、起算日翌日から8営業日を超過
+      if (['estimate_drafting', 'surveyed'].includes(c.status) && c.estimate_start_date) {
+        const biz = poBusinessDaysBetween(c.estimate_start_date, today, holidaySet);
+        if (biz != null && biz > 8) estimateOverdue++;
+      }
+      // 完成期限（工期）超過で未完成
+      const dl = c.completion_deadline || c.completion_deadline_calc;
+      if (dl && dl < today && !['completed', 'canceled', 'closed', 'stopped'].includes(c.status)) deadlineOverdue++;
+    }
+    res.json({
+      fiscal_year: fy,
+      total: rows.length,
+      by_status: byStatus,
+      estimate_overdue: estimateOverdue,
+      deadline_overdue: deadlineOverdue,
+      role: req.poRole?.role || 'member',
+    });
+  } catch (error) {
+    console.error('Error (post-office stats):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 郵便局 - 担当ピッカー用の社員一覧
+app.get('/api/post-office/staff', requireAuth, requirePostOfficeAccess, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('staff_master').select('id, name').order('id', { ascending: true });
+    if (error) throw error;
+    res.json(data || []);
+  } catch (error) {
+    console.error('Error (post-office staff):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 郵便局 - 年度一覧（絞り込み用の存在年度）
+app.get('/api/post-office/years', requireAuth, requirePostOfficeAccess, async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('post_office_cases').select('fiscal_year').eq('is_active', true);
+    if (error) throw error;
+    const years = Array.from(new Set((data || []).map((r) => r.fiscal_year))).sort((a, b) => b - a);
+    if (!years.includes(poCurrentFiscalYear())) years.unshift(poCurrentFiscalYear());
+    res.json(years);
+  } catch (error) {
+    console.error('Error (post-office years):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 郵便局 - 案件一覧
+app.get('/api/post-office/cases', requireAuth, requirePostOfficeAccess, async (req, res) => {
+  try {
+    const { status, response_type, q } = req.query;
+    const fy = Number(req.query.fiscal_year) || poCurrentFiscalYear();
+    let query = supabase.from('post_office_cases').select('*').eq('is_active', true).eq('fiscal_year', fy);
+    if (status && POST_OFFICE_STATUSES.includes(status)) query = query.eq('status', status);
+    if (response_type && ['一般', '緊急'].includes(response_type)) query = query.eq('response_type', response_type);
+    query = query.order('seq_no', { ascending: true, nullsFirst: false }).order('id', { ascending: true });
+    const { data, error } = await query;
+    if (error) throw error;
+    let rows = data || [];
+    if (q) {
+      const needle = String(q).toLowerCase();
+      rows = rows.filter((c) =>
+        (c.facility_name || '').toLowerCase().includes(needle) ||
+        (c.work_content || '').toLowerCase().includes(needle) ||
+        (c.estimate_no || '').toLowerCase().includes(needle));
+    }
+    const [holidaySet, nameMap] = await Promise.all([poLoadNonBusinessSet(), loadStaffNameMap()]);
+    rows = rows.map((c) => {
+      const d = poDeriveCase(c, holidaySet);
+      return { ...d, assignee_name: c.assignee_id ? nameMap[c.assignee_id] || null : null };
+    });
+    res.json(rows);
+  } catch (error) {
+    console.error('Error (post-office list):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 郵便局 - 案件詳細
+app.get('/api/post-office/cases/:id', requireAuth, requirePostOfficeAccess, async (req, res) => {
+  try {
+    const { data: c, error } = await supabase
+      .from('post_office_cases').select('*').eq('id', req.params.id).eq('is_active', true).maybeSingle();
+    if (error) throw error;
+    if (!c) return res.status(404).json({ error: '案件が見つかりません' });
+    const [holidaySet, nameMap] = await Promise.all([poLoadNonBusinessSet(), loadStaffNameMap()]);
+    const d = poDeriveCase(c, holidaySet);
+    res.json({ ...d, assignee_name: c.assignee_id ? nameMap[c.assignee_id] || null : null });
+  } catch (error) {
+    console.error('Error (post-office detail):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 郵便局 - 案件の新規登録
+app.post('/api/post-office/cases', requireAuth, requirePostOfficeAccess, async (req, res) => {
+  try {
+    const payload = pickPoFields(req.body);
+    if (!payload.fiscal_year) payload.fiscal_year = poCurrentFiscalYear();
+    if (payload.status && !POST_OFFICE_STATUSES.includes(payload.status)) {
+      return res.status(400).json({ error: '不正なステータスです' });
+    }
+    // 整理番号の自動採番（年度内の最大+1）。指定があればそれを優先。
+    if (payload.seq_no == null) {
+      const { data: mx } = await supabase.from('post_office_cases')
+        .select('seq_no').eq('fiscal_year', payload.fiscal_year).eq('is_active', true)
+        .order('seq_no', { ascending: false, nullsFirst: false }).limit(1);
+      payload.seq_no = ((mx && mx[0]?.seq_no) || 0) + 1;
+    }
+    payload.created_by = req.user.email;
+    const { data, error } = await supabase.from('post_office_cases').insert([payload]).select('*').single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (post-office create):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 郵便局 - 案件の更新
+app.put('/api/post-office/cases/:id', requireAuth, requirePostOfficeAccess, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const payload = pickPoFields(req.body);
+    if (payload.status && !POST_OFFICE_STATUSES.includes(payload.status)) {
+      return res.status(400).json({ error: '不正なステータスです' });
+    }
+    const { data: existing } = await supabase
+      .from('post_office_cases').select('id').eq('id', id).eq('is_active', true).maybeSingle();
+    if (!existing) return res.status(404).json({ error: '案件が見つかりません' });
+    payload.updated_at = new Date().toISOString();
+    const { data, error } = await supabase.from('post_office_cases').update(payload).eq('id', id).select('*').single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (post-office update):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 郵便局 - 案件の論理削除（管理者のみ）
+app.delete('/api/post-office/cases/:id', requireAuth, requirePostOfficeAdmin, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('post_office_cases').update({ is_active: false, updated_at: new Date().toISOString() })
+      .eq('id', req.params.id).select('id');
+    if (error) throw error;
+    if (!data || !data.length) return res.status(404).json({ error: '案件が見つかりません' });
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error (post-office delete):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 郵便局 - 簡易エクスポート（様式1-6の列順でxlsx出力）
+//    ※正式様式（数式・書式・集計シート付き）への自動流し込みは Phase 2 で対応。
+app.get('/api/post-office/export', requireAuth, requirePostOfficeAccess, async (req, res) => {
+  try {
+    const XLSX = require('xlsx');
+    const fy = Number(req.query.fiscal_year) || poCurrentFiscalYear();
+    const [{ data: cases }, holidaySet, nameMap] = await Promise.all([
+      supabase.from('post_office_cases').select('*').eq('is_active', true).eq('fiscal_year', fy)
+        .order('seq_no', { ascending: true, nullsFirst: false }).order('id', { ascending: true }),
+      poLoadNonBusinessSet(), loadStaffNameMap(),
+    ]);
+    const STATUS_JA = {
+      estimate_drafting: '見積作成中', surveyed: '調査完了', done_no_estimate: '工事完成（見積未提出）',
+      estimate_submitted: '見積書提出', contracted: '工事契約', completed: '工事完成',
+      canceled: '依頼取消', on_hold: '保留', stopped: '中止', closed: '終了',
+    };
+    const aoa = [[
+      '整理番号', 'エリア名', '会社名', '依頼状況', '営繕サポート受付番号', '識別番号', '対応の種別', '区分', '種別・区分',
+      '施設名称', '依頼者所属・役職', '依頼者氏名', '社宅入居前', '施策工事', '工事内容',
+      '見積依頼受付日', '郵便局等連絡日', '連絡営業日数', '最終調査指定日', '最終調査完了日', '見積書提出日', '見積提出営業日数',
+      '工事契約日', '契約金額(税込)', '現地工事開始日', '現地工事完了日', '完成書類提出日', '請求書提出日', '入金確認日',
+      '契約番号', '営繕管理番号', '局番号', '査定額(税抜)', '完成期限', '担当', '備考',
+    ]];
+    for (const c0 of cases || []) {
+      const c = poDeriveCase(c0, holidaySet);
+      aoa.push([
+        c.seq_no ?? '', c.area || '', c.company || '', STATUS_JA[c.status] || c.status, c.eizen_recv_no || '', c.estimate_no || '',
+        c.response_type || '', c.category || '', c.type_category || '',
+        c.facility_name || '', c.requester_org || '', c.requester_name || '', c.is_pre_movein ? '○' : '', c.is_policy_work ? '○' : '', c.work_content || '',
+        c.request_recv_date || '', c.first_contact_date || '', c.contact_bizdays ?? '', c.survey_designated_date || '', c.survey_done_date || '', c.estimate_submit_date || '', c.estimate_bizdays ?? '',
+        c.contract_date || '', c.contract_amount ?? '', c.work_start_date || '', c.work_done_date || '', c.completion_docs_date || '', c.invoice_date || '', c.payment_date || '',
+        c.contract_number || '', c.eizen_mgmt_no || '', c.office_number || '', c.assessed_amount ?? '', c.completion_deadline || c.completion_deadline_calc || '',
+        c.assignee_id ? (nameMap[c.assignee_id] || '') : '', c.remarks || '',
+      ]);
+    }
+    const ws = XLSX.utils.aoa_to_sheet(aoa);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, '受注一覧');
+    const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="post_office_${fy}.xlsx"`);
+    res.send(buf);
+  } catch (error) {
+    console.error('Error (post-office export):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
 
 app.listen(PORT, () => {
   console.log(`✅ Portal API running on http://localhost:${PORT}`);
