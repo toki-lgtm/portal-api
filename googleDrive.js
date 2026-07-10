@@ -93,33 +93,50 @@ export async function driveUpload({ name, buffer, mimeType, folderId }) {
     throw e;
   }
   const token = await getAccessToken();
-  const boundary = `boundary_${Date.now()}_${Math.random().toString(16).slice(2)}`;
   const metadata = { name, parents: [parent] };
+  const contentType = mimeType || 'application/octet-stream';
 
-  const body = Buffer.concat([
-    Buffer.from(`--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n`),
-    Buffer.from(JSON.stringify(metadata)),
-    Buffer.from(`\r\n--${boundary}\r\nContent-Type: ${mimeType || 'application/octet-stream'}\r\n\r\n`),
-    buffer,
-    Buffer.from(`\r\n--${boundary}--\r\n`),
-  ]);
-
-  const res = await fetch(
-    'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&supportsAllDrives=true&fields=id',
+  // 大容量でもメモリを二重に持たないよう resumable（分割）アップロードを使う。
+  //   旧実装は Buffer.concat でメタデータ＋本体を1つの巨大バッファに結合しており、
+  //   ファイルサイズの約2倍のメモリを瞬間的に消費していた（大容量で失敗する原因だった）。
+  // 1) セッション開始：メタデータだけを送り、本体のアップロード先URLを受け取る。
+  const initRes = await fetch(
+    'https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&supportsAllDrives=true&fields=id',
     {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${token}`,
-        'Content-Type': `multipart/related; boundary=${boundary}`,
+        'Content-Type': 'application/json; charset=UTF-8',
+        'X-Upload-Content-Type': contentType,
+        'X-Upload-Content-Length': String(buffer.length),
       },
-      body,
+      body: JSON.stringify(metadata),
     },
   );
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Drive へのアップロードに失敗しました（${res.status}）: ${text}`);
+  if (!initRes.ok) {
+    const text = await initRes.text().catch(() => '');
+    throw new Error(`Drive へのアップロード開始に失敗しました（${initRes.status}）: ${text}`);
   }
-  const data = await res.json();
+  const uploadUrl = initRes.headers.get('location');
+  if (!uploadUrl) {
+    throw new Error('Drive へのアップロード開始に失敗しました（アップロードURLを取得できませんでした）');
+  }
+
+  // 2) 本体を1回の PUT で送る。バッファをそのまま body に渡すため、結合コピーは発生しない。
+  const putRes = await fetch(uploadUrl, {
+    method: 'PUT',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': contentType,
+      'Content-Length': String(buffer.length),
+    },
+    body: buffer,
+  });
+  if (!putRes.ok) {
+    const text = await putRes.text().catch(() => '');
+    throw new Error(`Drive へのアップロードに失敗しました（${putRes.status}）: ${text}`);
+  }
+  const data = await putRes.json();
   return data.id;
 }
 
