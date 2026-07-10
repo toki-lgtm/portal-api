@@ -14359,6 +14359,21 @@ async function storeCardFile({ category, fileName, buffer, mimeType }) {
   return path;
 }
 
+// multer のアップロードファイル1つを「サイズ検査 → 向き補正 → 保存」し、image_ref を返す。
+// file が無ければ null。18MB 超は status 付きエラーを投げる（呼び出し側の catch で 400 相当に）。
+async function storeCardImage(file, category) {
+  if (!file) return null;
+  if (file.size > 18 * 1024 * 1024) {
+    const err = new Error('ファイルサイズが18MBを超えています');
+    err.status = 400;
+    throw err;
+  }
+  const oriented = await orientCardUpright(file.buffer, file.mimetype);
+  const ext = oriented.mimeType === 'image/jpeg' ? 'jpg' : (file.originalname.split('.').pop() || 'jpg').toLowerCase();
+  const fileName = `${Date.now()}-${uuidv4()}.${ext}`;
+  return storeCardFile({ category, fileName, buffer: oriented.buffer, mimeType: oriented.mimeType });
+}
+
 // 名刺画像の一時表示URL（既定1時間）。
 //   'drive:' 参照 → 短命JWT付き API プロキシURL（/api/card-file）。
 //   それ以外      → Supabase 署名付きURL。
@@ -14600,6 +14615,7 @@ app.get('/api/cards', requireAuth, requireCardAccess, async (req, res) => {
     const rows = await Promise.all((data || []).map(async (r) => ({
       ...r,
       image_url: r.image_ref ? await cardSignedUrl(r.image_ref, { size: 600 }) : null,
+      back_image_url: r.back_image_ref ? await cardSignedUrl(r.back_image_ref, { size: 600 }) : null,
       my_category: myLabels[r.id] || null,   // 本人だけに返す個人ラベル
     })));
     res.json(rows);
@@ -14640,6 +14656,7 @@ app.get('/api/cards/:id', requireAuth, requireCardAccess, async (req, res) => {
     res.json({
       ...data,
       image_url: data.image_ref ? await cardSignedUrl(data.image_ref, { size: 600 }) : null,
+      back_image_url: data.back_image_ref ? await cardSignedUrl(data.back_image_ref, { size: 600 }) : null,
       my_category: myLabel?.label || null,
     });
   } catch (error) {
@@ -14702,8 +14719,9 @@ app.put('/api/cards/:id/my-category', requireAuth, requireCardAccess, async (req
   }
 });
 
-// ✅ 名刺 - 新規登録（画像アップロード対応）
-app.post('/api/cards', requireAuth, requireCardAccess, upload.single('file'), async (req, res) => {
+// ✅ 名刺 - 新規登録（画像アップロード対応。表面=file / 裏面=back_file の両面対応）
+app.post('/api/cards', requireAuth, requireCardAccess,
+  upload.fields([{ name: 'file', maxCount: 1 }, { name: 'back_file', maxCount: 1 }]), async (req, res) => {
   try {
     const {
       full_name, company, department, title,
@@ -14717,20 +14735,11 @@ app.post('/api/cards', requireAuth, requireCardAccess, upload.single('file'), as
     const vis = visibility === 'private' ? 'private' : 'shared';
     const cat = (category || '').trim() || null;
 
-    let image_ref = null;
-    if (req.file) {
-      if (req.file.size > 18 * 1024 * 1024) return res.status(400).json({ error: 'ファイルサイズが18MBを超えています' });
-      // 保存前に向きを自動補正（正立画素で保存。回転時は JPEG に正規化）
-      const oriented = await orientCardUpright(req.file.buffer, req.file.mimetype);
-      const ext = oriented.mimeType === 'image/jpeg' ? 'jpg' : (req.file.originalname.split('.').pop() || 'jpg').toLowerCase();
-      const fileName = `${Date.now()}-${uuidv4()}.${ext}`;
-      image_ref = await storeCardFile({
-        category: cat,
-        fileName,
-        buffer: oriented.buffer,
-        mimeType: oriented.mimeType,
-      });
-    }
+    // 表面（file）・裏面（back_file）を保存。裏面は任意。OCR は行わず画像として保存するだけ。
+    const frontFile = req.files?.file?.[0] || null;
+    const backFile = req.files?.back_file?.[0] || null;
+    const image_ref = await storeCardImage(frontFile, cat);
+    const back_image_ref = await storeCardImage(backFile, cat);
 
     const { data, error } = await supabase
       .from('business_cards')
@@ -14750,6 +14759,7 @@ app.post('/api/cards', requireAuth, requireCardAccess, upload.single('file'), as
         note:           (note           || null),
         category:       cat,
         image_ref,
+        back_image_ref,
         visibility:     vis,
         owner_email:    ownerEmail,
       }])
@@ -14764,7 +14774,11 @@ app.post('/api/cards', requireAuth, requireCardAccess, upload.single('file'), as
     }
 
     const row = data[0];
-    res.json({ ...row, image_url: row.image_ref ? await cardSignedUrl(row.image_ref, { size: 600 }) : null });
+    res.json({
+      ...row,
+      image_url: row.image_ref ? await cardSignedUrl(row.image_ref, { size: 600 }) : null,
+      back_image_url: row.back_image_ref ? await cardSignedUrl(row.back_image_ref, { size: 600 }) : null,
+    });
   } catch (error) {
     console.error('Error (cards create):', error.message);
     res.status(error.status || 500).json({ error: error.message });
@@ -14845,8 +14859,9 @@ app.post('/api/cards/batch', requireAuth, requireCardAccess, upload.single('file
   }
 });
 
-// ✅ 名刺 - 更新（自分の名刺 or admin のみ）
-app.patch('/api/cards/:id', requireAuth, requireCardAccess, upload.single('file'), async (req, res) => {
+// ✅ 名刺 - 更新（自分の名刺 or admin のみ。表面=file / 裏面=back_file 差し替え、remove_back で裏面削除）
+app.patch('/api/cards/:id', requireAuth, requireCardAccess,
+  upload.fields([{ name: 'file', maxCount: 1 }, { name: 'back_file', maxCount: 1 }]), async (req, res) => {
   try {
     const { data: existing, error: fetchErr } = await supabase
       .from('business_cards')
@@ -14877,20 +14892,18 @@ app.patch('/api/cards/:id', requireAuth, requireCardAccess, upload.single('file'
       }
     }
 
-    if (req.file) {
-      if (req.file.size > 18 * 1024 * 1024) return res.status(400).json({ error: 'ファイルサイズが18MBを超えています' });
-      // 差し替え画像も保存前に向きを自動補正
-      const oriented = await orientCardUpright(req.file.buffer, req.file.mimetype);
-      const ext = oriented.mimeType === 'image/jpeg' ? 'jpg' : (req.file.originalname.split('.').pop() || 'jpg').toLowerCase();
-      const fileName = `${Date.now()}-${uuidv4()}.${ext}`;
-      // category はパッチ済みの値、なければ既存の値を使用
-      const effectiveCategory = ('category' in patch ? patch.category : existing.category) || null;
-      patch.image_ref = await storeCardFile({
-        category: effectiveCategory,
-        fileName,
-        buffer: oriented.buffer,
-        mimeType: oriented.mimeType,
-      });
+    // category はパッチ済みの値、なければ既存の値を使用（保存先フォルダの決定に使う）
+    const effectiveCategory = ('category' in patch ? patch.category : existing.category) || null;
+    const frontFile = req.files?.file?.[0] || null;
+    const backFile = req.files?.back_file?.[0] || null;
+
+    // 表面の差し替え
+    if (frontFile) patch.image_ref = await storeCardImage(frontFile, effectiveCategory);
+    // 裏面の差し替え / 削除（remove_back='1' で裏面を外す。差し替えが優先）
+    if (backFile) {
+      patch.back_image_ref = await storeCardImage(backFile, effectiveCategory);
+    } else if (String(req.body?.remove_back || '') === '1') {
+      patch.back_image_ref = null;
     }
 
     patch.updated_at = new Date().toISOString();
@@ -14912,7 +14925,11 @@ app.patch('/api/cards/:id', requireAuth, requireCardAccess, upload.single('file'
     }
 
     const row = data[0];
-    res.json({ ...row, image_url: row.image_ref ? await cardSignedUrl(row.image_ref, { size: 600 }) : null });
+    res.json({
+      ...row,
+      image_url: row.image_ref ? await cardSignedUrl(row.image_ref, { size: 600 }) : null,
+      back_image_url: row.back_image_ref ? await cardSignedUrl(row.back_image_ref, { size: 600 }) : null,
+    });
   } catch (error) {
     console.error('Error (cards update):', error.message);
     res.status(error.status || 500).json({ error: error.message });
@@ -15358,6 +15375,47 @@ app.post('/api/exam/admin/access', requireAuth, requireExamAccess, async (req, r
       await supabase.from('exam_subject_access').delete().eq('staff_id', staff_id).eq('subject_id', subject_id);
     }
     res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── 教材（読み物）: 公式教本の本文を章立てで読む（migration 102） ──────────
+//   権限は既存の2層(requireExamAccess + canAccessSubject)をそのまま流用。
+//   exam_materials は1000行を超える(ソムリエ=1181節)ため pagedSelect 必須。
+
+// 教材の章一覧（章ごとの節数つき）
+app.get('/api/exam/subjects/:sid/materials/chapters', requireAuth, requireExamAccess, async (req, res) => {
+  try {
+    const role = req.examRole; const sid = req.params.sid;
+    if (!(await canAccessSubject(role, sid))) return res.status(403).json({ error: 'この科目のアクセス権がありません' });
+    const rows = await pagedSelect(() => supabase
+      .from('exam_materials').select('chapter_no,chapter_title').eq('subject_id', sid).order('id'));
+    const byChap = {};
+    for (const r of rows) {
+      const c = byChap[r.chapter_no] || (byChap[r.chapter_no] = { chapter_no: r.chapter_no, title: r.chapter_title, section_count: 0 });
+      c.section_count++;
+    }
+    const chapters = Object.values(byChap).sort((a, b) => a.chapter_no - b.chapter_no);
+    res.json({ subject_id: sid, chapters });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// 指定章の全節（本文）を並び順で返す
+app.get('/api/exam/subjects/:sid/materials/chapters/:cno', requireAuth, requireExamAccess, async (req, res) => {
+  try {
+    const role = req.examRole; const sid = req.params.sid;
+    if (!(await canAccessSubject(role, sid))) return res.status(403).json({ error: 'この科目のアクセス権がありません' });
+    const cno = Number(req.params.cno);
+    const { data, error } = await supabase
+      .from('exam_materials')
+      .select('id,chapter_no,chapter_title,section_no,heading,body,src_page_start,src_page_end')
+      .eq('subject_id', sid).eq('chapter_no', cno).order('section_no');
+    if (error) throw error;
+    if (!data || data.length === 0) return res.status(404).json({ error: '章が見つかりません' });
+    res.json({
+      subject_id: sid, chapter_no: cno,
+      chapter_title: data[0].chapter_title,
+      sections: data,
+    });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
