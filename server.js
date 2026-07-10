@@ -14017,6 +14017,66 @@ async function requireCardAdmin(req, res, next) {
   }
 }
 
+// ── 名刺OCR用 Gemini 呼び出しヘルパー（思考OFF＋タイムアウト＋1回リトライ）──
+// 名刺の OCR/向き判定は定型抽出なので思考モードを無効化する（高速化＋思考ループ暴走の防止）。
+// AbortController で上限時間を設け、詰まっても無限待ちにならないようにする。
+// タイムアウト/5xx は1回だけ再試行し、それでも駄目なら status 付きエラーを投げる。
+async function geminiCardFetch(body, { timeoutMs = 45000, retries = 1 } = {}) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+  // 既存の generationConfig を尊重しつつ、思考モードを無効化して上書き
+  const payload = {
+    ...body,
+    generationConfig: { ...(body.generationConfig || {}), thinkingConfig: { thinkingBudget: 0 } },
+  };
+  let lastErr;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+    try {
+      const resp = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+        signal: ctrl.signal,
+      });
+      if (!resp.ok) {
+        const t = await resp.text();
+        const e = new Error(`Gemini API エラー (${resp.status}): ${t.slice(0, 300)}`);
+        e.status = resp.status >= 500 ? 502 : resp.status;
+        if (resp.status >= 500 && attempt < retries) { lastErr = e; continue; } // 5xx は再試行
+        throw e;
+      }
+      return await resp.json();
+    } catch (err) {
+      lastErr = err;
+      const aborted = err.name === 'AbortError';
+      if (attempt < retries && (aborted || err.status === 502)) continue; // タイムアウト/5xx は再試行
+      if (aborted) {
+        const e = new Error('Gemini 応答がタイムアウトしました。もう一度お試しください。');
+        e.status = 504;
+        throw e;
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  throw lastErr;
+}
+
+// Gemini へ送る前に画像を縮小（大きな写真での遅延・タイムアウトを防ぐ）。
+// 長辺1600pxに収める。名刺文字の可読性は保ちつつ、スマホ実寸(数千px)を大幅に削減。
+async function shrinkForGemini(buffer) {
+  try {
+    return await sharp(buffer)
+      .resize({ width: 1600, height: 1600, fit: 'inside', withoutEnlargement: true })
+      .jpeg({ quality: 85 })
+      .toBuffer();
+  } catch {
+    return buffer; // 縮小失敗時は原本のまま送る（無害フォールバック）
+  }
+}
+
 // ── Gemini 名刺 OCR 関数（extractCertificate と同型）────────────
 // 名刺画像を Gemini で解析し、各フィールドを構造化して返す。
 async function extractBusinessCard(buffer, mimeType) {
@@ -14025,6 +14085,7 @@ async function extractBusinessCard(buffer, mimeType) {
     e.status = 503;
     throw e;
   }
+  buffer = await shrinkForGemini(buffer); // 送信前に縮小（遅延・タイムアウト対策）
   const prompt = [
     'これは日本のビジネス名刺の画像です。',
     '記載内容を読み取り、次の項目をJSONで返してください。',
@@ -14077,18 +14138,7 @@ async function extractBusinessCard(buffer, mimeType) {
     },
   };
 
-  const resp = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  if (!resp.ok) {
-    const t = await resp.text();
-    const e = new Error(`Gemini API エラー (${resp.status}): ${t.slice(0, 300)}`);
-    e.status = 502;
-    throw e;
-  }
-  const json = await resp.json();
+  const json = await geminiCardFetch(body);
   const text = json?.candidates?.[0]?.content?.parts?.[0]?.text;
   if (!text) throw new Error('Gemini から有効な応答が得られませんでした');
   let parsed;
@@ -14120,6 +14170,7 @@ async function extractBusinessCards(buffer, mimeType) {
     e.status = 503;
     throw e;
   }
+  buffer = await shrinkForGemini(buffer); // 送信前に縮小（遅延・タイムアウト対策）
   const prompt = [
     'これは1枚の画像で、中に日本のビジネス名刺が1枚以上写っています（机に並べた複数枚など）。',
     '写っている名刺を1枚ずつすべて検出し、各名刺について次の項目を読み取って配列で返してください。',
@@ -14179,18 +14230,7 @@ async function extractBusinessCards(buffer, mimeType) {
     },
   };
 
-  const resp = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  if (!resp.ok) {
-    const t = await resp.text();
-    const e = new Error(`Gemini API エラー (${resp.status}): ${t.slice(0, 300)}`);
-    e.status = 502;
-    throw e;
-  }
-  const json = await resp.json();
+  const json = await geminiCardFetch(body);
   const text = json?.candidates?.[0]?.content?.parts?.[0]?.text;
   if (!text) throw new Error('Gemini から有効な応答が得られませんでした');
   let parsed;
@@ -14267,9 +14307,7 @@ async function judgeCardRotation(jpegBuffer) {
       responseSchema: { type: 'OBJECT', properties: { rotate_cw: { type: 'INTEGER' }, confidence: { type: 'NUMBER' } }, required: ['rotate_cw'] },
     },
   };
-  const resp = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-  if (!resp.ok) throw new Error(`Gemini ${resp.status}`);
-  const json = await resp.json();
+  const json = await geminiCardFetch(body, { timeoutMs: 30000 });
   const p = JSON.parse(json?.candidates?.[0]?.content?.parts?.[0]?.text || '{}');
   const valid = [0, 90, 180, 270];
   return { rotate_cw: valid.includes(Number(p.rotate_cw)) ? Number(p.rotate_cw) : 0, confidence: Number(p.confidence) || 0 };
