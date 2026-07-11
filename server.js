@@ -14456,12 +14456,13 @@ app.get('/api/cards/my-categories', requireAuth, requireCardAccess, async (req, 
   }
 });
 
-// 名刺の全社カテゴリ（17分類）。カテゴリ提案の検証に使う。
+// 名刺の全社カテゴリ（18分類）。カテゴリ提案の検証に使う。
 const CARD_CATEGORIES = [
   '建設・土木', '設計・コンサル・測量', '専門工事・下請', '建設資材・商社',
   '機械・重機・レンタル', '電気・通信・設備', 'IT・システム', '官公庁・行政',
   '金融・保険', '運輸・物流', '教育・学校', '不動産',
-  '士業（税理士・法務等）', '飲食・宿泊・サービス', '医療・福祉', '水産・漁業', 'その他',
+  '士業（税理士・法務等）', '飲食・宿泊・サービス', '医療・福祉', '水産・漁業',
+  '団体・組合・NPO', 'その他',
 ];
 
 // ✅ 名刺 - 会社名からカテゴリを提案
@@ -14589,8 +14590,8 @@ app.get('/api/cards', requireAuth, requireCardAccess, async (req, res) => {
     } else if (scope === 'shared') {
       query = query.eq('visibility', 'shared');
     } else {
-      // 自分の名刺 または 共有名刺
-      query = query.or(`owner_email.eq.${email},visibility.eq.shared`);
+      // 自分の名刺 または 全社共有 または 自分が限定共有先(shared_with)に含まれる名刺
+      query = query.or(`owner_email.eq.${email},visibility.eq.shared,shared_with.cs.{"${email}"}`);
     }
 
     if (q) {
@@ -14641,8 +14642,9 @@ app.get('/api/cards/:id', requireAuth, requireCardAccess, async (req, res) => {
     const email = String(req.user.email || '').toLowerCase();
     const isOwner = data.owner_email === email;
     const isShared = data.visibility === 'shared';
+    const isSharedWith = Array.isArray(data.shared_with) && data.shared_with.includes(email);
     const isAdmin = req.cardRole.role === 'admin';
-    if (!isOwner && !isShared && !isAdmin) {
+    if (!isOwner && !isShared && !isSharedWith && !isAdmin) {
       return res.status(403).json({ error: 'この名刺を閲覧する権限がありません' });
     }
 
@@ -14678,7 +14680,7 @@ app.put('/api/cards/:id/my-category', requireAuth, requireCardAccess, async (req
     // 閲覧権限チェック（共有 or 自分の or admin のみラベル付与可）
     const { data: card, error: cardErr } = await supabase
       .from('business_cards')
-      .select('id, owner_email, visibility')
+      .select('id, owner_email, visibility, shared_with')
       .eq('id', cardId)
       .eq('is_active', true)
       .maybeSingle();
@@ -14687,8 +14689,9 @@ app.put('/api/cards/:id/my-category', requireAuth, requireCardAccess, async (req
 
     const isOwner = card.owner_email === email;
     const isShared = card.visibility === 'shared';
+    const isSharedWith = Array.isArray(card.shared_with) && card.shared_with.includes(email);
     const isAdmin = req.cardRole.role === 'admin';
-    if (!isOwner && !isShared && !isAdmin) {
+    if (!isOwner && !isShared && !isSharedWith && !isAdmin) {
       return res.status(403).json({ error: 'この名刺にラベルを付ける権限がありません' });
     }
 
