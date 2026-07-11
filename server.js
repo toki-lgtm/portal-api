@@ -16440,6 +16440,348 @@ app.delete('/api/post-office/submissions/:id', requireAuth, requirePostOfficeAdm
   }
 });
 
+// ============================================================
+// 郵便局 年間指名 — 案件添付ファイル / 提出書類チェックリスト / AI自動起票（Phase 3）
+//   工事管理（submission_files / auto-file / extract-info）と同方式を郵便局向けに流用。
+//   - 添付本体は共有ドライブへ（07.郵便局年間指名/案件添付/<年度>/<整理番号_施設名>/）。
+//     DB(post_office_case_files) は参照(drive:<id>)＋メタ＋書類種別(doc_type)のみ。
+//   - フェーズ別チェックリストは doc_type の有無から算出（別マスタは作らない）。
+//   - AI起票は 見積依頼メール/PDF を Gemini で読み取り、新規案件フォームをプリフィル。
+// ============================================================
+
+// 標準提出書類の語彙（doc_type）とフェーズ。フェーズ別チェックリストの見出し順＝PO_PHASES。
+const PO_PHASES = ['見積', '契約', '施工', '完成', '請求'];
+const PO_DOC_TYPES = [
+  { name: '見積書',                 phase: '見積' },
+  { name: '石綿事前調査(様式1-3)',  phase: '見積' },
+  { name: '現地調査写真',           phase: '見積' },
+  { name: '注文書・請書',           phase: '契約' },
+  { name: '施工計画書',             phase: '施工' },
+  { name: '工事写真帳',             phase: '施工' },
+  { name: '完成届・検査調書・引渡書', phase: '完成' },
+  { name: '請求書',                 phase: '請求' },
+];
+const PO_DOC_TYPE_NAMES = [...PO_DOC_TYPES.map((t) => t.name), 'その他'];
+
+// 添付ファイル群 → フェーズ別チェックリスト（提出済/未提出）。'その他' は一覧のみでチェック対象外。
+function poBuildChecklist(files) {
+  const counts = {};
+  for (const f of files || []) counts[f.doc_type] = (counts[f.doc_type] || 0) + 1;
+  return PO_PHASES.map((phase) => ({
+    phase,
+    items: PO_DOC_TYPES.filter((t) => t.phase === phase).map((t) => ({
+      doc_type: t.name, count: counts[t.name] || 0, present: (counts[t.name] || 0) > 0,
+    })),
+  }));
+}
+
+// 案件添付を共有ドライブへ保存し参照文字列(drive:<id> もしくはバケットパス)を返す。
+//   保存先: （共有ドライブ）/07.郵便局年間指名/案件添付/<年度>/<整理番号_施設名>/
+async function storePostOfficeFile({ fiscalYear, seqNo, facilityName, fileName, buffer, mimeType }) {
+  if (driveConfigured()) {
+    const label = `${seqNo != null ? String(seqNo).padStart(3, '0') + '_' : ''}${facilityName || '案件'}`;
+    const folderId = await ensureFolderPath([
+      '07.郵便局年間指名', '案件添付', String(fiscalYear || '未設定'), sanitizeDriveSeg(label),
+    ], SHARED_DRIVE_ROOT_ID);
+    const fileId = await driveUpload({ name: fileName, buffer, mimeType, folderId });
+    return `drive:${fileId}`;
+  }
+  await ensureConstructionBucket();
+  const path = `post-office/${Date.now()}-${uuidv4()}-${sanitizeDriveSeg(fileName)}`;
+  const { error } = await supabase.storage.from(CONSTRUCTION_BUCKET).upload(path, buffer, { contentType: mimeType });
+  if (error) throw error;
+  return path;
+}
+
+// 一時表示/DL用URL。drive: 参照は短命JWT付きの API プロキシ、その他は Supabase 署名URL。
+async function postOfficeFileSignedUrl(ref, expiresIn = 3600) {
+  if (!ref) return null;
+  if (String(ref).startsWith('drive:')) {
+    const fileId = String(ref).slice('drive:'.length);
+    const token = jwt.sign({ fileId, kind: 'post-office' }, JWT_SECRET, { expiresIn });
+    const base = process.env.PUBLIC_API_URL || 'https://portal-api-hhlx.onrender.com';
+    return `${base}/api/post-office-file?t=${encodeURIComponent(token)}`;
+  }
+  const { data } = await supabase.storage.from(CONSTRUCTION_BUCKET).createSignedUrl(ref, expiresIn);
+  return data?.signedUrl || null;
+}
+
+// 署名トークンで保護された Drive ファイルプロキシ（認証ヘッダ無しで開ける）。
+app.get('/api/post-office-file', async (req, res) => {
+  try {
+    const token = req.query.t;
+    if (!token) return res.status(400).send('missing token');
+    let payload;
+    try { payload = jwt.verify(token, JWT_SECRET); } catch { return res.status(401).send('invalid or expired token'); }
+    if (payload.kind !== 'post-office' || !payload.fileId) return res.status(400).send('bad token');
+    const { buffer, contentType } = await driveDownload(payload.fileId);
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('Cache-Control', 'private, max-age=600');
+    res.send(buffer);
+  } catch (error) {
+    console.error('Error (post-office-file proxy):', error.message);
+    res.status(error.status || 500).send(error.message);
+  }
+});
+
+// 1ファイルの内容＋ファイル名から、郵便局の標準提出書類(doc_type)を判定（Gemini）。
+async function classifyPostOfficeDoc({ fileName, buffer, mimeType }) {
+  if (!GEMINI_API_KEY) return null;
+  const list = PO_DOC_TYPES.map((t) => t.name).join(' / ');
+  const prompt = [
+    'これは日本郵便の年間事前指名（郵便局・社宅の小規模修繕）で扱う書類の1つです。',
+    'ファイル名と内容（PDF/画像）から、この書類が次の「標準提出書類」のどれに当たるか1つだけ判定してください。',
+    `書類種別: ${list} / その他`,
+    '判定の目安: 見積書=見積書 / 石綿の事前調査結果報告(様式1-3)=石綿事前調査(様式1-3) / 現地調査・現況の写真=現地調査写真 / ',
+    '注文書・請書・契約書=注文書・請書 / 施工計画書=施工計画書 / 工事の施工前後や工事中の写真帳=工事写真帳 / ',
+    '完成届・完成検査調書・引渡書=完成届・検査調書・引渡書 / 請求書=請求書。どれにも当てはまらなければ その他。',
+    '出力JSON:',
+    '- doc_type: 上記のいずれかの文字列（完全一致）',
+    '- confidence: 判定の確信度 0.0〜1.0',
+    '- reason: 判定理由を簡潔に（20字程度）',
+    `ファイル名: ${fileName || '(不明)'}`,
+  ].join('\n');
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+  const body = {
+    contents: [{ parts: [
+      { text: prompt },
+      { inlineData: { mimeType: mimeType || 'application/pdf', data: buffer.toString('base64') } },
+    ] }],
+    generationConfig: {
+      temperature: 0,
+      responseMimeType: 'application/json',
+      responseSchema: {
+        type: 'OBJECT',
+        properties: {
+          doc_type: { type: 'STRING' }, confidence: { type: 'NUMBER' }, reason: { type: 'STRING' },
+        },
+        required: ['doc_type'],
+      },
+    },
+  };
+  const resp = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  if (!resp.ok) {
+    const t = await resp.text();
+    const e = new Error(`Gemini API エラー (${resp.status}): ${t.slice(0, 300)}`); e.status = 502; throw e;
+  }
+  const json = await resp.json();
+  const text = json?.candidates?.[0]?.content?.parts?.[0]?.text;
+  if (!text) return null;
+  let p; try { p = JSON.parse(text); } catch { return null; }
+  const dt = PO_DOC_TYPE_NAMES.includes((p.doc_type || '').trim()) ? p.doc_type.trim() : 'その他';
+  return {
+    doc_type: dt,
+    confidence: typeof p.confidence === 'number' ? Math.max(0, Math.min(1, p.confidence)) : null,
+    reason: (p.reason || '').trim(),
+  };
+}
+
+// AI起票用の書類選定（見積依頼系を優先。PDF/画像・合計上限内で最大3件）。
+function poSelectDocsForExtract(files) {
+  const KW = ['見積', '依頼', '修繕', '緊急', '調査', '営繕', '局', '社宅'];
+  const cand = (files || []).filter((f) => geminiAnalyzable(f.mimetype, f.size));
+  const scored = cand.map((f) => {
+    const nm = f.originalname || '';
+    let s = 0; for (const k of KW) if (nm.includes(k)) s += 2;
+    return { f, s };
+  }).sort((a, b) => b.s - a.s || (a.f.size || 0) - (b.f.size || 0));
+  const picked = []; let total = 0;
+  for (const { f } of scored) {
+    if (picked.length >= 3) break;
+    if (total + (f.size || 0) > CONS_AI_EXTRACT_TOTAL) continue;
+    picked.push(f); total += (f.size || 0);
+  }
+  if (!picked.length && cand.length) picked.push([...cand].sort((a, b) => (a.size || 0) - (b.size || 0))[0]);
+  return picked;
+}
+
+// 見積依頼メール/緊急修繕依頼書 等から、郵便局案件の登録項目を構造化抽出（プレフィル用・DB保存なし）。
+async function extractPostOfficeInfo(files) {
+  if (!GEMINI_API_KEY) { const e = new Error('GEMINI_API_KEY が未設定です。'); e.status = 503; throw e; }
+  const prompt = [
+    'これは日本郵便の年間事前指名（郵便局・社宅の小規模修繕）における「見積依頼メール」や「緊急修繕依頼書」などです。',
+    '記載内容を読み取り、案件登録に必要な項目を JSON で返してください。読み取れない項目は空文字にし、推測で埋めないこと。',
+    '- facility_name: 施設名称（郵便局名／社宅名）',
+    '- response_type: 対応の種別。「一般」「緊急」のいずれか（緊急・至急の記載があれば緊急）',
+    '- category: 区分。「旧郵便事業」「旧郵便局」「社宅」のいずれか（判別できなければ空文字）',
+    '- eizen_recv_no: 営繕サポート受付番号（7桁の番号があれば）',
+    '- estimate_no: 識別番号／見積発行番号（例 25-0001 の形式があれば）',
+    '- requester_org: 依頼者の所属・役職',
+    '- requester_name: 依頼者の氏名',
+    '- work_content: 工事内容（依頼された修繕の内容を簡潔に）',
+    '- request_recv_date: 見積依頼を受け付けた日（YYYY-MM-DD）',
+    '- survey_designated_date: 指定された現地調査日（YYYY-MM-DD。あれば）',
+    '- remarks: その他の特記事項（任意）',
+    '日付が和暦（令和・平成等）の場合は西暦へ変換。時刻が併記されていても日付のみ抽出。',
+  ].join('\n');
+  const parts = [{ text: prompt }];
+  for (const f of files) parts.push({ inlineData: { mimeType: f.mimetype || 'application/pdf', data: f.buffer.toString('base64') } });
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+  const body = {
+    contents: [{ parts }],
+    generationConfig: {
+      temperature: 0,
+      responseMimeType: 'application/json',
+      responseSchema: {
+        type: 'OBJECT',
+        properties: {
+          facility_name: { type: 'STRING' }, response_type: { type: 'STRING' }, category: { type: 'STRING' },
+          eizen_recv_no: { type: 'STRING' }, estimate_no: { type: 'STRING' },
+          requester_org: { type: 'STRING' }, requester_name: { type: 'STRING' }, work_content: { type: 'STRING' },
+          request_recv_date: { type: 'STRING' }, survey_designated_date: { type: 'STRING' }, remarks: { type: 'STRING' },
+        },
+      },
+    },
+  };
+  const resp = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  if (!resp.ok) {
+    const t = await resp.text();
+    const e = new Error(`Gemini API エラー (${resp.status}): ${t.slice(0, 300)}`); e.status = 502; throw e;
+  }
+  const json = await resp.json();
+  const text = json?.candidates?.[0]?.content?.parts?.[0]?.text;
+  if (!text) throw new Error('Gemini から有効な応答が得られませんでした');
+  let p; try { p = JSON.parse(text); } catch { throw new Error('Gemini 応答の解析に失敗しました'); }
+  const rtype = ['一般', '緊急'].includes((p.response_type || '').trim()) ? p.response_type.trim() : null;
+  const cat = ['旧郵便事業', '旧郵便局', '社宅'].includes((p.category || '').trim()) ? p.category.trim() : null;
+  return {
+    facility_name: (p.facility_name || '').trim(),
+    response_type: rtype,
+    category: cat,
+    eizen_recv_no: (p.eizen_recv_no || '').trim(),
+    estimate_no: (p.estimate_no || '').trim(),
+    requester_org: (p.requester_org || '').trim(),
+    requester_name: (p.requester_name || '').trim(),
+    work_content: (p.work_content || '').trim(),
+    request_recv_date: cleanIsoDate(p.request_recv_date),
+    survey_designated_date: cleanIsoDate(p.survey_designated_date),
+    remarks: (p.remarks || '').trim(),
+  };
+}
+
+// ✅ 郵便局 - 案件の添付ファイル一覧＋提出書類チェックリスト
+app.get('/api/post-office/cases/:id/files', requireAuth, requirePostOfficeAccess, async (req, res) => {
+  try {
+    const { data: c } = await supabase
+      .from('post_office_cases').select('id').eq('id', req.params.id).eq('is_active', true).maybeSingle();
+    if (!c) return res.status(404).json({ error: '案件が見つかりません' });
+    const { data, error } = await supabase
+      .from('post_office_case_files').select('*').eq('case_id', req.params.id).order('created_at', { ascending: true });
+    if (error) throw error;
+    const files = await Promise.all((data || []).map(async (f) => ({
+      id: f.id, doc_type: f.doc_type, file_name: f.file_name, mime_type: f.mime_type, size_bytes: f.size_bytes,
+      source: f.source, ai_classified: f.ai_classified, ai_confidence: f.ai_confidence, ai_note: f.ai_note,
+      uploaded_by: f.uploaded_by, created_at: f.created_at, url: await postOfficeFileSignedUrl(f.file_ref),
+    })));
+    res.json({ files, checklist: poBuildChecklist(data || []), doc_types: PO_DOC_TYPE_NAMES });
+  } catch (error) {
+    console.error('Error (post-office files list):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 郵便局 - 案件へファイル添付（共有ドライブへ保存）。
+//    body: doc_type?（未指定かつAI可能なら Gemini が自動判定＝source:'auto'）
+app.post('/api/post-office/cases/:id/files', requireAuth, requirePostOfficeAccess, upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'file フィールドが必要です' });
+    const { data: c } = await supabase
+      .from('post_office_cases').select('id, fiscal_year, seq_no, facility_name').eq('id', req.params.id).eq('is_active', true).maybeSingle();
+    if (!c) return res.status(404).json({ error: '案件が見つかりません' });
+
+    const fileName = decodeUploadName(req.file.originalname);
+    if (await isEncryptedPdf(req.file.buffer, req.file.mimetype, fileName)) {
+      return res.status(400).json({ error: ENCRYPTED_PDF_MSG });
+    }
+
+    let docType = (req.body?.doc_type || '').trim();
+    let classification = null;
+    if (!docType && GEMINI_API_KEY && geminiAnalyzable(req.file.mimetype, req.file.size)) {
+      try { classification = await classifyPostOfficeDoc({ fileName, buffer: req.file.buffer, mimeType: req.file.mimetype }); }
+      catch (e) { console.error('po classify:', e.message); }
+      if (classification?.doc_type) docType = classification.doc_type;
+    }
+    if (!PO_DOC_TYPE_NAMES.includes(docType)) docType = 'その他';
+
+    const ref = await storePostOfficeFile({
+      fiscalYear: c.fiscal_year, seqNo: c.seq_no, facilityName: c.facility_name,
+      fileName, buffer: req.file.buffer, mimeType: req.file.mimetype,
+    });
+    const { data: row, error } = await supabase.from('post_office_case_files').insert([{
+      case_id: c.id, doc_type: docType, file_ref: ref,
+      file_name: fileName, mime_type: req.file.mimetype, size_bytes: req.file.size,
+      source: classification ? 'auto' : 'manual', ai_classified: !!classification,
+      ai_confidence: classification?.confidence ?? null, ai_note: classification?.reason || null,
+      uploaded_by: req.user.email,
+    }]).select('*').single();
+    if (error) throw error;
+    const url = await postOfficeFileSignedUrl(row.file_ref);
+    res.json({
+      file: {
+        id: row.id, doc_type: row.doc_type, file_name: row.file_name, mime_type: row.mime_type,
+        size_bytes: row.size_bytes, source: row.source, ai_classified: row.ai_classified,
+        ai_confidence: row.ai_confidence, ai_note: row.ai_note, url,
+      },
+      classification,
+    });
+  } catch (error) {
+    console.error('Error (post-office file upload):', error.message);
+    res.status(error.status || 500).json({ error: error.message });
+  }
+});
+
+// ✅ 郵便局 - 添付ファイルの書類種別を変更（誤判定の修正用）。
+app.put('/api/post-office/case-files/:fileId', requireAuth, requirePostOfficeAccess, async (req, res) => {
+  try {
+    const docType = (req.body?.doc_type || '').trim();
+    if (!PO_DOC_TYPE_NAMES.includes(docType)) return res.status(400).json({ error: '不正な書類種別です' });
+    const { data, error } = await supabase
+      .from('post_office_case_files').update({ doc_type: docType }).eq('id', req.params.fileId).select('id');
+    if (error) throw error;
+    if (!data || !data.length) return res.status(404).json({ error: 'ファイルが見つかりません' });
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error (post-office file retype):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 郵便局 - 添付ファイルの削除（Driveはゴミ箱へ）。
+app.delete('/api/post-office/case-files/:fileId', requireAuth, requirePostOfficeAccess, async (req, res) => {
+  try {
+    const { data: f, error: fErr } = await supabase
+      .from('post_office_case_files').select('*').eq('id', req.params.fileId).maybeSingle();
+    if (fErr) throw fErr;
+    if (!f) return res.status(404).json({ error: 'ファイルが見つかりません' });
+    if (String(f.file_ref).startsWith('drive:')) {
+      try { await driveTrash(String(f.file_ref).slice('drive:'.length)); } catch (e) { console.error('po drive trash:', e.message); }
+    } else {
+      try { await supabase.storage.from(CONSTRUCTION_BUCKET).remove([f.file_ref]); } catch { /* noop */ }
+    }
+    await supabase.from('post_office_case_files').delete().eq('id', req.params.fileId);
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error (post-office file delete):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 郵便局 - 見積依頼メール/PDFから案件情報を AI 抽出（新規登録のプレフィル用。DB保存なし）
+app.post('/api/post-office/extract-info', requireAuth, requirePostOfficeAccess, upload.array('files', 20), async (req, res) => {
+  try {
+    const files = req.files || [];
+    if (!files.length) return res.status(400).json({ error: 'files（書類）が必要です' });
+    for (const f of files) f.originalname = decodeUploadName(f.originalname);
+    const picked = poSelectDocsForExtract(files);
+    if (!picked.length) return res.status(400).json({ error: 'AIで読み取れる書類（PDF/画像）が見つかりませんでした。手入力で登録してください。' });
+    const fields = await extractPostOfficeInfo(picked);
+    res.json({ fields, used_files: picked.map((f) => f.originalname) });
+  } catch (error) {
+    console.error('Error (post-office extract-info):', error.message);
+    res.status(error.status || 500).json({ error: error.message });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`✅ Portal API running on http://localhost:${PORT}`);
   // 本番(Render)のみ起動。ローカル開発では回さない（二重抽出・不要なAPI消費を防ぐ）

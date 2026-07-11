@@ -91,3 +91,5 @@
 | 049 | `049_company_calendar` | 会社カレンダー（公休・計画有給） | ✅ 適用済 |
 | 050 | `050_inspection_checklist_reseed` | 検査チェックリスト 再seed（データ・冪等） | ✅ 適用済 |
 | 051 | `051_schema_migrations_ledger` | schema_migrations 記録テーブル新設＋既存遡及記録 | ✅ 適用済 |
+| … | (052〜105 は schema_migrations テーブルが正。この表は 051 以降未追記) | — | — |
+| 106 | `106_post_office_case_files` | 郵便局 案件添付ファイル＋提出書類チェックリスト | ⬜ 未適用（SQL Editorで実行） |
