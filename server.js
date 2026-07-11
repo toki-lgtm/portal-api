@@ -14456,10 +14456,15 @@ app.get('/api/cards/categories', requireAuth, requireCardAccess, async (req, res
     const { data, error } = await supabase
       .from('card_categories')
       .select('name')
-      .eq('user_email', email)
-      .order('name', { ascending: true });
+      .eq('user_email', email);
     if (error) throw error;
-    res.json({ categories: (data || []).map((r) => r.name) });
+    // 建設隣接順（中原建設＝建築・土木基準。「その他」は最後）で返す。未知名はその手前で五十音順。
+    const names = (data || []).map((r) => r.name);
+    names.sort((a, b) => {
+      const ra = cardCategoryRank(a), rb = cardCategoryRank(b);
+      return ra !== rb ? ra - rb : a.localeCompare(b, 'ja');
+    });
+    res.json({ categories: names });
   } catch (error) {
     console.error('Error (cards categories):', error.message);
     res.status(500).json({ error: error.message });
@@ -14495,6 +14500,20 @@ const CARD_CATEGORIES = [
   '士業（税理士・法務等）', '飲食・宿泊・サービス', '医療・福祉', '水産・漁業',
   '団体・組合・NPO', 'その他',
 ];
+
+// カテゴリの表示順（中原建設＝建築・土木ゼネコンに隣接する業種から順に。「その他」は最後）
+const CARD_CATEGORY_DISPLAY_ORDER = [
+  '建設・土木', '設計・コンサル・測量', '専門工事・下請', '建設資材・商社',
+  '機械・重機・レンタル', '電気・通信・設備', '不動産', '官公庁・行政',
+  '金融・保険', '士業（税理士・法務等）', 'IT・システム', '運輸・物流',
+  '団体・組合・NPO', '教育・学校', '医療・福祉', '水産・漁業',
+  '飲食・宿泊・サービス', 'その他',
+];
+function cardCategoryRank(name) {
+  if (name === 'その他') return 9999;
+  const i = CARD_CATEGORY_DISPLAY_ORDER.indexOf(name);
+  return i >= 0 ? i : 9000;
+}
 
 // ✅ 名刺 - 会社名からカテゴリを提案
 //    POST /api/cards/suggest-category   body: { company }
