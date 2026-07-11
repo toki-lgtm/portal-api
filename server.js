@@ -6504,7 +6504,7 @@ app.get('/api/workscope/agent/commands', requireDevice, async (req, res) => {
 app.post('/api/workscope/agent/commands/:id/result', requireDevice, async (req, res) => {
   try {
     const status = req.body?.status === 'error' ? 'error' : 'done';
-    const result = String(req.body?.result || '').slice(0, 2000);
+    const result = String(req.body?.result || '').slice(0, 8000); // pull_log のログ末尾を収めるため拡大
     const { error } = await supabase.from('workscope_commands')
       .update({ status, result, done_at: new Date().toISOString() })
       .eq('id', req.params.id)
@@ -6513,6 +6513,35 @@ app.post('/api/workscope/agent/commands/:id/result', requireDevice, async (req, 
     res.json({ ok: true });
   } catch (error) {
     console.error('Error (workscope agent result):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ WorkScope - エージェント自己更新用のスクリプト配布（要 device_token）
+//    self_update 命令を受けた端末が、最新リリース zip の src/*.py, *.ps1 を取得する。
+//    端末固有ファイル（identity.json / agent_config.json / config.json）は配らない。
+app.get('/api/workscope/agent/payload', requireDevice, async (req, res) => {
+  try {
+    const release = await getLatestWorkscopeRelease();
+    if (!release) return res.status(404).json({ error: 'リリース未登録' });
+    const { data: blob, error: dErr } = await supabase.storage
+      .from(APP_DOWNLOADS_BUCKET)
+      .download(release.file_path);
+    if (dErr) throw dErr;
+    const zipBuf = Buffer.from(await blob.arrayBuffer());
+    const zip = await JSZip.loadAsync(zipBuf);
+    const files = {};
+    const EXCLUDE = new Set(['identity.json', 'agent_config.json', 'config.json']);
+    await Promise.all(Object.values(zip.files).map(async (entry) => {
+      if (entry.dir) return;
+      const base = entry.name.split('/').pop();
+      if (!/\.(py|ps1)$/i.test(base)) return;
+      if (EXCLUDE.has(base)) return;
+      files[base] = await entry.async('string');
+    }));
+    res.json({ version: release.version, files });
+  } catch (error) {
+    console.error('Error (workscope agent payload):', error.message);
     res.status(500).json({ error: error.message });
   }
 });
@@ -6588,6 +6617,7 @@ app.get('/api/admin/workscope/status', requireAuth, requireAdmin, async (req, re
         last_send_at: s.last_send_at ?? null,
         last_send_date: s.last_send_date ?? null,
         agent_version: s.agent_version ?? null,
+        extra: s.extra ?? null, // 端末インベントリ（Python版/空き容量/常駐生死/最終エラー）
         alerts,
       });
     }
@@ -6608,7 +6638,8 @@ app.get('/api/admin/workscope/status', requireAuth, requireAdmin, async (req, re
 app.post('/api/admin/workscope/commands', requireAuth, requireAdmin, async (req, res) => {
   try {
     const { device_id, cmd, args } = req.body || {};
-    const ALLOWED = ['send', 'resend', 'resend_range', 'catchup', 'ping'];
+    const ALLOWED = ['send', 'resend', 'resend_range', 'catchup', 'ping', 'retask', 'self_update',
+      'pull_log', 'restart_services', 'uninstall', 'set_config'];
     if (!device_id || !ALLOWED.includes(cmd)) {
       return res.status(400).json({ error: 'device_id と正しい cmd を指定してください' });
     }
