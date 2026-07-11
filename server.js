@@ -16225,6 +16225,187 @@ app.get('/api/post-office/export', requireAuth, requirePostOfficeAccess, async (
   }
 });
 
+// ── 郵便局 様式1-6 正式自動生成（Phase 2）───────────────────────────
+//   ハイブリッド郵便受け方式（見積比較・施工計画書と同じ）。ポータルは post_office_cases から
+//   入力JSON(meta+cases)を組み立て 07.郵便局年間指名\_queue に投入。このPC常駐 po_agent.py が
+//   po_gen.py で正式様式(数式・色分け・集計付き)を生成し回収。ここは投入・状態・DLを担う。
+const PO_QUEUE_SEGMENTS = ['07.郵便局年間指名', '_queue'];
+
+const PO_STATUS_JA = {
+  estimate_drafting: '見積作成中', surveyed: '調査完了', done_no_estimate: '工事完成（見積未提出）',
+  estimate_submitted: '見積書提出', contracted: '工事契約', completed: '工事完成',
+  canceled: '依頼取消', on_hold: '保留', stopped: '中止', closed: '終了',
+};
+
+// area「長崎県対馬エリア」→ ['長崎県','対馬エリア']（県が無ければ後半空）
+function poSplitArea(area) {
+  if (!area) return ['', ''];
+  const i = area.indexOf('県');
+  return i >= 0 ? [area.slice(0, i + 1), area.slice(i + 1)] : [area, ''];
+}
+
+// post_office_cases 群 → po_gen が食う入力JSON（フィールド名はDBカラム名のまま／status=コード）。
+function buildPoMaster(cases, opts) {
+  const first = cases[0] || {};
+  const [pref, areaName] = poSplitArea(opts.area || first.area || '長崎県対馬エリア');
+  return {
+    meta: {
+      prefecture: pref,
+      area_name: areaName,
+      company: opts.company || first.company || '㈱中原建設',
+      branch: opts.branch || null,
+      report_date: opts.report_date || null,
+    },
+    // po_gen は seq_no 昇順に並べ、未指定なら行番号を採番する。余分な派生列は無視される。
+    cases,
+  };
+}
+
+async function findPoOutput(folderId) {
+  const kids = await driveListChildren(folderId);
+  return kids.find((k) => /\.xlsx$/i.test(k.name)) || null;
+}
+
+// ✅ 郵便局 - 生成ジョブ一覧（年度ごと）。
+app.get('/api/post-office/submissions', requireAuth, requirePostOfficeAccess, async (req, res) => {
+  try {
+    const fy = Number(req.query.fiscal_year) || poCurrentFiscalYear();
+    const { data, error } = await supabase
+      .from('post_office_monthly_submissions')
+      .select('id, fiscal_year, target_month, report_date, status, message, case_count, output_name, created_by, created_at, updated_at')
+      .eq('fiscal_year', fy)
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+    res.json({ submissions: data || [] });
+  } catch (error) {
+    console.error('Error (post-office submissions list):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 郵便局 - 様式1-6 生成ジョブ投入。DBの案件から入力JSONを組み _queue へ。
+//    body: { fiscal_year?, report_date?(YYYY-MM-DD), branch? }
+app.post('/api/post-office/submissions', requireAuth, requirePostOfficeAccess, async (req, res) => {
+  try {
+    if (!driveConfigured()) return res.status(503).json({ error: '共有ドライブ未設定のためキュー投入できません' });
+    const fy = Number(req.body.fiscal_year) || poCurrentFiscalYear();
+    const reportDate = req.body.report_date ? String(req.body.report_date).slice(0, 10) : jstToday();
+    const branch = req.body.branch ? String(req.body.branch) : null;
+
+    const { data: cases, error: cErr } = await supabase
+      .from('post_office_cases').select('*').eq('is_active', true).eq('fiscal_year', fy)
+      .order('seq_no', { ascending: true, nullsFirst: false }).order('id', { ascending: true });
+    if (cErr) throw cErr;
+    if (!cases || cases.length === 0) return res.status(400).json({ error: `${fy}年度の案件がありません` });
+
+    const master = buildPoMaster(cases, { report_date: reportDate, branch });
+    const targetMonth = reportDate.slice(0, 7);
+    const outputName = `様式1-6_${fy}年度_${reportDate}.xlsx`;
+
+    const ts = new Date().toISOString().replace(/[:.]/g, '').replace('T', '_').slice(0, 15);
+    const jobName = `${fy}__${ts}`;
+    const jobFolderId = await ensureFolderPath([...PO_QUEUE_SEGMENTS, String(fy), jobName], SHARED_DRIVE_ROOT_ID);
+
+    const job = { job_type: 'post_office', fiscal_year: fy, output_name: outputName, master };
+    await driveUpload({ name: 'po_job.json', buffer: Buffer.from(JSON.stringify(job, null, 2), 'utf8'), mimeType: 'application/json', folderId: jobFolderId });
+    await driveUpload({ name: 'status.json', buffer: Buffer.from(JSON.stringify({ status: 'queued', message: '', updated_at: new Date().toISOString() }), 'utf8'), mimeType: 'application/json', folderId: jobFolderId });
+
+    const { data: row, error: iErr } = await supabase
+      .from('post_office_monthly_submissions')
+      .insert({
+        fiscal_year: fy, target_month: targetMonth, report_date: reportDate,
+        case_count: cases.length, status: 'queued',
+        job_name: jobName, job_folder_id: jobFolderId, output_name: outputName,
+        master_json: master, created_by: req.user.email,
+      })
+      .select('id').single();
+    if (iErr) throw iErr;
+
+    res.json({ ok: true, id: row.id, job: jobName, case_count: cases.length });
+  } catch (error) {
+    console.error('Error (post-office submissions enqueue):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 郵便局 - 生成ジョブ状態（画面ポーリング用）。done かつ xlsx が揃えば ready。
+app.get('/api/post-office/submissions/:id/status', requireAuth, requirePostOfficeAccess, async (req, res) => {
+  try {
+    const { data: row, error } = await supabase
+      .from('post_office_monthly_submissions').select('*').eq('id', req.params.id).maybeSingle();
+    if (error) throw error;
+    if (!row) return res.status(404).json({ error: 'ジョブが見つかりません' });
+    if (!driveConfigured() || !row.job_folder_id) return res.json({ status: row.status, ready: false });
+
+    const status = await readDriveJson(row.job_folder_id, 'status.json');
+    const st = status?.status || row.status || 'queued';
+    const msg = status?.message || '';
+
+    if (st !== 'done') {
+      if (st !== row.status) await supabase.from('post_office_monthly_submissions').update({ status: st, message: msg, updated_at: new Date().toISOString() }).eq('id', row.id);
+      return res.json({ status: st, ready: false, message: msg });
+    }
+
+    const out = await findPoOutput(row.job_folder_id);
+    if (!out) return res.json({ status: 'done', ready: false, message: '生成ファイルの同期待ち' });
+
+    await supabase.from('post_office_monthly_submissions')
+      .update({ status: 'done', message: msg, output_ref: `drive:${out.id}`, output_name: out.name, updated_at: new Date().toISOString() })
+      .eq('id', row.id);
+    res.json({ status: 'done', ready: true, file: out.name });
+  } catch (error) {
+    console.error('Error (post-office submissions status):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 郵便局 - 生成済み xlsx をダウンロード（Drive から中継）。
+app.get('/api/post-office/submissions/:id/download', requireAuth, requirePostOfficeAccess, async (req, res) => {
+  try {
+    const { data: row, error } = await supabase
+      .from('post_office_monthly_submissions').select('*').eq('id', req.params.id).maybeSingle();
+    if (error) throw error;
+    if (!row) return res.status(404).json({ error: 'ジョブが見つかりません' });
+    if (!driveConfigured()) return res.status(503).json({ error: '共有ドライブ未設定です' });
+
+    let fileId = row.output_ref && row.output_ref.startsWith('drive:') ? driveIdOf(row.output_ref) : null;
+    let name = row.output_name;
+    if (!fileId && row.job_folder_id) {
+      const out = await findPoOutput(row.job_folder_id);
+      if (out) { fileId = out.id; name = out.name; }
+    }
+    if (!fileId) return res.status(404).json({ error: '生成済みのファイルがありません' });
+
+    const { buffer } = await driveDownload(fileId);
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(name || '様式1-6.xlsx')}`);
+    res.send(buffer);
+  } catch (error) {
+    console.error('Error (post-office submissions download):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 郵便局 - 生成物を削除（DB行＋共有ドライブのジョブフォルダをゴミ箱へ）。管理者のみ。
+app.delete('/api/post-office/submissions/:id', requireAuth, requirePostOfficeAdmin, async (req, res) => {
+  try {
+    const { data: row, error } = await supabase
+      .from('post_office_monthly_submissions').select('id, job_folder_id').eq('id', req.params.id).maybeSingle();
+    if (error) throw error;
+    if (!row) return res.status(404).json({ error: 'ジョブが見つかりません' });
+
+    if (row.job_folder_id && driveConfigured()) {
+      try { await driveTrash(row.job_folder_id); } catch (e) { console.error('po drive trash:', e.message); }
+    }
+    const { error: dErr } = await supabase.from('post_office_monthly_submissions').delete().eq('id', row.id);
+    if (dErr) throw dErr;
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error (post-office submissions delete):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`✅ Portal API running on http://localhost:${PORT}`);
   // 本番(Render)のみ起動。ローカル開発では回さない（二重抽出・不要なAPI消費を防ぐ）
