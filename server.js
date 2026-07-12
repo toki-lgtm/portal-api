@@ -14628,6 +14628,56 @@ app.post('/api/cards/scan', requireAuth, requireCardAccess, upload.single('file'
 // ✅ 名刺 - 一覧取得（?q=&scope= で絞り込み）
 //    scope: 'mine'（自分のみ）| 'shared'（共有のみ）| 未指定/'all'（両方）
 //    q: full_name / company / department / qualifications を ilike 部分一致
+// メール配列 → { email(小文字): 表示名 } を staff_master から一括解決（誰に公開かの表示用）
+async function resolveStaffNames(emails) {
+  const uniq = [...new Set((emails || []).map((e) => String(e || '').toLowerCase()).filter(Boolean))];
+  if (!uniq.length) return {};
+  const { data } = await supabase.from('staff_master').select('email, name').in('email', uniq);
+  const map = {};
+  for (const r of (data || [])) if (r.email) map[String(r.email).toLowerCase()] = r.name || null;
+  return map;
+}
+
+// visibility(+shared_with) を正規化。restricted は共有先が空なら private に落とす。登録者自身は共有先から除外。
+function normalizeVisibility(rawVis, rawShared, ownerEmail) {
+  let shared = rawShared;
+  if (typeof shared === 'string') {
+    try { shared = JSON.parse(shared); }
+    catch { shared = shared.split(',').map((s) => s.trim()); }
+  }
+  const owner = String(ownerEmail || '').toLowerCase();
+  const list = [...new Set((Array.isArray(shared) ? shared : [])
+    .map((e) => String(e || '').toLowerCase())
+    .filter(Boolean)
+    .filter((e) => e !== owner))];
+  if (rawVis === 'restricted') {
+    return list.length ? { visibility: 'restricted', shared_with: list } : { visibility: 'private', shared_with: [] };
+  }
+  if (rawVis === 'private') return { visibility: 'private', shared_with: [] };
+  return { visibility: 'shared', shared_with: [] };
+}
+
+// ✅ 名刺 - 限定公開の共有先に選べる社員一覧（在籍者。名刺利用権限があれば誰でも取得可）
+//    ※ /api/cards/:id より前に定義すること（'people' が :id に食われないように）
+app.get('/api/cards/people', requireAuth, requireCardAccess, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('staff_master')
+      .select('name, email, department')
+      .eq('is_active', true)
+      .order('name', { ascending: true });
+    if (error) throw error;
+    const me = String(req.user.email || '').toLowerCase();
+    const people = (data || [])
+      .filter((r) => r.email && String(r.email).toLowerCase() !== me)
+      .map((r) => ({ name: r.name || r.email, email: String(r.email).toLowerCase(), department: r.department || '' }));
+    res.json(people);
+  } catch (error) {
+    console.error('Error (cards people):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.get('/api/cards', requireAuth, requireCardAccess, async (req, res) => {
   try {
     const { q, scope } = req.query;
@@ -14664,11 +14714,20 @@ app.get('/api/cards', requireAuth, requireCardAccess, async (req, res) => {
       for (const r of (labelRows || [])) myLabels[r.card_id] = r.label;
     }
 
+    // 登録者・限定公開の共有先メールを社員名に一括解決（誰に公開かの表示用）
+    const nameMap = await resolveStaffNames(
+      (data || []).flatMap((r) => [r.owner_email, ...(Array.isArray(r.shared_with) ? r.shared_with : [])])
+    );
+
     const rows = await Promise.all((data || []).map(async (r) => ({
       ...r,
       image_url: r.image_ref ? await cardSignedUrl(r.image_ref, { size: 600 }) : null,
       back_image_url: r.back_image_ref ? await cardSignedUrl(r.back_image_ref, { size: 600 }) : null,
       my_category: myLabels[r.id] || null,   // 本人だけに返す個人ラベル
+      owner_name: r.owner_email ? (nameMap[String(r.owner_email).toLowerCase()] || null) : null,
+      shared_with_names: Array.isArray(r.shared_with)
+        ? r.shared_with.map((e) => nameMap[String(e).toLowerCase()] || e)
+        : [],
     })));
     res.json(rows);
   } catch (error) {
@@ -14706,11 +14765,16 @@ app.get('/api/cards/:id', requireAuth, requireCardAccess, async (req, res) => {
       .eq('card_id', data.id)
       .maybeSingle();
 
+    const nameMap = await resolveStaffNames([data.owner_email, ...(Array.isArray(data.shared_with) ? data.shared_with : [])]);
     res.json({
       ...data,
       image_url: data.image_ref ? await cardSignedUrl(data.image_ref, { size: 600 }) : null,
       back_image_url: data.back_image_ref ? await cardSignedUrl(data.back_image_ref, { size: 600 }) : null,
       my_category: myLabel?.label || null,
+      owner_name: data.owner_email ? (nameMap[String(data.owner_email).toLowerCase()] || null) : null,
+      shared_with_names: Array.isArray(data.shared_with)
+        ? data.shared_with.map((e) => nameMap[String(e).toLowerCase()] || e)
+        : [],
     });
   } catch (error) {
     console.error('Error (cards get):', error.message);
@@ -14781,12 +14845,12 @@ app.post('/api/cards', requireAuth, requireCardAccess,
       full_name, company, department, title,
       phone, mobile, email: cardEmail, fax,
       postal_code, address, website, qualifications, note,
-      visibility, category,
+      visibility, shared_with, category,
     } = req.body || {};
 
     const ownerEmail = String(req.user.email || '').toLowerCase();
-    // デフォルトは 'shared'（未指定 or 不正値は shared 扱い。既存データは変更しない）
-    const vis = visibility === 'private' ? 'private' : 'shared';
+    // visibility は shared / private / restricted。restricted は共有先(shared_with)必須（空なら private）。
+    const { visibility: vis, shared_with: sw } = normalizeVisibility(visibility, shared_with, ownerEmail);
     const cat = (category || '').trim() || null;
 
     // 表面（file）・裏面（back_file）を保存。裏面は任意。OCR は行わず画像として保存するだけ。
@@ -14815,6 +14879,7 @@ app.post('/api/cards', requireAuth, requireCardAccess,
         image_ref,
         back_image_ref,
         visibility:     vis,
+        shared_with:    sw,
         owner_email:    ownerEmail,
       }])
       .select('*');
@@ -14944,6 +15009,13 @@ app.patch('/api/cards/:id', requireAuth, requireCardAccess,
           patch[key] = req.body[key] || null;
         }
       }
+    }
+
+    // 公開範囲: shared / private / restricted と共有先(shared_with)をまとめて正規化（visibility 指定時のみ上書き）
+    if (req.body && 'visibility' in req.body) {
+      const norm = normalizeVisibility(req.body.visibility, req.body.shared_with, existing.owner_email);
+      patch.visibility = norm.visibility;
+      patch.shared_with = norm.shared_with;
     }
 
     // category はパッチ済みの値、なければ既存の値を使用（保存先フォルダの決定に使う）
@@ -16130,7 +16202,7 @@ app.get('/api/post-office/cases', requireAuth, requirePostOfficeAccess, async (r
     let query = supabase.from('post_office_cases').select('*').eq('is_active', true).eq('fiscal_year', fy);
     if (status && POST_OFFICE_STATUSES.includes(status)) query = query.eq('status', status);
     if (response_type && ['一般', '緊急'].includes(response_type)) query = query.eq('response_type', response_type);
-    query = query.order('seq_no', { ascending: true, nullsFirst: false }).order('id', { ascending: true });
+    query = query.order('seq_no', { ascending: false, nullsFirst: false }).order('id', { ascending: false });
     const { data, error } = await query;
     if (error) throw error;
     let rows = data || [];
