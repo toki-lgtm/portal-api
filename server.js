@@ -14683,26 +14683,28 @@ app.get('/api/cards', requireAuth, requireCardAccess, async (req, res) => {
     const { q, scope } = req.query;
     const email = String(req.user.email || '').toLowerCase();
 
-    let query = supabase.from('business_cards').select('*').eq('is_active', true);
+    // 1000行上限対策: pagedSelect で全件取得（buildQuery は毎回新しいビルダを返す）
+    const buildQuery = () => {
+      let query = supabase.from('business_cards').select('*').eq('is_active', true);
 
-    if (scope === 'mine') {
-      query = query.eq('owner_email', email);
-    } else if (scope === 'shared') {
-      query = query.eq('visibility', 'shared');
-    } else {
-      // 自分の名刺 または 全社共有 または 自分が限定共有先(shared_with)に含まれる名刺
-      query = query.or(`owner_email.eq.${email},visibility.eq.shared,shared_with.cs.{"${email}"}`);
-    }
+      if (scope === 'mine') {
+        query = query.eq('owner_email', email);
+      } else if (scope === 'shared') {
+        query = query.eq('visibility', 'shared');
+      } else {
+        // 自分の名刺 または 全社共有 または 自分が限定共有先(shared_with)に含まれる名刺
+        query = query.or(`owner_email.eq.${email},visibility.eq.shared,shared_with.cs.{"${email}"}`);
+      }
 
-    if (q) {
-      const like = `%${q}%`;
-      query = query.or(`full_name.ilike.${like},company.ilike.${like},department.ilike.${like},qualifications.ilike.${like}`);
-    }
+      if (q) {
+        const like = `%${q}%`;
+        query = query.or(`full_name.ilike.${like},company.ilike.${like},department.ilike.${like},qualifications.ilike.${like}`);
+      }
 
-    query = query.order('created_at', { ascending: false });
+      return query.order('created_at', { ascending: false });
+    };
 
-    const { data, error } = await query;
-    if (error) throw error;
+    const data = await pagedSelect(buildQuery);
 
     // 自分のマイカテゴリ（個人ラベル）をまとめて取得し card_id => label のマップに
     const myLabels = {};
