@@ -14494,19 +14494,19 @@ app.get('/api/cards/my-categories', requireAuth, requireCardAccess, async (req, 
 
 // 名刺の全社カテゴリ（18分類）。カテゴリ提案の検証に使う。
 const CARD_CATEGORIES = [
-  '建設・土木', '設計・コンサル・測量', '専門工事・下請', '建設資材・商社',
+  '建設・土木', '設計・コンサル・測量', '建設資材・商社',
   '機械・重機・レンタル', '電気・通信・設備', 'IT・システム', '官公庁・行政',
-  '金融・保険', '運輸・物流', '教育・学校', '不動産',
+  '金融・保険', '運輸・物流', '小売・流通', '教育・学校', '不動産',
   '士業（税理士・法務等）', '飲食・宿泊・サービス', '医療・福祉', '水産・漁業',
   '団体・組合・NPO', 'その他',
 ];
 
 // カテゴリの表示順（中原建設＝建築・土木ゼネコンに隣接する業種から順に。「その他」は最後）
 const CARD_CATEGORY_DISPLAY_ORDER = [
-  '建設・土木', '設計・コンサル・測量', '専門工事・下請', '建設資材・商社',
+  '建設・土木', '設計・コンサル・測量', '建設資材・商社',
   '機械・重機・レンタル', '電気・通信・設備', '不動産', '官公庁・行政',
   '金融・保険', '士業（税理士・法務等）', 'IT・システム', '運輸・物流',
-  '団体・組合・NPO', '教育・学校', '医療・福祉', '水産・漁業',
+  '小売・流通', '団体・組合・NPO', '教育・学校', '医療・福祉', '水産・漁業',
   '飲食・宿泊・サービス', 'その他',
 ];
 function cardCategoryRank(name) {
@@ -14552,11 +14552,11 @@ app.post('/api/cards/suggest-category', requireAuth, requireCardAccess, async (r
     // 【2】新規会社 → Gemini + Google検索グラウンディングで業種を調べてカテゴリ判定
     if (!GEMINI_API_KEY) return res.json({ category: null, source: 'none' });
 
-    const prompt = `日本の企業/組織「${company}」について、Google検索で実際の業種・事業内容を調べ、次の17カテゴリから最も適切なものを1つだけ選んでください。どれにも明確に当てはまらなければ「その他」を選んでください。
+    const prompt = `日本の企業/組織「${company}」について、Google検索で実際の業種・事業内容を調べ、次の18カテゴリから最も適切なものを1つだけ選んでください。どれにも明確に当てはまらなければ「その他」を選んでください。
 
-17カテゴリ: ${CARD_CATEGORIES.join('、')}
+18カテゴリ: ${CARD_CATEGORIES.join('、')}
 
-出力はJSONのみ（前後に説明文やマークダウンを付けない）: {"category":"<17カテゴリのいずれか>","industry":"<業種の一言>"}`;
+出力はJSONのみ（前後に説明文やマークダウンを付けない）: {"category":"<18カテゴリのいずれか>","industry":"<業種の一言>"}`;
 
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
     const body = { contents: [{ parts: [{ text: prompt }] }], tools: [{ google_search: {} }] };
