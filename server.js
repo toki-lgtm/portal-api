@@ -14697,8 +14697,16 @@ app.get('/api/cards', requireAuth, requireCardAccess, async (req, res) => {
       }
 
       if (q) {
-        const like = `%${q}%`;
-        query = query.or(`full_name.ilike.${like},company.ilike.${like},department.ilike.${like},qualifications.ilike.${like}`);
+        // スペース区切りは複数語のAND検索（各語がいずれかの列に含まれる）。
+        // カンマ・括弧などPostgRESTの予約文字は値を二重引用符で囲んで無害化する。
+        const terms = String(q).trim().split(/\s+/).filter(Boolean);
+        for (const term of terms) {
+          const safe = term.replace(/[\\"]/g, '\\$&');        // " と \ をエスケープ
+          const like = `"%${safe}%"`;
+          query = query.or(
+            `full_name.ilike.${like},company.ilike.${like},title.ilike.${like},department.ilike.${like},qualifications.ilike.${like}`
+          );
+        }
       }
 
       return query.order('created_at', { ascending: false });
