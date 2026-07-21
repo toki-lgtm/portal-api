@@ -4802,7 +4802,7 @@ app.put('/api/user/settings', requireAuth, async (req, res) => {
 // ============================================================
 
 // 既知のアプリキー（/api/apps と権限UIで共有）
-const APP_KEYS = ['safety-patrol', 'employee-list', 'announcements', 'bids', 'documents', 'feedback', 'workscope', 'construction', 'regulations', 'cards'];
+const APP_KEYS = ['safety-patrol', 'employee-list', 'announcements', 'bids', 'documents', 'feedback', 'workscope', 'construction', 'regulations', 'cards', 'quote_compare', 'exam-prep', 'post-office'];
 
 // staffId のアプリ別権限を { app_key: 'member'|'admin' } のマップで返す
 async function resolveAppPermissions(staffId) {
