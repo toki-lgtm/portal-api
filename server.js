@@ -15494,11 +15494,29 @@ app.get('/api/exam/admin/access', requireAuth, requireExamAccess, async (req, re
   try {
     if (req.examRole.role !== 'admin') return res.status(403).json({ error: '管理者のみ可能です' });
     const { data: subs } = await supabase.from('exam_subjects').select('id,name').order('sort_order');
+    // 在籍社員（利用対象）
+    const { data: staff } = await supabase
+      .from('staff_master')
+      .select('id,name,department')
+      .eq('is_active', true)
+      .order('id');
+    // 1層目: exam-prep の利用可状態
+    const { data: appPerms } = await supabase
+      .from('staff_app_permissions')
+      .select('staff_id,access_level')
+      .eq('app_key', 'exam-prep');
+    const appMap = {};
+    for (const p of appPerms || []) appMap[p.staff_id] = p.access_level;
+    const staffOut = (staff || []).map(s => ({
+      id: s.id, name: s.name, department: s.department || '',
+      app_level: appMap[s.id] || null,   // null=利用不可 / 'member' / 'admin'
+    }));
+    // 2層目: 科目別アクセス
     const { data: acc } = await supabase.from('exam_subject_access').select('staff_id,subject_id');
-    res.json({ subjects: subs || [], access: acc || [] });
+    res.json({ subjects: subs || [], staff: staffOut, access: acc || [] });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
-// 付与/剥奪: { staff_id, subject_id, grant:true|false }
+// 科目アクセス（2層目）付与/剥奪: { staff_id, subject_id, grant:true|false }
 app.post('/api/exam/admin/access', requireAuth, requireExamAccess, async (req, res) => {
   try {
     if (req.examRole.role !== 'admin') return res.status(403).json({ error: '管理者のみ可能です' });
@@ -15509,6 +15527,24 @@ app.post('/api/exam/admin/access', requireAuth, requireExamAccess, async (req, r
         { staff_id, subject_id }, { onConflict: 'staff_id,subject_id' });
     } else {
       await supabase.from('exam_subject_access').delete().eq('staff_id', staff_id).eq('subject_id', subject_id);
+    }
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+// アプリ利用可（1層目 = staff_app_permissions['exam-prep']）の付与/剥奪: { staff_id, grant:true|false }
+//   資格学習の管理者が、同じ画面で「利用可」を切り替えられるようにする（exam-prep 限定）。
+app.post('/api/exam/admin/app-access', requireAuth, requireExamAccess, async (req, res) => {
+  try {
+    if (req.examRole.role !== 'admin') return res.status(403).json({ error: '管理者のみ可能です' });
+    const { staff_id, grant } = req.body || {};
+    if (!staff_id) return res.status(400).json({ error: 'staff_id が必要です' });
+    if (grant) {
+      await supabase.from('staff_app_permissions').upsert(
+        { staff_id, app_key: 'exam-prep', access_level: 'member', updated_at: new Date().toISOString() },
+        { onConflict: 'staff_id,app_key' });
+    } else {
+      await supabase.from('staff_app_permissions')
+        .delete().eq('staff_id', staff_id).eq('app_key', 'exam-prep');
     }
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
