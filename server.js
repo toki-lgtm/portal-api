@@ -17,6 +17,7 @@ import { Readable } from 'stream';
 import { classifyQuote, classNoOf } from './classifyQuote.js';
 import { extractExcelQuote } from './quoteExcelExtract.js';
 import { extractSiteAssignments, nextWorkingDay, sumMembers, loadStaffRoster, loadNameAliases } from './siteAssignments.js';
+import { runCollection as runBidNoticeCollection } from './bidNoticeCollector.js';
 
 dotenv.config();
 
@@ -419,6 +420,7 @@ app.get('/api/apps', requireAuth, async (req, res) => {
       { id: 21, key: 'site-assignments', name: '翌日の人員配置', icon: '👷', internal: true, view: 'site-assignments', description: 'グループLINEの夜の報告から翌営業日の現場別人員を自動集計' },
       { id: 22, key: 'archive', name: '過去工事アーカイブ', icon: '🗄️', internal: true, view: 'archive', description: '過去の工事書類をスキャンして工事別に保管・閲覧（人事資料は管理者限定）' },
       { id: 23, key: 'post-office', name: '郵便局 年間指名', icon: '📮', internal: true, view: 'post-office', description: '日本郵便の年間事前指名（対馬エリア小規模修繕）の案件・月次一覧表を管理' },
+      { id: 24, key: 'bid-notices', name: '入札公告', icon: '📢', internal: true, view: 'bid-notices', description: '九州防衛局・対馬市・長崎県の工事入札公告を日次自動収集。募集中の公告をレビューして入札案件に登録' },
       // 【凍結 2026-06-17】法令集はメニューから除外（機能・API・データは残置、復活時はこの行を戻す）
       // { id: 13, key: 'regulations', name: '法令集', icon: '📚', internal: true, view: 'regulations', description: '建設・不動産・林業・労務・会社経営の法令を条文単位で検索・閲覧' },
     ];
@@ -447,6 +449,8 @@ app.get('/api/apps', requireAuth, async (req, res) => {
       if (a.key === 'site-assignments') return true;
       // 過去工事アーカイブは全社員に表示（工事資料は全員閲覧。人事タブ・人事資料は画面内＆API双方で admin のみ）。
       if (a.key === 'archive') return true;
+      // 入札公告は入札案件管理と同じ権限で出し分ける（キーは 'bids'）。
+      if (a.key === 'bid-notices') return perms.role === 'admin' || !!appPerms['bids'];
       if (perms.role === 'admin') return true;
       return !!appPerms[a.key];
     });
@@ -7899,6 +7903,178 @@ app.post('/api/bids/:id/import-estimate', requireAuth, requireBidAccess, upload.
   } catch (error) {
     console.error('Error (bid import-estimate):', error.message);
     res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================================
+// 入札公告 収集（migration 107）
+//   九州防衛局・対馬市・長崎県対馬振興局の工事入札公告を日次収集して蓄積。
+//   レビューして選んだものを bid_projects へ昇格。権限は入札案件管理と共通。
+// ============================================================
+const BID_NOTICE_STATUSES = ['new', 'reviewed', 'promoted', 'dismissed'];
+
+// 締切（bid_date もしくは opening_date）が本日以降 or 未設定なら「募集中」とみなす
+function isNoticeActive(n, todayStr) {
+  const deadline = n.bid_date || n.opening_date || null;
+  if (!deadline) return true;
+  return String(deadline) >= todayStr;
+}
+function todayISO() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+// ✅ 入札公告 - 一覧（フィルタ: source / prefecture / tsushima / status / scope / q）
+app.get('/api/bid-notices', requireAuth, requireBidAccess, async (req, res) => {
+  try {
+    const { source, prefecture, tsushima, status, scope = 'active', q } = req.query;
+    let query = supabase.from('bid_notices').select('*');
+    if (source) query = query.eq('source', source);
+    if (prefecture) query = query.eq('prefecture', prefecture);
+    if (tsushima === 'true') query = query.eq('is_tsushima', true);
+    if (status && BID_NOTICE_STATUSES.includes(status)) query = query.eq('status', status);
+    query = query.order('notice_date', { ascending: false, nullsFirst: false }).order('id', { ascending: false });
+
+    const { data, error } = await query;
+    if (error) throw error;
+    let rows = data || [];
+
+    const today = todayISO();
+    if (scope === 'active') rows = rows.filter((n) => isNoticeActive(n, today));
+    if (scope === 'closed') rows = rows.filter((n) => !isNoticeActive(n, today));
+
+    if (q) {
+      const needle = String(q).toLowerCase();
+      rows = rows.filter(
+        (n) =>
+          (n.project_name || '').toLowerCase().includes(needle) ||
+          (n.location || '').toLowerCase().includes(needle) ||
+          (n.source_agency || '').toLowerCase().includes(needle)
+      );
+    }
+
+    res.json(rows.map((n) => ({ ...n, is_active: isNoticeActive(n, today) })));
+  } catch (error) {
+    console.error('Error (bid-notices list):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 入札公告 - 新着件数（ナビのバッジ用。未確認かつ募集中）
+app.get('/api/bid-notices/new-count', requireAuth, requireBidAccess, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('bid_notices')
+      .select('bid_date, opening_date, status')
+      .eq('status', 'new');
+    if (error) throw error;
+    const today = todayISO();
+    const count = (data || []).filter((n) => isNoticeActive(n, today)).length;
+    res.json({ count });
+  } catch (error) {
+    console.error('Error (bid-notices new-count):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 入札公告 - 最終収集ログ（画面の「最終更新」表示用）
+app.get('/api/bid-notices/last-run', requireAuth, requireBidAccess, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('bid_collection_runs')
+      .select('*')
+      .order('started_at', { ascending: false })
+      .limit(6);
+    if (error) throw error;
+    res.json(data || []);
+  } catch (error) {
+    console.error('Error (bid-notices last-run):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 入札公告 - ステータス変更（reviewed / dismissed / new に戻す）
+app.patch('/api/bid-notices/:id', requireAuth, requireBidAccess, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status } = req.body;
+    if (!BID_NOTICE_STATUSES.includes(status) || status === 'promoted') {
+      return res.status(400).json({ error: '不正なステータスです（promoted は昇格APIで設定）' });
+    }
+    const { data, error } = await supabase
+      .from('bid_notices')
+      .update({ status, updated_at: new Date().toISOString() })
+      .eq('id', id)
+      .select('*')
+      .single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error (bid-notices patch):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ 入札公告 - 入札案件（bid_projects）へ昇格
+app.post('/api/bid-notices/:id/promote', requireAuth, requireBidAccess, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { data: n, error: nErr } = await supabase.from('bid_notices').select('*').eq('id', id).maybeSingle();
+    if (nErr) throw nErr;
+    if (!n) return res.status(404).json({ error: '公告が見つかりません' });
+    if (n.promoted_bid_project_id) {
+      return res.status(409).json({ error: 'この公告は既に案件登録されています', bid_id: n.promoted_bid_project_id });
+    }
+
+    // 公告 → 案件のフィールドマッピング
+    const payload = {
+      project_name: n.project_name,
+      client_name: n.source_agency,
+      location: n.location,
+      work_type: n.work_type || null,
+      bid_method: n.bid_method || null,
+      status: 'collecting', // 情報収集から開始
+      notice_date: n.notice_date,
+      bid_date: n.bid_date,
+      opening_date: n.opening_date,
+      budget_price: n.budget_price,
+      remarks: [n.summary, `公告URL: ${n.notice_url}`].filter(Boolean).join('\n'),
+      staff_id: req.bidRole?.staffId || null,
+      created_by: req.user.email,
+    };
+    const { data: bid, error: bErr } = await supabase.from('bid_projects').insert([payload]).select('*').single();
+    if (bErr) throw bErr;
+
+    await supabase.from('bid_status_history').insert([
+      { bid_id: bid.id, from_status: null, to_status: bid.status, changed_by: req.user.email },
+    ]);
+    await supabase
+      .from('bid_notices')
+      .update({ status: 'promoted', promoted_bid_project_id: bid.id, updated_at: new Date().toISOString() })
+      .eq('id', id);
+
+    res.json({ bid_id: bid.id, bid });
+  } catch (error) {
+    console.error('Error (bid-notices promote):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// x-cron-key が一致すれば通過、そうでなければ requireAuth → requireBidAdmin を要求。
+function requireBidAdminOrCron(req, res, next) {
+  const cronOk = process.env.CRON_KEY && req.headers['x-cron-key'] === process.env.CRON_KEY;
+  if (cronOk) return next();
+  requireAuth(req, res, () => requireBidAdmin(req, res, next));
+}
+
+// ✅ 入札公告 - 手動収集（管理者 or Cron）。九州防衛局はサーバのTLS指紋次第で失敗し得る
+//    （その場合も他ソースは収集され、per-source で ok=false が返る）。
+app.post('/api/bid-notices/collect', requireBidAdminOrCron, async (req, res) => {
+  try {
+    const summary = await runBidNoticeCollection({ dryRun: false });
+    res.json(summary);
+  } catch (error) {
+    console.error('Error (bid-notices collect):', error.message);
+    if (!res.headersSent) res.status(500).json({ error: error.message });
   }
 });
 

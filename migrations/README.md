@@ -93,3 +93,4 @@
 | 051 | `051_schema_migrations_ledger` | schema_migrations 記録テーブル新設＋既存遡及記録 | ✅ 適用済 |
 | … | (052〜105 は schema_migrations テーブルが正。この表は 051 以降未追記) | — | — |
 | 106 | `106_post_office_case_files` | 郵便局 案件添付ファイル＋提出書類チェックリスト | ⬜ 未適用（SQL Editorで実行） |
+| 107 | `107_bid_notices` | 入札公告 日次収集（bid_notices ＋ bid_collection_runs） | ✅ 適用済 |
